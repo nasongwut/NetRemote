@@ -113,6 +113,17 @@ def save_config(cfg):
         pass
 
 
+def log_error(e):
+    """บันทึก error ลง ~/.netremote/error.log (ช่วยหาสาเหตุเมื่อใช้แบบ .app / .exe)"""
+    try:
+        os.makedirs(CONF_DIR, exist_ok=True)
+        with open(os.path.join(CONF_DIR, "error.log"), "a", encoding="utf-8") as f:
+            f.write("%s  %s\n%s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), e,
+                                     "".join(traceback.format_exception(type(e), e, e.__traceback__))))
+    except Exception:
+        pass
+
+
 def gen_password():
     alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
     s = "".join(secrets.choice(alphabet) for _ in range(12))
@@ -1736,10 +1747,7 @@ def run_gui():
             ttk.Button(bar, text="เต็มจอ", command=self.toggle_full).pack(side="right", padx=4)
             ttk.Button(bar, text="ส่งข้อความ…", command=self.send_text).pack(side="right")
             ttk.Button(bar, text="ปล่อยปุ่มค้าง", command=self._release_all).pack(side="right", padx=4)
-            fb = ttk.Button(bar, text="📁 รับ-ส่งไฟล์", command=self.open_files)
-            fb.pack(side="right")
-            if not info.get("files"):
-                fb.configure(state="disabled")
+            ttk.Button(bar, text="📁 รับ-ส่งไฟล์", command=self.open_files).pack(side="right")
             self.lat_lbl = tk.Label(bar, text="Latency —", font=("Helvetica", 12, "bold"), fg="#888",
                                     padx=8)
             self.lat_lbl.pack(side="right", padx=(0, 8))
@@ -2036,6 +2044,16 @@ def run_gui():
                 self.destroy()
 
         def open_files(self):
+            if not self.info.get("files"):
+                if "v" not in self.info:
+                    msg = ("เครื่องปลายทาง (%s) ใช้โปรแกรม NetRemote เวอร์ชันเก่า ที่ยังไม่รองรับการรับ-ส่งไฟล์\n\n"
+                           "ให้อัปเดตโปรแกรมบนเครื่องปลายทางเป็นเวอร์ชันล่าสุด แล้วเชื่อมต่อใหม่" % self.info.get("name", ""))
+                else:
+                    msg = ("เครื่องปลายทาง (%s) ปิดการรับ-ส่งไฟล์ไว้\n\n"
+                           "ที่เครื่องปลายทาง: แท็บ \"ให้เครื่องอื่นควบคุมเครื่องนี้\" → ติ๊ก \"อนุญาตให้รับ-ส่งไฟล์\" "
+                           "แล้วเชื่อมต่อใหม่" % self.info.get("name", ""))
+                messagebox.showinfo(APP, msg, parent=self.win)
+                return
             if self.fw is None:
                 self.fw = FileWindow(self)
             else:
@@ -2050,6 +2068,153 @@ def run_gui():
                 self.win.destroy()
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    class LocalPicker:
+        """ตัวเลือกไฟล์/โฟลเดอร์ในเครื่องนี้ (ใช้แทนหน้าต่างของระบบบน macOS ซึ่งบางครั้งเปิดไม่ขึ้น)"""
+
+        def __init__(self, parent, title, mode="files", initial=None):
+            self.mode, self.result = mode, None
+            self.cur = None
+            self.entries = {}
+            w = self.win = tk.Toplevel(parent)
+            w.title(title)
+            w.geometry("760x540")
+            w.minsize(520, 380)
+            try:
+                w.transient(parent)
+            except Exception:
+                pass
+            nav = ttk.Frame(w, padding=(10, 10, 10, 4))
+            nav.pack(fill="x")
+            ttk.Button(nav, text="⬆ ขึ้น", width=6, command=self.up).pack(side="left")
+            home = os.path.expanduser("~")
+            for label, sub in (("⌂ Home", ""), ("Desktop", "Desktop"), ("Documents", "Documents"),
+                               ("Downloads", "Downloads")):
+                p = os.path.join(home, sub) if sub else home
+                if os.path.isdir(p):
+                    ttk.Button(nav, text=label, command=lambda p=p: self.go(p)).pack(side="left", padx=(4, 0))
+            if SYSTEM == "Darwin" and os.path.isdir("/Volumes"):
+                ttk.Button(nav, text="ไดรฟ์", command=lambda: self.go("/Volumes")).pack(side="left", padx=(4, 0))
+            self.path_var = tk.StringVar()
+            pe = ttk.Entry(w, textvariable=self.path_var)
+            pe.pack(fill="x", padx=10, pady=(2, 4))
+            pe.bind("<Return>", lambda e: self.go(self.path_var.get().strip()))
+            hint = ("เลือกได้หลายรายการ (กด ⌘/Ctrl หรือ Shift ค้าง) — เลือกโฟลเดอร์ได้ด้วย ดับเบิลคลิกโฟลเดอร์เพื่อเปิด"
+                    if mode == "files" else "เปิดโฟลเดอร์ที่ต้องการ แล้วกด \"เลือกโฟลเดอร์นี้\" (หรือคลิกเลือกโฟลเดอร์ย่อย)")
+            ttk.Label(w, text=hint, foreground="#666", padding=(10, 0)).pack(fill="x")
+            fr = ttk.Frame(w, padding=(10, 4, 10, 0))
+            fr.pack(fill="both", expand=True)
+            t = self.tree = ttk.Treeview(fr, columns=("name", "size", "mtime"), show="headings",
+                                         selectmode="extended" if mode == "files" else "browse")
+            for c, txt, wd, st in (("name", "ชื่อ", 400, True), ("size", "ขนาด", 100, False),
+                                   ("mtime", "แก้ไขล่าสุด", 150, False)):
+                t.heading(c, text=txt)
+                t.column(c, width=wd, stretch=st, anchor="e" if c == "size" else "w")
+            sb = ttk.Scrollbar(fr, orient="vertical", command=t.yview)
+            t.configure(yscrollcommand=sb.set)
+            t.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            t.bind("<Double-1>", self.on_double)
+            bot = ttk.Frame(w, padding=10)
+            bot.pack(fill="x")
+            self.info_var = tk.StringVar()
+            ttk.Label(bot, textvariable=self.info_var, foreground="#555").pack(side="left")
+            ttk.Button(bot, text="ยกเลิก", command=w.destroy).pack(side="right")
+            ttk.Button(bot, text="เลือก" if mode == "files" else "เลือกโฟลเดอร์นี้",
+                       command=self.choose).pack(side="right", padx=6)
+            t.bind("<<TreeviewSelect>>", lambda e: self._sel_info())
+            self.go(initial if initial and os.path.isdir(initial) else home)
+            w.protocol("WM_DELETE_WINDOW", w.destroy)
+            w.lift()
+            w.focus_force()
+            try:
+                w.grab_set()
+            except Exception:
+                pass
+            w.wait_window()
+
+        def go(self, path):
+            path = os.path.abspath(os.path.expanduser(path or "~"))
+            try:
+                items = sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower()))
+            except OSError as e:
+                messagebox.showerror(APP, "เปิดโฟลเดอร์ไม่ได้: %s" % err_text(e), parent=self.win)
+                return
+            self.cur = path
+            self.path_var.set(path)
+            self.tree.delete(*self.tree.get_children(""))
+            self.entries.clear()
+            n = 0
+            for e in items:
+                if e.name.startswith("."):
+                    continue
+                try:
+                    isdir = e.is_dir()
+                    st = e.stat()
+                except OSError:
+                    continue
+                if self.mode == "folder" and not isdir:
+                    continue
+                iid = "p%d" % n
+                n += 1
+                self.entries[iid] = (e.path, isdir)
+                self.tree.insert("", "end", iid=iid, values=(("📁  " if isdir else "📄  ") + e.name,
+                                                             "" if isdir else fmt_size(st.st_size),
+                                                             datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")))
+            self._sel_info()
+
+        def up(self):
+            if self.cur:
+                parent = os.path.dirname(self.cur)
+                if parent != self.cur:
+                    self.go(parent)
+
+        def _sel_info(self):
+            sel = [self.entries[i] for i in self.tree.selection() if i in self.entries]
+            if sel:
+                self.info_var.set("เลือก %d รายการ" % len(sel))
+            else:
+                self.info_var.set(self.cur or "")
+
+        def on_double(self, e=None):
+            sel = self.tree.selection()
+            if not sel or sel[0] not in self.entries:
+                return
+            path, isdir = self.entries[sel[0]]
+            if isdir:
+                self.go(path)
+            elif self.mode == "files":
+                self.result = [path]
+                self.win.destroy()
+
+        def choose(self):
+            sel = [self.entries[i][0] for i in self.tree.selection() if i in self.entries]
+            if self.mode == "folder":
+                self.result = sel[0] if sel else self.cur
+            else:
+                if not sel:
+                    messagebox.showinfo(APP, "คลิกเลือกไฟล์หรือโฟลเดอร์ก่อน", parent=self.win)
+                    return
+                self.result = sel
+            self.win.destroy()
+
+    def pick_files(parent, title):
+        """คืนรายการ path ที่เลือก (ไฟล์และ/หรือโฟลเดอร์)"""
+        if SYSTEM != "Darwin":
+            try:
+                return list(filedialog.askopenfilenames(parent=parent, title=title) or [])
+            except Exception as e:
+                log_error(e)
+        return LocalPicker(parent, title, "files").result or []
+
+    def pick_folder(parent, title, initial=None):
+        if SYSTEM != "Darwin":
+            try:
+                return filedialog.askdirectory(parent=parent, title=title, initialdir=initial) or ""
+            except Exception as e:
+                log_error(e)
+        return LocalPicker(parent, title, "folder", initial).result or ""
 
     # ------------------------------------------------------------------
     class FileWindow:
@@ -2189,16 +2354,24 @@ def run_gui():
         def upload_files(self):
             if not self._need_dir():
                 return
-            paths = filedialog.askopenfilenames(parent=self.win, title="เลือกไฟล์ที่จะอัปโหลด")
-            if paths:
-                self._add_job(self.fc.upload(list(paths), self.cur_path))
+            try:
+                paths = pick_files(self.win, "เลือกไฟล์ที่จะอัปโหลด")
+                if paths:
+                    self._add_job(self.fc.upload(list(paths), self.cur_path))
+            except Exception as e:
+                log_error(e)
+                messagebox.showerror(APP, "อัปโหลดไม่ได้: %s" % err_text(e), parent=self.win)
 
         def upload_folder(self):
             if not self._need_dir():
                 return
-            d = filedialog.askdirectory(parent=self.win, title="เลือกโฟลเดอร์ที่จะอัปโหลด")
-            if d:
-                self._add_job(self.fc.upload([d], self.cur_path))
+            try:
+                d = pick_folder(self.win, "เลือกโฟลเดอร์ที่จะอัปโหลด")
+                if d:
+                    self._add_job(self.fc.upload([d], self.cur_path))
+            except Exception as e:
+                log_error(e)
+                messagebox.showerror(APP, "อัปโหลดไม่ได้: %s" % err_text(e), parent=self.win)
 
         def download(self, paths=None):
             if paths is None:
@@ -2222,8 +2395,7 @@ def run_gui():
                 self.pending = self.fc.mkdir(self.cur_path, name.strip(), self.hidden_var.get())
 
         def change_dl(self):
-            d = filedialog.askdirectory(parent=self.win, initialdir=self.dl_var.get(),
-                                        title="เลือกโฟลเดอร์สำหรับเก็บไฟล์ที่ดาวน์โหลด")
+            d = pick_folder(self.win, "เลือกโฟลเดอร์สำหรับเก็บไฟล์ที่ดาวน์โหลด", self.dl_var.get())
             if d:
                 self.dl_var.set(d)
                 self.app.cfg["download_dir"] = d

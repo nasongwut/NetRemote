@@ -1,0 +1,4 @@
+mss>=9
+Pillow>=9
+pynput>=1.7.6
+cryptography>=41

@@ -3964,6 +3964,24 @@ def run_gui():
                 open_path(os.path.dirname(res))
             messagebox.showinfo(APP, "ดาวน์โหลดเวอร์ชันใหม่เรียบร้อย\n\n%s" % how)
 
+        def _confirm_fp_threadsafe(self, host, fp, name):
+            """ตรวจ Certificate ของปลายทาง (เรียกจาก thread เชื่อมต่อ) — ครั้งแรกจดจำไว้ ถ้าเปลี่ยนจะถามผู้ใช้"""
+            known = self.cfg.setdefault("known", {})
+            old = known.get(host)
+            if old == fp:
+                return True
+            if old is None:
+                known[host] = fp
+                save_config(self.cfg)
+                return True
+            ev, box = threading.Event(), {}
+            self.q.put(("ask_fp", host, old, fp, name, ev, box))
+            ev.wait(120)
+            if box.get("ok"):
+                known[host] = fp
+                save_config(self.cfg)
+            return bool(box.get("ok"))
+
         def _relay_conn(self):
             """ที่อยู่และ Key ของ Relay — จาก .env ก่อน ถ้าไม่มีใช้ค่าที่ตั้งในโปรแกรม"""
             if env_str("RELAY_ADDR"):

@@ -6,9 +6,9 @@ if [ -z "$PY" ]; then
   echo "ไม่พบ Python 3 — ติดตั้งได้จาก https://www.python.org/downloads/"
   read -p "กด Enter เพื่อปิด"; exit 1
 fi
-if [ ! -f .venv/.installed ]; then
-  echo "กำลังติดตั้งครั้งแรก (ประมาณ 1-2 นาที ต้องต่ออินเทอร์เน็ต) ..."
-  "$PY" -m venv .venv || { echo "สร้าง .venv ไม่สำเร็จ"; read -p "กด Enter เพื่อปิด"; exit 1; }
+if [ ! -f .venv/.installed ] || [ requirements.txt -nt .venv/.installed ]; then
+  echo "กำลังติดตั้งไลบรารี (ประมาณ 1-2 นาที ต้องต่ออินเทอร์เน็ต) ..."
+  [ -x .venv/bin/python ] || "$PY" -m venv .venv || { echo "สร้าง .venv ไม่สำเร็จ"; read -p "กด Enter เพื่อปิด"; exit 1; }
   .venv/bin/python -m pip install --upgrade pip -q
   if ! .venv/bin/python -m pip install -r requirements.txt; then
     echo "ติดตั้งไลบรารีไม่สำเร็จ"; read -p "กด Enter เพื่อปิด"; exit 1

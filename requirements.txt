@@ -2,3 +2,7 @@ mss>=9
 Pillow>=9
 pynput>=1.7.6
 cryptography>=41
+# แชทโทรเสียง/วีดีโอคอล
+sounddevice>=0.4.6
+numpy>=1.24
+opencv-python-headless>=4.8

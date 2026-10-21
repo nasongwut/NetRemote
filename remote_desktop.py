@@ -51,7 +51,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 APP = "NetRemote"
-VERSION = "1.4"
+VERSION = "1.5"
 PROTO = 1
 DEFAULT_PORT = 5905
 SYSTEM = platform.system()
@@ -460,7 +460,42 @@ _EN = {
 "รีสตาร์ตโปรแกรมเพื่ออัปเดตเป็นเวอร์ชัน %s ตอนนี้?": "Restart the program now to update to version %s?",
 "การรีโมทที่เปิดอยู่จะถูกตัด": "Open remote sessions will be disconnected.",
 "ติดตั้งอัปเดตไม่สำเร็จ: %s": "Could not install the update: %s",
-"กำลังอัปเดตเป็นเวอร์ชัน %s …": "Updating to version %s …"
+"กำลังอัปเดตเป็นเวอร์ชัน %s …": "Updating to version %s …",
+"ไฟล์ใหญ่เกิน 2 GB — ใช้ปุ่ม 📁 ไฟล์ แทน": "File is larger than 2 GB — use the 📁 Files button instead",
+"ไฟล์ไม่สมบูรณ์": "The file is incomplete",
+"อีกฝั่งยกเลิกการส่ง": "The other side cancelled the transfer",
+"ไม่พบไมโครโฟนหรือลำโพงในเครื่องนี้": "No microphone or speaker found on this computer",
+"เปิดไมโครโฟน/ลำโพงไม่ได้: %s": "Cannot open the microphone/speaker: %s",
+"เปิดกล้องไม่ได้": "Cannot open the camera",
+"เปิดกล้องไม่ได้: %s": "Cannot open the camera: %s",
+"แชท": "Chat",
+"เครื่องปลายทาง (%s) ใช้โปรแกรมเวอร์ชันเก่าที่ยังไม่มีแชท\n\nให้อัปเดตโปรแกรมบนเครื่องปลายทาง แล้วเชื่อมต่อใหม่": "The remote computer (%s) runs an older version without chat\n\nUpdate the program on the remote computer, then reconnect",
+"รับสาย": "Answer",
+"วางสาย": "Hang up",
+"ยังไม่มีข้อความ\nพิมพ์ข้อความ หรือส่งไฟล์ รูป วีดีโอได้ที่ด้านล่าง": "No messages yet\nType a message, or send files, photos and videos below",
+"รูป": "Photo",
+"วีดีโอ": "Video",
+"เลือกไฟล์ที่จะส่ง": "Choose files to send",
+"เลือกรูปที่จะส่ง": "Choose photos to send",
+"เลือกวีดีโอที่จะส่ง": "Choose videos to send",
+"รูปภาพ": "Images",
+"ทุกไฟล์": "All files",
+"ส่งแล้ว ✓": "Sent ✓",
+"ได้รับแล้ว ✓": "Received ✓",
+"เปิด": "Open",
+"แสดงในโฟลเดอร์": "Show in folder",
+"ส่งไม่สำเร็จ": "Failed to send",
+"ไม่พบไมโครโฟนหรือลำโพงในเครื่องนี้ จึงโทรไม่ได้": "No microphone or speaker found on this computer, so you can't call",
+"ไม่พบกล้องในเครื่องนี้ — จะโทรด้วยเสียงอย่างเดียว": "No camera found on this computer — calling with voice only",
+"วีดีโอคอลเข้า…": "Incoming video call…",
+"สายเรียกเข้า…": "Incoming call…",
+"วางสายแล้ว · %d:%02d": "Call ended · %d:%02d",
+"อีกฝั่งไม่รับสาย": "No answer",
+"อีกฝั่งสายไม่ว่าง": "The other side is busy",
+"อีกฝั่งไม่มีไมโครโฟน/ลำโพง": "The other side has no microphone/speaker",
+"ยกเลิกการโทร": "Call cancelled",
+"กำลังโทรหา %s …": "Calling %s …",
+"กำลังคุย": "On call"
 }
 _TH = {v: k for k, v in _EN.items()}
 
@@ -861,14 +896,20 @@ class Channel(threading.Thread):
         self.last_rx = time.time()
         self.bytes_in = self.bytes_out = 0
         self.reason = ""
+        self.qbytes = 0                      # ข้อมูลที่รอส่ง (ใช้ชะลอการส่งไฟล์ไม่ให้แย่งภาพ/เสียง)
+        self.wlen = 0
 
     def send(self, t, payload=b""):
         if not self.alive:
             return False
         with self.lock:
             self.out.append(HDR.pack(t, len(payload)) + payload)
+            self.qbytes += HDR.size + len(payload)
         self._wake()
         return True
+
+    def backlog(self):
+        return self.qbytes + self.wlen
 
     def _wake(self):
         try:
@@ -893,6 +934,7 @@ class Channel(threading.Thread):
                         if self.out:
                             wbuf = b"".join(self.out)
                             self.out.clear()
+                            self.qbytes = 0
                 pend = sock.pending() if hasattr(sock, "pending") else 0
                 try:
                     r, w, _ = select.select([sock, self.wr], [sock] if wbuf else [], [], 0 if pend else 0.5)
@@ -936,6 +978,7 @@ class Channel(threading.Thread):
                         n = sock.send(wbuf[:262144])
                         wbuf = wbuf[n:]
                         self.bytes_out += n
+                        self.wlen = len(wbuf)
                     except (ssl.SSLWantWriteError, ssl.SSLWantReadError, BlockingIOError, InterruptedError):
                         pass
                 if self.idle and time.time() - self.last_rx > self.idle:
@@ -1296,7 +1339,7 @@ class Server(threading.Thread):
                 self.log(tr("⚠ ควบคุมเมาส์/คีย์บอร์ดไม่ได้: %s") % err_text(e))
             mons = [{"w": m["width"], "h": m["height"]} for m in cap.monitors]
             send_msg(tls, T_OK, jdump({"name": computer_name(), "os": SYSTEM, "monitors": mons,
-                                       "files": bool(self.allow_files), "v": PROTO,
+                                       "files": bool(self.allow_files), "v": PROTO, "chat": 1,
                                        "control": bool(self.allow_control and inj)}))
             self._session_loop(tls, ip, name, cap, inj)
         except Exception as e:
@@ -1324,6 +1367,10 @@ class Server(threading.Thread):
         def on_message(t, p):
             if t in FILE_TYPES:
                 fs.handle(t, p)
+            elif t in CHAT_TYPES:
+                chat.handle(t, p)
+            elif t in CALL_TYPES:
+                call.handle(t, p)
             elif t == T_REQ:
                 d = jload(p)
                 new = {"max_w": int(d.get("max_w", 1600)), "q": int(d.get("q", 60)),
@@ -1353,7 +1400,17 @@ class Server(threading.Thread):
 
         chan = Channel(tls, on_message, on_close)
         fs = FileServer(chan, self.log, lambda: self.allow_files, "%s (%s)" % (name, ip))
+
+        def deliver(ev):
+            if ev.get("ev") == "call_incoming" and not getattr(self, "ui", True):
+                call.decline("nodev")                # โหมดไม่มีหน้าต่าง: รับสายไม่ได้
+                return
+            self.events.put(("chat", ev))
+        chat = ChatEngine(chan, deliver, name)
+        call = CallEngine(chan, deliver)
         self.session["chan"] = chan
+        self.session["chat"], self.session["call"] = chat, call
+        self.events.put(("chat_open", chat, call, name))
         chan.start()
         self.events.put(("session", ip, name))
         self.log(tr("● %s (%s) เชื่อมต่อแล้ว") % (name, ip))
@@ -1410,6 +1467,9 @@ class Server(threading.Thread):
             last_sent = time.time()
             last_cur = cur
         fs.close()
+        chat.close()
+        call.close()
+        self.events.put(("chat_end",))
         chan.close(tr("เครื่องนี้ตัดการเชื่อมต่อ") if self.stop_event.is_set() else "")
         chan.join(3)
         self.events.put(("session_end", ip, reason["r"] or chan.reason))
@@ -2050,6 +2110,419 @@ def _relay_socket(addr, timeout=10):
     s = socket.create_connection((h, p), timeout=timeout)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     return s
+
+
+# ============================================================================
+# แชท + ส่งไฟล์/รูป/วีดีโอ + โทรเสียง/วีดีโอคอล (ระหว่างผู้ควบคุมกับเครื่องปลายทาง)
+# วิ่งในช่องเดียวกับภาพหน้าจอ (เข้ารหัส TLS) — ถ้าเชื่อมต่อแบบ P2P ก็ไม่ผ่าน Server
+# ============================================================================
+T_CHAT = 70
+T_CF_BEGIN, T_CF_DATA, T_CF_END, T_CF_CANCEL = 71, 72, 73, 74
+T_CALL, T_AUDIO, T_VIDEO = 80, 81, 82
+CHAT_TYPES = {T_CHAT, T_CF_BEGIN, T_CF_DATA, T_CF_END, T_CF_CANCEL}
+CALL_TYPES = {T_CALL, T_AUDIO, T_VIDEO}
+CHAT_MAX_FILE = 2 * 1024 ** 3
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".heic", ".tif", ".tiff")
+VIDEO_EXT = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".wmv", ".3gp")
+AUDIO_RATE, AUDIO_BLOCK = 16000, 320                 # 16 kHz mono 16-bit, ช่วงละ 20 ms
+
+
+def chat_dir():
+    base = env_str("DOWNLOAD_DIR", "") or os.path.join(os.path.expanduser("~"), "Downloads")
+    return os.path.join(os.path.expanduser(base), "NetRemote Chat")
+
+
+def file_kind(name):
+    n = name.lower()
+    return "image" if n.endswith(IMAGE_EXT) else ("video" if n.endswith(VIDEO_EXT) else "file")
+
+
+def media_available():
+    """(ไมค์/ลำโพงใช้ได้?, กล้องใช้ได้?) — ตรวจครั้งเดียวแล้วจำไว้"""
+    global _MEDIA
+    try:
+        return _MEDIA
+    except NameError:
+        pass
+    audio = video = False
+    try:
+        import sounddevice as sd
+        devs = sd.query_devices()
+        audio = any(d.get("max_input_channels", 0) > 0 for d in devs) and \
+            any(d.get("max_output_channels", 0) > 0 for d in devs)
+    except Exception:
+        audio = False
+    try:
+        import cv2  # noqa: F401
+        video = True
+    except Exception:
+        video = False
+    _MEDIA = (audio, video)
+    return _MEDIA
+
+
+class ChatEngine:
+    """ส่ง/รับข้อความและไฟล์ในแชท — ไม่มี UI; ส่งเหตุการณ์ออกทาง deliver(dict) (เรียกจาก thread อื่น)"""
+
+    def __init__(self, chan, deliver, peer=""):
+        self.chan, self.deliver, self.peer = chan, deliver, peer
+        self.rx = {}
+        self.cancelled = set()
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def _id(self):
+        return secrets.token_hex(6)
+
+    def send_text(self, text):
+        text = str(text).strip()
+        if not text:
+            return None
+        m = {"id": self._id(), "text": text[:8000], "t": time.time(), "name": computer_name()}
+        self.chan.send(T_CHAT, jdump(m))
+        self.deliver(dict(m, ev="msg", mine=True))
+        return m["id"]
+
+    def send_file(self, path):
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            self.deliver({"ev": "error", "text": err_text(e)})
+            return None
+        if size > CHAT_MAX_FILE:
+            self.deliver({"ev": "error", "text": tr("ไฟล์ใหญ่เกิน 2 GB — ใช้ปุ่ม 📁 ไฟล์ แทน")})
+            return None
+        fid = self._id()
+        name = os.path.basename(path)
+        meta = {"id": fid, "name": name, "size": size, "kind": file_kind(name), "t": time.time(),
+                "name_from": computer_name()}
+        self.deliver(dict(meta, ev="file", mine=True, path=path, done=0, status="sending"))
+        threading.Thread(target=self._send_worker, args=(path, meta), daemon=True).start()
+        return fid
+
+    def cancel(self, fid):
+        self.cancelled.add(fid)
+        self.chan.send(T_CF_CANCEL, jdump({"id": fid}))
+
+    def _send_worker(self, path, meta):
+        fid = meta["id"]
+        bid = bytes.fromhex(fid)
+        sha = hashlib.sha256()
+        sent = 0
+        try:
+            self.chan.send(T_CF_BEGIN, jdump(meta))
+            with open(path, "rb") as f:
+                last = 0
+                while True:
+                    if fid in self.cancelled or not self.chan.alive:
+                        raise InterruptedError(tr("ยกเลิกแล้ว"))
+                    while self.chan.backlog() > 1024 * 1024 and self.chan.alive:   # ไม่ให้ไฟล์แย่งช่องภาพ/เสียง
+                        time.sleep(0.01)
+                    chunk = f.read(65536)
+                    if not chunk:
+                        break
+                    sha.update(chunk)
+                    self.chan.send(T_CF_DATA, bid + chunk)
+                    sent += len(chunk)
+                    if time.time() - last > 0.2:
+                        last = time.time()
+                        self.deliver({"ev": "progress", "id": fid, "done": sent, "size": meta["size"]})
+            self.chan.send(T_CF_END, jdump({"id": fid, "sha256": sha.hexdigest()}))
+            self.deliver({"ev": "progress", "id": fid, "done": sent, "size": meta["size"], "status": "sent"})
+        except Exception as e:
+            self.deliver({"ev": "progress", "id": fid, "done": sent, "size": meta["size"], "status": "failed",
+                          "text": err_text(e) if not isinstance(e, InterruptedError) else tr("ยกเลิกแล้ว")})
+
+    def handle(self, t, p):
+        if t == T_CHAT:
+            m = jload(p)
+            self.deliver(dict(m, ev="msg", mine=False))
+        elif t == T_CF_BEGIN:
+            m = jload(p)
+            fid = str(m.get("id", ""))
+            d = chat_dir()
+            os.makedirs(d, exist_ok=True)
+            path = unique_path(os.path.join(d, os.path.basename(str(m.get("name", "file"))) or "file"))
+            try:
+                fh = open(path + PART_EXT, "wb")
+            except OSError as e:
+                self.deliver({"ev": "error", "text": err_text(e)})
+                return
+            with self.lock:
+                self.rx[fid] = {"fh": fh, "path": path, "sha": hashlib.sha256(), "got": 0, "meta": m, "last": 0}
+            self.deliver(dict(m, ev="file", mine=False, path=path, done=0, status="receiving"))
+        elif t == T_CF_DATA:
+            fid = p[:6].hex()
+            r = self.rx.get(fid)
+            if not r:
+                return
+            r["fh"].write(p[6:])
+            r["sha"].update(p[6:])
+            r["got"] += len(p) - 6
+            if time.time() - r["last"] > 0.2:
+                r["last"] = time.time()
+                self.deliver({"ev": "progress", "id": fid, "done": r["got"], "size": r["meta"].get("size", 0)})
+        elif t == T_CF_END:
+            m = jload(p)
+            fid = str(m.get("id", ""))
+            with self.lock:
+                r = self.rx.pop(fid, None)
+            if not r:
+                return
+            r["fh"].close()
+            ok = r["sha"].hexdigest() == m.get("sha256")
+            if ok:
+                os.replace(r["path"] + PART_EXT, r["path"])
+            else:
+                try:
+                    os.remove(r["path"] + PART_EXT)
+                except OSError:
+                    pass
+            self.deliver({"ev": "progress", "id": fid, "done": r["got"], "size": r["meta"].get("size", 0),
+                          "status": "received" if ok else "failed", "path": r["path"],
+                          "text": "" if ok else tr("ไฟล์ไม่สมบูรณ์")})
+        elif t == T_CF_CANCEL:
+            fid = str(jload(p).get("id", ""))
+            self.cancelled.add(fid)
+            with self.lock:
+                r = self.rx.pop(fid, None)
+            if r:
+                r["fh"].close()
+                try:
+                    os.remove(r["path"] + PART_EXT)
+                except OSError:
+                    pass
+            self.deliver({"ev": "progress", "id": fid, "status": "failed", "text": tr("อีกฝั่งยกเลิกการส่ง")})
+
+    def close(self):
+        self.closed = True
+        with self.lock:
+            rx, self.rx = self.rx, {}
+        for r in rx.values():
+            try:
+                r["fh"].close()
+                os.remove(r["path"] + PART_EXT)
+            except OSError:
+                pass
+
+
+class CallEngine:
+    """โทรเสียง / วีดีโอคอล — สัญญาณ (invite/accept/decline/end) + สตรีมเสียง PCM และภาพ JPEG
+    ส่งเหตุการณ์ทาง deliver(dict): call_incoming, call_state, remote_video, self_video, call_error"""
+
+    def __init__(self, chan, deliver):
+        self.chan, self.deliver = chan, deliver
+        self.state = "idle"                  # idle / calling / ringing / active
+        self.video = False                   # เปิดกล้องฝั่งเรา
+        self.muted = False
+        self.started = 0
+        self.lock = threading.Lock()
+        self.play = bytearray()
+        self.play_ready = False
+        self.in_stream = self.out_stream = None
+        self.cam_stop = threading.Event()
+        self.peer_video = False
+        self.sid = None
+
+    # ----- สัญญาณ -----
+    def _sig(self, op, **kw):
+        kw.update(op=op, sid=self.sid)
+        self.chan.send(T_CALL, jdump(kw))
+
+    def start_call(self, video):
+        if self.state != "idle":
+            return
+        audio_ok, video_ok = media_available()
+        if not audio_ok:
+            self.deliver({"ev": "call_error", "text": tr("ไม่พบไมโครโฟนหรือลำโพงในเครื่องนี้")})
+            return
+        self.sid = secrets.token_hex(4)
+        self.video = bool(video and video_ok)
+        self._set("calling")
+        self._sig("invite", video=self.video)
+
+    def accept(self, video=False):
+        if self.state != "ringing":
+            return
+        audio_ok, video_ok = media_available()
+        if not audio_ok:
+            self.deliver({"ev": "call_error", "text": tr("ไม่พบไมโครโฟนหรือลำโพงในเครื่องนี้")})
+            self.decline("nodev")
+            return
+        self.video = bool(video and video_ok)
+        self._sig("accept", video=self.video)
+        self._begin()
+
+    def decline(self, reason="declined"):
+        if self.state in ("ringing", "calling"):
+            self._sig("decline", reason=reason)
+        self._finish(reason)
+
+    def hangup(self):
+        if self.state != "idle":
+            self._sig("end")
+        self._finish("ended")
+
+    def set_mute(self, on):
+        self.muted = bool(on)
+
+    def set_video(self, on):
+        on = bool(on) and media_available()[1]
+        if on == self.video:
+            return
+        self.video = on
+        if self.state == "active":
+            self._sig("video", on=on)
+            if on:
+                self._start_camera()
+            else:
+                self.cam_stop.set()
+                self.deliver({"ev": "self_video", "jpg": None})
+
+    def handle(self, t, p):
+        if t == T_AUDIO:
+            if self.state == "active":
+                with self.lock:
+                    self.play += p
+                    cap = AUDIO_RATE * 2 * 0.4             # เก็บไม่เกิน 0.4 วินาที กันเสียงดีเลย์สะสม
+                    if len(self.play) > cap:
+                        del self.play[:len(self.play) - int(AUDIO_RATE * 2 * 0.12)]
+            return
+        if t == T_VIDEO:
+            if self.state == "active":
+                self.deliver({"ev": "remote_video", "jpg": p})
+            return
+        m = jload(p)
+        op = m.get("op")
+        if op == "invite":
+            if self.state != "idle":
+                self.chan.send(T_CALL, jdump({"op": "decline", "sid": m.get("sid"), "reason": "busy"}))
+                return
+            self.sid = m.get("sid")
+            self.peer_video = bool(m.get("video"))
+            self._set("ringing")
+            self.deliver({"ev": "call_incoming", "video": self.peer_video, "name": m.get("name", "")})
+        elif m.get("sid") != self.sid:
+            return
+        elif op == "accept" and self.state == "calling":
+            self.peer_video = bool(m.get("video"))
+            self._begin()
+        elif op == "decline":
+            self._finish(m.get("reason") or "declined")
+        elif op == "end":
+            self._finish("ended")
+        elif op == "video":
+            self.peer_video = bool(m.get("on"))
+            if not self.peer_video:
+                self.deliver({"ev": "remote_video", "jpg": None})
+            self.deliver({"ev": "call_state", "state": self.state, "peer_video": self.peer_video})
+
+    def _set(self, state):
+        self.state = state
+        self.deliver({"ev": "call_state", "state": state, "video": self.video, "peer_video": self.peer_video,
+                      "started": self.started})
+
+    # ----- สื่อ -----
+    def _begin(self):
+        self.started = time.time()
+        with self.lock:
+            self.play = bytearray()
+            self.play_ready = False
+        try:
+            self._start_audio()
+        except Exception as e:
+            self.deliver({"ev": "call_error", "text": tr("เปิดไมโครโฟน/ลำโพงไม่ได้: %s") % err_text(e)})
+            self.hangup()
+            return
+        self._set("active")
+        if self.video:
+            self._start_camera()
+
+    def _start_audio(self):
+        import sounddevice as sd
+
+        def mic(indata, frames, ti, status):
+            if self.state == "active" and not self.muted and self.chan.alive:
+                self.chan.send(T_AUDIO, bytes(indata))
+
+        def spk(outdata, frames, ti, status):
+            need = frames * 2
+            with self.lock:
+                if not self.play_ready and len(self.play) >= AUDIO_RATE * 2 * 0.06:
+                    self.play_ready = True             # รอเก็บเสียงไว้ 60 ms ก่อนเริ่มเล่น ลดเสียงสะดุด
+                if self.play_ready and len(self.play) >= need:
+                    outdata[:] = bytes(self.play[:need])
+                    del self.play[:need]
+                    return
+                got = bytes(self.play) if self.play_ready else b""
+                self.play = bytearray()
+                self.play_ready = False
+            outdata[:] = got + b"\0" * (need - len(got))
+
+        self.in_stream = sd.RawInputStream(samplerate=AUDIO_RATE, channels=1, dtype="int16",
+                                           blocksize=AUDIO_BLOCK, callback=mic)
+        self.out_stream = sd.RawOutputStream(samplerate=AUDIO_RATE, channels=1, dtype="int16",
+                                             blocksize=AUDIO_BLOCK, callback=spk)
+        self.in_stream.start()
+        self.out_stream.start()
+
+    def _start_camera(self):
+        self.cam_stop = threading.Event()
+        threading.Thread(target=self._camera_loop, args=(self.cam_stop,), daemon=True).start()
+
+    def _camera_loop(self, stop):
+        try:
+            import cv2
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                raise OSError(tr("เปิดกล้องไม่ได้"))
+        except Exception as e:
+            self.deliver({"ev": "call_error", "text": tr("เปิดกล้องไม่ได้: %s") % err_text(e)})
+            self.video = False
+            self._sig("video", on=False)
+            return
+        try:
+            last_prev = 0
+            while not stop.is_set() and self.state == "active" and self.video and self.chan.alive:
+                t0 = time.time()
+                ok, frame = cap.read()
+                if not ok:
+                    time.sleep(0.05)
+                    continue
+                h, w = frame.shape[:2]
+                if w > 480:
+                    frame = cv2.resize(frame, (480, int(h * 480 / w)), interpolation=cv2.INTER_AREA)
+                ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 62])
+                if ok:
+                    data = jpg.tobytes()
+                    if self.chan.backlog() < 384 * 1024:            # เน็ตช้า: ข้ามภาพ แต่เสียงยังไป
+                        self.chan.send(T_VIDEO, data)
+                    if time.time() - last_prev > 0.1:
+                        last_prev = time.time()
+                        self.deliver({"ev": "self_video", "jpg": data})
+                time.sleep(max(0.0, 1 / 15 - (time.time() - t0)))
+        finally:
+            cap.release()
+
+    def _finish(self, reason):
+        was = self.state
+        self.state = "idle"
+        self.cam_stop.set()
+        for s in (self.in_stream, self.out_stream):
+            try:
+                if s:
+                    s.stop()
+                    s.close()
+            except Exception:
+                pass
+        self.in_stream = self.out_stream = None
+        dur = time.time() - self.started if self.started and was == "active" else 0
+        self.started = 0
+        self.deliver({"ev": "call_state", "state": "idle", "reason": reason, "was": was, "duration": dur})
+
+    def close(self):
+        if self.state != "idle":
+            self._finish("ended")
 
 
 # ============================================================================
@@ -2765,7 +3238,7 @@ def client_connect(host, port, password, confirm_fp, relay=None):
         if not confirm_fp(host, fp, hello.get("name", "")):
             raise ConnectionError(tr("ยกเลิกการเชื่อมต่อ — ยืนยันตัวตนของเครื่องปลายทางไม่ได้"))
         nonce = base64.b64decode(hello["nonce"])
-        send_msg(tls, T_AUTH, jdump({"mac": auth_mac(password, nonce, fp), "name": computer_name(),
+        send_msg(tls, T_AUTH, jdump({"mac": auth_mac(password, nonce, fp), "name": computer_name(), "chat": 1,
                                      "os": SYSTEM}))
         tls.settimeout(70)                          # ปลายทางอาจต้องกดยืนยัน
         t, p = recv_msg(tls)
@@ -3124,14 +3597,19 @@ def run_gui():
             ttk.Button(inner, text=tr("✎ ข้อความ"), style="Tool.TButton", command=self.send_text).pack(side="right", padx=(0, 5))
             ttk.Button(inner, text=tr("📁 ไฟล์"), style="Tool.Accent.TButton",
                        command=self.open_files).pack(side="right", padx=(0, 5))
+            self.chat_btn = ttk.Button(inner, text="💬 " + tr("แชท"), style="Tool.Accent.TButton",
+                                       command=self.toggle_chat)
+            self.chat_btn.pack(side="right", padx=(0, 5))
             self.lat_lbl = lbl(inner, "Latency —", fg="muted", bg="subtle", font="smallbold", padx=10, pady=4)
             self.lat_lbl.pack(side="right", padx=(0, 12))
             self.rtt = self.rtt_avg = self.rtt_min = self.rtt_max = None
             self.last_pong = time.time()
             T.track(tk.Frame(win, height=1, bd=0), bg="border").pack(fill="x")
 
-            self.canvas = T.track(tk.Canvas(win, highlightthickness=0, cursor="arrow"), bg="viewer")
-            self.canvas.pack(fill="both", expand=True)
+            self.body = box(win, bg="viewer")
+            self.body.pack(fill="both", expand=True)
+            self.canvas = T.track(tk.Canvas(self.body, highlightthickness=0, cursor="arrow"), bg="viewer")
+            self.canvas.pack(side="left", fill="both", expand=True)
             self.img_item = self.canvas.create_image(0, 0, anchor="nw")
             self.cur_item = self.canvas.create_polygon(0, 0, 0, 0, fill="white", outline="black", width=1)
             self.wait_item = self.canvas.create_text(300, 200, text=tr("กำลังรับภาพหน้าจอ…"), fill="#9AA3B2",
@@ -3141,7 +3619,6 @@ def run_gui():
             st.pack(fill="x")
             self.status = tk.StringVar(value=tr("เชื่อมต่อแล้ว"))
             lbl(st, textvariable=self.status, fg="muted", bg="bg", font="small").pack(side="left", padx=12, pady=5)
-            lbl(st, "🔒 TLS  %s" % fp[:23], fg="muted", bg="bg", font="small").pack(side="right", padx=12)
 
             c = self.canvas
             c.bind("<Configure>", lambda e: self._mark_dirty())
@@ -3162,7 +3639,19 @@ def run_gui():
             self.chan = Channel(tls, self._on_message, self._on_close, idle_timeout=15)
             self.files = FileClient(self.chan)
             self.fw = None
+            # แชท + โทร: แผงด้านขวา กว้าง 1/8 ของหน้าจอ ซ่อน/แสดงได้
+            self.cq = queue.Queue()
+            self.chat = ChatEngine(self.chan, self.cq.put, info.get("name", host))
+            self.call = CallEngine(self.chan, self.cq.put)
+            pw = max(260, int(win.winfo_screenwidth() / 8))
+            self.panel = ChatPanel(self.body, self.chat, self.call, info.get("name", host), on_hide=self.toggle_chat,
+                                   width=pw)
+            self.panel.on_unread = self._on_unread
+            self.panel_shown = False
+            if app.cfg.get("chat_open"):
+                self.toggle_chat()
             self.chan.start()
+            self.win.after(40, self._chat_poll)
             self.request(full=True)
             self.win.after(16, self._render_loop)
             self.win.after(1000, self._stats_loop)
@@ -3193,6 +3682,12 @@ def run_gui():
         def _on_message(self, t, p):
             if t in FILE_TYPES:
                 self.files.handle(t, p)
+                return
+            if t in CHAT_TYPES:
+                self.chat.handle(t, p)
+                return
+            if t in CALL_TYPES:
+                self.call.handle(t, p)
                 return
             if t == T_PONG:
                 try:
@@ -3413,6 +3908,50 @@ def run_gui():
             full = not bool(self.win.attributes("-fullscreen"))
             self.win.attributes("-fullscreen", full)
 
+        # ----- แชท / โทร -----
+        def toggle_chat(self, show=None):
+            show = (not self.panel_shown) if show is None else show
+            if show and not self.info.get("chat"):
+                messagebox.showinfo(APP, tr("เครื่องปลายทาง (%s) ใช้โปรแกรมเวอร์ชันเก่าที่ยังไม่มีแชท\n\n"
+                                            "ให้อัปเดตโปรแกรมบนเครื่องปลายทาง แล้วเชื่อมต่อใหม่") % self.info.get("name", ""),
+                                    parent=self.win)
+                return
+            if show == self.panel_shown:
+                return
+            self.panel_shown = show
+            if show:
+                self.panel.frame.pack(side="right", fill="y", before=self.canvas)
+                self.panel.seen()
+                self.panel.entry.focus_set()
+            else:
+                self.panel.frame.pack_forget()
+                self.canvas.focus_set()
+            self.app.cfg["chat_open"] = show
+            self.dirty = True
+
+        def _on_unread(self, n):
+            if n == -1:                                   # สายเรียกเข้า → เปิดแผงแชทให้เห็นปุ่มรับสาย
+                self.toggle_chat(True)
+                return
+            self.chat_btn.configure(text="💬 " + tr("แชท") + (" (%d)" % n if n else ""))
+
+        def _chat_poll(self):
+            if self.closed:
+                return
+            latest_video = None
+            try:
+                for _ in range(200):
+                    ev = self.cq.get_nowait()
+                    if ev.get("ev") == "remote_video":       # เก็บเฉพาะภาพล่าสุด ลดภาระการวาด
+                        latest_video = ev
+                        continue
+                    self.panel.on_event(ev, self.panel_shown)
+            except queue.Empty:
+                pass
+            if latest_video is not None:
+                self.panel.on_event(latest_video, self.panel_shown)
+            self.win.after(40, self._chat_poll)
+
         def disconnect(self):
             if not self.closed:
                 self.chan.close(tr("ตัดการเชื่อมต่อแล้ว"))
@@ -3439,6 +3978,11 @@ def run_gui():
                 return
             self.closed = True
             self.files.close()
+            try:
+                self.call.close()
+                self.chat.close()
+            except Exception:
+                pass
             try:
                 self.win.destroy()
             except Exception:
@@ -3590,6 +4134,422 @@ def run_gui():
             except Exception as e:
                 log_error(e)
         return LocalPicker(parent, title, "folder", initial).result or ""
+
+    # ------------------------------------------------------------------
+    # แผงแชท + โทร (ใช้ทั้งในหน้าต่างรีโมท และหน้าต่างแชทของเครื่องปลายทาง)
+    # ------------------------------------------------------------------
+    def show_in_folder(p):
+        try:
+            if SYSTEM == "Darwin":
+                subprocess.Popen(["open", "-R", p])
+            elif SYSTEM == "Windows":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(p)])
+            else:
+                open_path(os.path.dirname(p))
+        except Exception:
+            pass
+
+    class ChatPanel:
+        def __init__(self, parent, chat, call, peer, on_hide=None, width=300):
+            self.chat, self.call, self.peer, self.on_hide = chat, call, peer, on_hide
+            self.width = width
+            self.cards = {}
+            self.imgs = []
+            self.unread = 0
+            self.on_unread = None
+            self.call_dialog = None
+            self.remote_photo = self.self_photo = None
+            f = self.frame = T.track(tk.Frame(parent, width=width, bd=0, highlightthickness=0), bg="card")
+            f.pack_propagate(False)
+            T.track(tk.Frame(f, width=1, bd=0), bg="border").pack(side="left", fill="y")
+            body = self.body = box(f)
+            body.pack(side="left", fill="both", expand=True)
+
+            # --- หัว: ชื่อ + ปุ่มโทร ---
+            head = box(body)
+            head.pack(fill="x", padx=10, pady=(10, 6))
+            if on_hide:
+                ttk.Button(head, text="⟩", width=2, style="Tool.TButton", command=on_hide).pack(side="right")
+            self.vbtn = ttk.Button(head, text="🎥", width=3, style="Tool.TButton", command=lambda: self._call(True))
+            self.vbtn.pack(side="right", padx=(4, 4))
+            self.abtn = ttk.Button(head, text="📞", width=3, style="Tool.TButton", command=lambda: self._call(False))
+            self.abtn.pack(side="right")
+            lbl(head, "💬 " + tr("แชท"), font="h2").pack(side="left")
+            self.sub = lbl(body, peer, fg="muted", font="small")
+            self.sub.pack(fill="x", padx=12)
+
+            # --- พื้นที่โทร (ซ่อนจนกว่าจะมีการโทร) ---
+            self.callbox = T.track(tk.Frame(body, bd=0), bg="viewer")
+            self.remote_lbl = T.track(tk.Label(self.callbox, bd=0, text="", font=T.f["h2"], fg="#FFFFFF"), bg="viewer")
+            self.remote_lbl.pack(fill="x")
+            self.self_lbl = T.track(tk.Label(self.callbox, bd=1, relief="solid"), bg="viewer")
+            self.call_info = T.track(tk.Label(self.callbox, text="", font=T.f["smallbold"], fg="#FFFFFF"), bg="viewer")
+            self.call_info.pack(fill="x", pady=(4, 2))
+            cb = T.track(tk.Frame(self.callbox, bd=0), bg="viewer")
+            cb.pack(pady=(2, 8))
+            self.mute_btn = ttk.Button(cb, text="🎤", width=3, style="Tool.TButton", command=self._toggle_mute)
+            self.mute_btn.pack(side="left", padx=3)
+            self.cam_btn = ttk.Button(cb, text="📷", width=3, style="Tool.TButton", command=self._toggle_cam)
+            self.cam_btn.pack(side="left", padx=3)
+            self.answer_btn = ttk.Button(cb, text="📞 " + tr("รับสาย"), style="Tool.Accent.TButton",
+                                         command=self._answer)
+            self.hang_btn = ttk.Button(cb, text="⏹ " + tr("วางสาย"), style="Tool.Danger.TButton", command=self._hang)
+            self.hang_btn.pack(side="left", padx=3)
+
+            # --- ข้อความ ---
+            mid = box(body)
+            mid.pack(fill="both", expand=True, pady=(8, 0))
+            self.cv = T.track(tk.Canvas(mid, highlightthickness=0, bd=0), bg="bg")
+            sb = ttk.Scrollbar(mid, orient="vertical", command=self.cv.yview)
+            self.cv.configure(yscrollcommand=sb.set)
+            sb.pack(side="right", fill="y")
+            self.cv.pack(side="left", fill="both", expand=True)
+            self.inner = box(self.cv, bg="bg")
+            self.win_id = self.cv.create_window(0, 0, window=self.inner, anchor="nw")
+            self.inner.bind("<Configure>", lambda e: self.cv.configure(scrollregion=self.cv.bbox("all")))
+            self.cv.bind("<Configure>", lambda e: self.cv.itemconfigure(self.win_id, width=e.width))
+            for w in (self.cv, self.inner):
+                w.bind("<MouseWheel>", self._wheel)
+                w.bind("<Button-4>", lambda e: self.cv.yview_scroll(-2, "units"))
+                w.bind("<Button-5>", lambda e: self.cv.yview_scroll(2, "units"))
+            self.empty = lbl(self.inner, tr("ยังไม่มีข้อความ\nพิมพ์ข้อความ หรือส่งไฟล์ รูป วีดีโอได้ที่ด้านล่าง"),
+                             fg="muted", bg="bg", font="small", justify="center", anchor="center")
+            self.empty.pack(fill="x", pady=30)
+
+            # --- ช่องพิมพ์ ---
+            T.track(tk.Frame(body, height=1, bd=0), bg="border").pack(fill="x")
+            att = box(body)
+            att.pack(fill="x", padx=8, pady=(6, 0))
+            for txt, kind in (("📎 " + tr("ไฟล์"), "file"), ("🖼 " + tr("รูป"), "image"), ("🎬 " + tr("วีดีโอ"), "video")):
+                ttk.Button(att, text=txt, style="Tool.TButton", command=lambda k=kind: self._attach(k)).pack(
+                    side="left", padx=(0, 4))
+            row = box(body)
+            row.pack(fill="x", padx=8, pady=8)
+            self.entry_var = tk.StringVar()
+            e = self.entry = ttk.Entry(row, textvariable=self.entry_var)
+            e.pack(side="left", fill="x", expand=True, ipady=3)
+            e.bind("<Return>", lambda ev: self._send())
+            ttk.Button(row, text="➤", width=3, style="Accent.TButton", command=self._send).pack(side="left", padx=(6, 0))
+            self._tick()
+
+        # ----- ข้อความ -----
+        def _wheel(self, e):
+            self.cv.yview_scroll(-1 if e.delta > 0 else 1, "units") if abs(e.delta) < 120 else \
+                self.cv.yview_scroll(int(-e.delta / 120), "units")
+
+        def _send(self):
+            text = self.entry_var.get()
+            if text.strip():
+                self.chat.send_text(text)
+                self.entry_var.set("")
+
+        def _attach(self, kind):
+            title = {"file": tr("เลือกไฟล์ที่จะส่ง"), "image": tr("เลือกรูปที่จะส่ง"), "video": tr("เลือกวีดีโอที่จะส่ง")}[kind]
+            paths = []
+            if SYSTEM != "Darwin":
+                types = {"image": [(tr("รูปภาพ"), " ".join("*" + x for x in IMAGE_EXT)), (tr("ทุกไฟล์"), "*")],
+                         "video": [(tr("วีดีโอ"), " ".join("*" + x for x in VIDEO_EXT)), (tr("ทุกไฟล์"), "*")],
+                         "file": [(tr("ทุกไฟล์"), "*")]}[kind]
+                try:
+                    paths = list(filedialog.askopenfilenames(parent=self.frame, title=title, filetypes=types) or [])
+                except Exception:
+                    paths = []
+            else:
+                paths = LocalPicker(self.frame.winfo_toplevel(), title, "files").result or []
+            for p in paths:
+                if os.path.isfile(p):
+                    self.chat.send_file(p)
+
+        def _row(self, mine):
+            row = box(self.inner, bg="bg")
+            row.pack(fill="x", padx=8, pady=3)
+            if self.empty is not None:
+                self.empty.destroy()
+                self.empty = None
+            return row
+
+        def _scroll_end(self):
+            self.inner.update_idletasks()
+            self.cv.configure(scrollregion=self.cv.bbox("all"))
+            self.cv.yview_moveto(1.0)
+
+        def _bubble_colors(self, mine):
+            return ("accent", "accent_fg") if mine else ("subtle", "text")
+
+        def add_msg(self, m):
+            mine = m.get("mine")
+            row = self._row(mine)
+            bg, fg = self._bubble_colors(mine)
+            wrap = max(120, self.width - 70)
+            b = lbl(row, m.get("text", ""), fg=fg, bg=bg, font="base", wraplength=wrap, padx=10, pady=6)
+            b.pack(side="right" if mine else "left")
+            self._meta(row, m, mine)
+            self._scroll_end()
+
+        def _meta(self, row, m, mine):
+            ts = time.strftime("%H:%M", time.localtime(m.get("t") or time.time()))
+            who = "" if mine else (m.get("name_from") if "name_from" in m else m.get("name") or "") + " · "
+            lbl(row, who + ts, fg="muted", bg="bg", font="small").pack(side="right" if mine else "left", padx=6,
+                                                                       anchor="s")
+
+        def add_file(self, m):
+            mine = m.get("mine")
+            row = self._row(mine)
+            bg, fg = ("sel", "text") if mine else ("subtle", "text")
+            c = T.track(tk.Frame(row, bd=0, highlightthickness=0), bg=bg)
+            c.pack(side="right" if mine else "left")
+            icon = {"image": "🖼", "video": "🎬"}.get(m.get("kind"), "📎")
+            top = box(c, bg=bg)
+            top.pack(fill="x", padx=8, pady=(6, 2))
+            thumb = box(c, bg=bg)
+            thumb.pack(fill="x", padx=8)
+            lbl(top, "%s  %s" % (icon, m.get("name", "")), fg=fg, bg=bg, font="smallbold",
+                wraplength=max(120, self.width - 90)).pack(anchor="w")
+            st = lbl(c, fmt_size(m.get("size", 0)), fg="muted", bg=bg, font="small")
+            st.pack(fill="x", padx=8)
+            pb = ttk.Progressbar(c, mode="determinate", maximum=max(1, m.get("size", 1)), length=max(120, self.width - 100))
+            pb.pack(fill="x", padx=8, pady=(2, 2))
+            btns = box(c, bg=bg)
+            btns.pack(fill="x", padx=6, pady=(2, 6))
+            card = {"m": m, "status": st, "pb": pb, "btns": btns, "thumb": thumb, "path": m.get("path"), "bg": bg}
+            self.cards[m["id"]] = card
+            if mine:
+                ttk.Button(btns, text=tr("ยกเลิก"), style="Tool.TButton",
+                           command=lambda: self.chat.cancel(m["id"])).pack(side="left")
+                if m.get("kind") in ("image", "video"):
+                    self._thumb(card, m["path"])
+            self._meta(row, m, mine)
+            self._scroll_end()
+
+        def _thumb(self, card, path):
+            try:
+                if card["m"].get("kind") == "image":
+                    im = Image.open(path)
+                    im.load()
+                else:
+                    import cv2
+                    cap = cv2.VideoCapture(path)
+                    ok, fr = cap.read()
+                    cap.release()
+                    if not ok:
+                        return
+                    im = Image.fromarray(fr[:, :, ::-1])
+                im = im.convert("RGB")
+                im.thumbnail((max(120, self.width - 90), 200))
+                if card["m"].get("kind") == "video":
+                    from PIL import ImageDraw
+                    d = ImageDraw.Draw(im)
+                    cx, cy, r = im.width // 2, im.height // 2, 18
+                    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(0, 0, 0))
+                    d.polygon([(cx - 6, cy - 10), (cx - 6, cy + 10), (cx + 11, cy)], fill=(255, 255, 255))
+                ph = ImageTk.PhotoImage(im)
+                self.imgs.append(ph)
+                for w in card["thumb"].winfo_children():
+                    w.destroy()
+                t = T.track(tk.Label(card["thumb"], image=ph, cursor="hand2", bd=0), bg=card["bg"])
+                t.pack(anchor="w", pady=(2, 2))
+                t.bind("<Button-1>", lambda e, p=path: open_path(p))
+                self._scroll_end()
+            except Exception:
+                pass
+
+        def progress(self, ev):
+            card = self.cards.get(ev.get("id"))
+            if not card:
+                return
+            m = card["m"]
+            if "done" in ev and ev.get("size"):
+                card["pb"].configure(value=ev["done"])
+                card["status"].configure(text="%s / %s" % (fmt_size(ev["done"]), fmt_size(ev["size"])))
+            status = ev.get("status")
+            if status in ("sent", "received"):
+                card["pb"].pack_forget()
+                path = ev.get("path") or card["path"]
+                card["path"] = path
+                card["status"].configure(text=fmt_size(m.get("size", 0)) + "  ·  " +
+                                         (tr("ส่งแล้ว ✓") if status == "sent" else tr("ได้รับแล้ว ✓")))
+                for w in card["btns"].winfo_children():
+                    w.destroy()
+                if path and os.path.exists(path):
+                    ttk.Button(card["btns"], text=tr("เปิด"), style="Tool.TButton",
+                               command=lambda: open_path(path)).pack(side="left")
+                    ttk.Button(card["btns"], text=tr("แสดงในโฟลเดอร์"), style="Tool.TButton",
+                               command=lambda: show_in_folder(path)).pack(side="left", padx=(4, 0))
+                    if status == "received" and m.get("kind") in ("image", "video"):
+                        self._thumb(card, path)
+            elif status == "failed":
+                card["pb"].pack_forget()
+                for w in card["btns"].winfo_children():
+                    w.destroy()
+                card["status"].configure(text="✗ " + (ev.get("text") or tr("ส่งไม่สำเร็จ")), fg=T.c("danger"))
+
+        def note(self, text, color="muted"):
+            row = self._row(False)
+            lbl(row, text, fg=color, bg="bg", font="small", justify="center", anchor="center",
+                wraplength=max(120, self.width - 40)).pack(fill="x")
+            self._scroll_end()
+
+        # ----- เหตุการณ์จาก engine -----
+        def on_event(self, ev, visible=True):
+            k = ev.get("ev")
+            if k == "msg":
+                self.add_msg(ev)
+                if not ev.get("mine"):
+                    self._bump(visible)
+            elif k == "file":
+                self.add_file(ev)
+                if not ev.get("mine"):
+                    self._bump(visible)
+            elif k == "progress":
+                self.progress(ev)
+            elif k == "error":
+                self.note("✗ " + ev.get("text", ""), "danger")
+            elif k in ("call_state", "call_incoming", "remote_video", "self_video", "call_error"):
+                self.on_call(ev)
+
+        def _bump(self, visible):
+            if not visible:
+                self.unread += 1
+                if self.on_unread:
+                    self.on_unread(self.unread)
+
+        def seen(self):
+            self.unread = 0
+            if self.on_unread:
+                self.on_unread(0)
+
+        # ----- โทร -----
+        def _call(self, video):
+            if self.call.state != "idle":
+                return
+            a, v = media_available()
+            if not a:
+                messagebox.showinfo(APP, tr("ไม่พบไมโครโฟนหรือลำโพงในเครื่องนี้ จึงโทรไม่ได้"), parent=self.frame)
+                return
+            if video and not v:
+                messagebox.showinfo(APP, tr("ไม่พบกล้องในเครื่องนี้ — จะโทรด้วยเสียงอย่างเดียว"), parent=self.frame)
+            self.call.start_call(video)
+
+        def _answer(self):
+            self.call.accept(video=self.call.peer_video and media_available()[1])
+
+        def _hang(self):
+            if self.call.state == "ringing":
+                self.call.decline()
+            else:
+                self.call.hangup()
+
+        def _toggle_mute(self):
+            self.call.set_mute(not self.call.muted)
+            self.mute_btn.configure(text="🔇" if self.call.muted else "🎤")
+
+        def _toggle_cam(self):
+            self.call.set_video(not self.call.video)
+            self.cam_btn.configure(text="📷" if self.call.video else "🚫")
+
+        def _video_img(self, jpg, maxw, maxh):
+            im = Image.open(io.BytesIO(jpg))
+            im.load()
+            im = im.convert("RGB")
+            im.thumbnail((maxw, maxh))
+            return ImageTk.PhotoImage(im)
+
+        def on_call(self, ev):
+            k = ev.get("ev")
+            st = self.call.state
+            if k == "call_error":
+                self.note("✗ " + ev.get("text", ""), "danger")
+                return
+            if k == "remote_video":
+                if ev.get("jpg") is None:
+                    self.remote_photo = None
+                    self.remote_lbl.configure(image="", text="🎧", height=4)
+                    return
+                try:
+                    w = max(160, self.width - 20)
+                    self.remote_photo = self._video_img(ev["jpg"], w, int(w * 0.75))
+                    self.remote_lbl.configure(image=self.remote_photo, text="", height=0)
+                except Exception:
+                    pass
+                return
+            if k == "self_video":
+                if ev.get("jpg") is None:
+                    self.self_lbl.place_forget()
+                    return
+                try:
+                    self.self_photo = self._video_img(ev["jpg"], 96, 72)
+                    self.self_lbl.configure(image=self.self_photo)
+                    self.self_lbl.place(relx=1.0, x=-6, y=6, anchor="ne")
+                except Exception:
+                    pass
+                return
+            if k == "call_incoming":
+                self.callbox.pack(fill="x", padx=8, pady=(6, 0), after=self.sub)
+                self.remote_lbl.configure(image="", text="📞", height=3)
+                self.call_info.configure(text=(tr("วีดีโอคอลเข้า…") if ev.get("video") else tr("สายเรียกเข้า…")))
+                self.answer_btn.pack(side="left", padx=3, before=self.hang_btn)
+                self.mute_btn.pack_forget()
+                self.cam_btn.pack_forget()
+                self._ring_notice(ev)
+                return
+            # call_state
+            if st == "idle":
+                self.callbox.pack_forget()
+                self.self_lbl.place_forget()
+                self.remote_photo = self.self_photo = None
+                self.mute_btn.configure(text="🎤")
+                reason = ev.get("reason")
+                if ev.get("was") == "active":
+                    d = int(ev.get("duration", 0))
+                    self.note("📞 " + tr("วางสายแล้ว · %d:%02d") % (d // 60, d % 60))
+                elif reason in ("declined", "busy", "nodev"):
+                    self.note("📞 " + {"declined": tr("อีกฝั่งไม่รับสาย"), "busy": tr("อีกฝั่งสายไม่ว่าง"),
+                                      "nodev": tr("อีกฝั่งไม่มีไมโครโฟน/ลำโพง")}[reason])
+                elif ev.get("was") in ("ringing", "calling"):
+                    self.note("📞 " + tr("ยกเลิกการโทร"))
+                self._close_ring()
+                return
+            self.callbox.pack(fill="x", padx=8, pady=(6, 0), after=self.sub)
+            if st == "calling":
+                self.remote_lbl.configure(image="", text="📞", height=3)
+                self.call_info.configure(text=tr("กำลังโทรหา %s …") % self.peer)
+                self.answer_btn.pack_forget()
+                self.mute_btn.pack_forget()
+                self.cam_btn.pack_forget()
+            elif st == "active":
+                self._close_ring()
+                self.answer_btn.pack_forget()
+                self.mute_btn.pack(side="left", padx=3, before=self.hang_btn)
+                if media_available()[1]:
+                    self.cam_btn.pack(side="left", padx=3, before=self.hang_btn)
+                self.cam_btn.configure(text="📷" if self.call.video else "🚫")
+                if not self.call.peer_video and self.remote_photo is None:
+                    self.remote_lbl.configure(image="", text="🎧", height=4)
+
+        def _ring_notice(self, ev):
+            """แจ้งสายเรียกเข้า — ส่งเสียงและเด้งหน้าต่างขึ้นมา"""
+            try:
+                top = self.frame.winfo_toplevel()
+                top.deiconify()
+                top.lift()
+                top.bell()
+            except Exception:
+                pass
+            if self.on_unread:
+                self.on_unread(-1)              # -1 = มีสายเรียกเข้า ให้เปิดแผงแชท
+
+        def _close_ring(self):
+            pass
+
+        def _tick(self):
+            try:
+                if self.call.state == "active" and self.call.started:
+                    d = int(time.time() - self.call.started)
+                    self.call_info.configure(text="● %s  %d:%02d%s" % (
+                        tr("กำลังคุย"), d // 60, d % 60, "  ·  🔇" if self.call.muted else ""))
+                self.frame.after(500, self._tick)
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     FILE_KINDS = {
@@ -4395,6 +5355,9 @@ def run_gui():
             self.srv_btn.pack(side="left")
             self.kick_btn = ttk.Button(self.status_btns, text=tr("ตัดการเชื่อมต่อ"), style="Big.Danger.TButton",
                                        command=self.kick)
+            self.host_chat_btn = ttk.Button(self.status_btns, text="💬 " + tr("แชท"), style="Big.TButton",
+                                            command=lambda: self.show_host_chat(True))
+            self.host_chat = None
 
             # ข้อมูลสำหรับเชื่อมต่อ
             info = card(left)
@@ -5001,8 +5964,65 @@ def run_gui():
                                    style="Big.TButton" if running else "Big.Accent.TButton")
             if state == "busy":
                 self.kick_btn.pack(side="left", padx=(10, 0))
+                if self.host_chat is not None:
+                    self.host_chat_btn.pack(side="left", padx=(10, 0))
             else:
                 self.kick_btn.pack_forget()
+                self.host_chat_btn.pack_forget()
+
+        # ----- แชทฝั่งเครื่องที่ถูกควบคุม -----
+        def _open_host_chat(self, chat, call, name):
+            self._close_host_chat()
+            w = T.track(tk.Toplevel(self.root), bg="card")
+            w.title("💬 %s — %s" % (name, APP))
+            sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
+            ww, wh = max(320, sw // 6), min(640, sh - 120)
+            w.geometry("%dx%d+%d+%d" % (ww, wh, sw - ww - 20, 60))
+            w.protocol("WM_DELETE_WINDOW", w.withdraw)
+            panel = ChatPanel(w, chat, call, name, width=ww)
+            panel.frame.pack(fill="both", expand=True)
+            panel.on_unread = lambda n: self.show_host_chat(True) if n else None
+            w.withdraw()
+            self.host_chat = (w, panel)
+            if self.banner_state[0] == "busy":
+                self.host_chat_btn.pack(side="left", padx=(10, 0))
+
+        def show_host_chat(self, show=True):
+            if not self.host_chat:
+                return
+            w, panel = self.host_chat
+            try:
+                if show:
+                    w.deiconify()
+                    w.lift()
+                    w.attributes("-topmost", True)
+                    w.after(300, lambda: w.attributes("-topmost", False))
+                    panel.seen()
+                else:
+                    w.withdraw()
+            except tk.TclError:
+                pass
+
+        def _close_host_chat(self):
+            if self.host_chat:
+                try:
+                    self.host_chat[0].destroy()
+                except tk.TclError:
+                    pass
+            self.host_chat = None
+            self.host_chat_btn.pack_forget()
+
+        def _host_chat_event(self, ev):
+            if not self.host_chat:
+                return
+            w, panel = self.host_chat
+            try:
+                visible = w.state() == "normal"
+            except tk.TclError:
+                return
+            panel.on_event(ev, visible)
+            if not ev.get("mine") and ev.get("ev") in ("msg", "file") and not visible:
+                self.show_host_chat(True)                # มีข้อความเข้า → เด้งหน้าต่างแชทขึ้นมา
 
         def _ask_threadsafe(self, ip, name):
             ev, box = threading.Event(), {}
@@ -5086,6 +6106,12 @@ def run_gui():
                             word, _c = latency_style(m[2])
                             self._banner("busy", self.session_who, tr("โดย %s   ·   Latency %.0f ms (%s)")
                                          % (self.session_who, m[2], word))
+                    elif k == "chat_open":
+                        self._open_host_chat(m[1], m[2], m[3])
+                    elif k == "chat":
+                        self._host_chat_event(m[1])
+                    elif k == "chat_end":
+                        self._close_host_chat()
                     elif k == "session_end":
                         self.session_who = None
                         self._banner("wait" if self.server and self.server.is_alive() else "off")
@@ -5160,6 +6186,7 @@ def run_headless_server(args):
     relay = {"addr": addr, "key": key, "id": cfg["host_id"], "secret": cfg["host_secret"],
              "direct": env_bool("DIRECT_CONNECT", True), "direct_port": direct_port()}
     srv = Server(0, pw, q, None, not args.view_only, not args.no_files, relay=relay)
+    srv.ui = False
     print(tr("%s %s — เปิดรับการเชื่อมต่อผ่าน Relay") % (APP, VERSION))
     print("  ID       : %s" % fmt_id(relay["id"]))
     print(tr("  รหัสผ่าน : %s") % pw)
@@ -5180,6 +6207,10 @@ def run_headless_server(args):
                 print(stamp, m[1])
             elif m[0] == "relay" and m[1] in ("online", "error"):
                 print(stamp, m[2])
+            elif m[0] == "chat" and m[1].get("ev") == "msg" and not m[1].get("mine"):
+                print(stamp, "💬 %s: %s" % (m[1].get("name", ""), m[1].get("text", "")))
+            elif m[0] == "chat" and m[1].get("ev") == "progress" and m[1].get("status") == "received":
+                print(stamp, "📎 %s" % m[1].get("path", ""))
     except KeyboardInterrupt:
         srv.stop()
         print(tr("\nหยุดแล้ว"))

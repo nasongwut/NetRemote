@@ -48,7 +48,7 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 V="$VENV/bin/python"
 "$V" -m pip install -q --upgrade pip
-"$V" -m pip install -q --upgrade pyinstaller mss Pillow pynput cryptography || fail "ติดตั้งเครื่องมือไม่สำเร็จ (ตรวจสอบอินเทอร์เน็ต)"
+"$V" -m pip install -q --upgrade pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless || fail "ติดตั้งเครื่องมือไม่สำเร็จ (ตรวจสอบอินเทอร์เน็ต)"
 
 # 3) Build  (ถ้ามีไฟล์ .env จะฝังไปกับโปรแกรม — ผู้ใช้ไม่ต้องตั้งค่า Relay เอง)
 ADD_ENV=()
@@ -61,6 +61,12 @@ echo; echo "▶ กำลัง Build $NAME.app ..."
   --distpath "$WORK/dist" --workpath "$WORK/build" --specpath "$WORK" \
   --name "$NAME" --icon "$ICON" --osx-bundle-identifier com.networktools.netremote --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin "${ADD_ENV[@]}" \
   "$SRC" || fail "Build ไม่สำเร็จ"
+
+# 3.1) ขอสิทธิ์ไมโครโฟน/กล้อง (แชทโทรเสียง/วีดีโอคอล) — ถ้าไม่มี macOS จะปิดโปรแกรมทันทีที่เปิดไมค์/กล้อง
+PLIST="$WORK/dist/$NAME.app/Contents/Info.plist"
+/usr/bin/plutil -replace NSMicrophoneUsageDescription -string "NetRemote ใช้ไมโครโฟนสำหรับโทรเสียงและวีดีโอคอล" "$PLIST"
+/usr/bin/plutil -replace NSCameraUsageDescription -string "NetRemote ใช้กล้องสำหรับวีดีโอคอล" "$PLIST"
+/usr/bin/codesign --force --deep -s - "$WORK/dist/$NAME.app" 2>/dev/null
 
 # 4) คัดลอกไปที่ Apps/macOS + สร้าง .dmg
 mkdir -p "$OUT"

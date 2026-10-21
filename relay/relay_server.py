@@ -32,7 +32,7 @@ import time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1"
+VERSION = "1.2"
 ID_RE = re.compile(r"^\d{9}$")
 
 
@@ -564,14 +564,41 @@ def start_web(relay, bind, port, admin_key):
     log("หน้ามอนิเตอร์: http://%s:%d %s" % (shown, port, "(ต้องใส่รหัส Admin)" if admin_key else ""))
 
 
+def load_env(path):
+    """อ่านไฟล์ .env (KEY=VALUE) แล้วตั้งเป็น environment — ค่าที่ตั้งไว้ใน environment อยู่แล้วมีผลเหนือกว่า"""
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k.startswith("export "):
+                k = k[7:].strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            elif " #" in v:
+                v = v.split(" #", 1)[0].strip()
+            os.environ.setdefault(k, v)
+    return path
+
+
 def main():
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--env", default=os.environ.get("RELAY_ENV",
+                                                     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")))
+    env_path = load_env(pre.parse_known_args()[0].env)
     p = argparse.ArgumentParser(description="NetRemote Relay Server")
+    p.add_argument("--env", help="ไฟล์ตั้งค่า (ค่าเริ่มต้น: .env ในโฟลเดอร์เดียวกับโปรแกรมนี้)")
     p.add_argument("--port", type=int, default=int(os.environ.get("RELAY_PORT", 5910)))
     p.add_argument("--key", default=os.environ.get("RELAY_KEY", ""),
                    help="Relay Key — ผู้ใช้ต้องใส่ให้ตรงจึงจะใช้ Relay ได้ (แนะนำให้ตั้ง)")
     p.add_argument("--store", default=os.environ.get("RELAY_STORE", "relay_ids.json"),
                    help="ไฟล์เก็บ ID ที่ลงทะเบียนแล้ว")
-    p.add_argument("--max-sessions", type=int, default=50)
+    p.add_argument("--max-sessions", type=int, default=int(os.environ.get("RELAY_MAX_SESSIONS", 50)))
     p.add_argument("--web-port", type=int, default=int(os.environ.get("RELAY_WEB_PORT", 5911)),
                    help="พอร์ตหน้ามอนิเตอร์ (0 = ปิด)")
     p.add_argument("--web-bind", default=os.environ.get("RELAY_WEB_BIND", "127.0.0.1"),
@@ -579,6 +606,8 @@ def main():
     p.add_argument("--admin-key", default=os.environ.get("RELAY_ADMIN_KEY", ""),
                    help="รหัสเข้าหน้ามอนิเตอร์ (ถ้าไม่ตั้ง ใช้ Relay Key)")
     a = p.parse_args()
+    if env_path:
+        log("อ่านการตั้งค่าจาก %s" % env_path)
     if not a.key:
         log("⚠ ไม่ได้ตั้ง --key — แนะนำให้ตั้งเพื่อกันคนอื่นใช้ Relay ของคุณ")
     relay = Relay(a.port, a.key, a.store, a.max_sessions)

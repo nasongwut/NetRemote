@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# แก้ YOUR-RELAY-KEY เป็นรหัสของคุณ (ต้องตรงกับที่ใส่ในโปรแกรม NetRemote)
-Environment=RELAY_KEY=YOUR-RELAY-KEY
-Environment=RELAY_PORT=5910
+# การตั้งค่าทั้งหมดอ่านจากไฟล์ .env (RELAY_KEY, RELAY_PORT, หน้ามอนิเตอร์ ฯลฯ)
+EnvironmentFile=/opt/netremote-relay/.env
+# เก็บรายการ ID ไว้ในโฟลเดอร์ข้อมูลของ service
 Environment=RELAY_STORE=/var/lib/netremote-relay/relay_ids.json
-ExecStart=/usr/bin/python3 /opt/netremote-relay/relay_server.py
+ExecStart=/usr/bin/python3 /opt/netremote-relay/relay_server.py --env /opt/netremote-relay/.env
 Restart=always
 RestartSec=3
 DynamicUser=yes

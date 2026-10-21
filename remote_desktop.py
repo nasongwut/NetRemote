@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NetRemote — โปรแกรม Remote Desktop สำหรับวง LAN
-================================================
-ดูหน้าจอ + ควบคุมเมาส์/คีย์บอร์ดของอีกเครื่องผ่านเครือข่าย
+NetRemote — โปรแกรม Remote Desktop (เชื่อมต่อผ่าน Relay Server เท่านั้น)
+=====================================================================
+ดูหน้าจอ + ควบคุมเมาส์/คีย์บอร์ด + รับ-ส่งไฟล์ ของอีกเครื่องด้วย ID 9 หลัก
+- ตั้งค่า Relay ได้ในโปรแกรม หรือไฟล์ .env (RELAY_ADDR / RELAY_KEY) — ดู .env.example
 - เข้ารหัสทั้งหมดด้วย TLS (สร้าง Certificate ให้เองอัตโนมัติ)
 - ยืนยันตัวตนด้วยรหัสผ่าน (HMAC ผูกกับ Certificate ป้องกันการดักกลางทาง)
 - ส่งเฉพาะส่วนของหน้าจอที่เปลี่ยน (ประหยัดเน็ต)
@@ -11,7 +12,7 @@ NetRemote — โปรแกรม Remote Desktop สำหรับวง LAN
 - ค้นหาเครื่องที่เปิดรับการเชื่อมต่อในวง LAN
 
 ต้องติดตั้ง:  pip install mss Pillow pynput cryptography
-(ไฟล์ "Remote Desktop.command" จะติดตั้งให้อัตโนมัติในครั้งแรก)
+(ไฟล์ "Run on Mac.command" จะติดตั้งให้อัตโนมัติในครั้งแรก)
 
 ใช้งาน:
     python3 remote_desktop.py                         เปิดหน้าต่างโปรแกรม
@@ -30,6 +31,7 @@ import queue
 import re
 import secrets
 import select
+import shutil
 import socket
 import ssl
 import struct
@@ -56,6 +58,74 @@ CONF_DIR = os.path.join(os.path.expanduser("~"), ".netremote")
 CONF_FILE = os.path.join(CONF_DIR, "config.json")
 CERT_FILE = os.path.join(CONF_DIR, "cert.pem")
 KEY_FILE = os.path.join(CONF_DIR, "key.pem")
+
+# ----------------------------------------------------------------------------
+# ไฟล์ .env (ตั้งค่าโดยผู้ดูแล) — ค่าใน .env มีผลเหนือค่าที่ตั้งในโปรแกรม
+#   ลำดับการค้นหา: $NETREMOTE_ENV → ~/.netremote/.env → โฟลเดอร์ของโปรแกรม → ฝังมากับโปรแกรม (ตอน Build)
+# ----------------------------------------------------------------------------
+def _parse_env(path):
+    out = {}
+    with open(path, encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k.startswith("export "):
+                k = k[7:].strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            elif " #" in v:
+                v = v.split(" #", 1)[0].strip()
+            out[k] = v
+    return out
+
+
+def env_candidates():
+    paths = []
+    if os.environ.get("NETREMOTE_ENV"):
+        paths.append(os.environ["NETREMOTE_ENV"])
+    paths.append(os.path.join(CONF_DIR, ".env"))
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        if ".app/Contents/MacOS" in exe_dir:                       # macOS .app → โฟลเดอร์ที่วาง .app
+            paths.append(os.path.join(exe_dir.split(".app/Contents/MacOS")[0].rsplit("/", 1)[0], ".env"))
+        paths.append(os.path.join(exe_dir, ".env"))
+        if getattr(sys, "_MEIPASS", None):
+            paths.append(os.path.join(sys._MEIPASS, ".env"))      # ฝังมากับโปรแกรมตอน Build
+    else:
+        paths.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    return paths
+
+
+def load_env():
+    for p in env_candidates():
+        try:
+            if os.path.isfile(p):
+                return _parse_env(p), p
+        except Exception:
+            pass
+    return {}, None
+
+
+ENV, ENV_PATH = load_env()
+
+
+def env_str(key, default=""):
+    v = ENV.get(key, "")
+    return v if v != "" else default
+
+
+def env_bool(key, default):
+    v = ENV.get(key, "").strip().lower()
+    if v in ("1", "true", "yes", "on", "y"):
+        return True
+    if v in ("0", "false", "no", "off", "n"):
+        return False
+    return default
+
 
 T_HELLO, T_AUTH, T_OK, T_ERR = 1, 2, 3, 4
 T_REQ, T_FRAME, T_INPUT, T_BYE = 10, 11, 20, 40
@@ -652,34 +722,16 @@ class Server(threading.Thread):
             s["chan"].close("เครื่องปลายทางตัดการเชื่อมต่อ")
 
     def run(self):
-        if self.relay:
-            r = self.relay
-            self.relay_thread = RelayHost(self, r["addr"], r.get("key", ""), r["id"], r["secret"], self.events)
-            self.relay_thread.start()
-        try:
-            ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            ls.bind(("0.0.0.0", self.port))
-            ls.listen(8)
-            ls.settimeout(1.0)
-            self.lsock = ls
-        except OSError as e:
-            if self.relay_thread:
-                self.log("⚠ เปิดพอร์ต LAN %d ไม่ได้ (%s) — รับการเชื่อมต่อผ่าน Relay อย่างเดียว"
-                         % (self.port, e.strerror or e))
-                self.stop_event.wait()
-                return
-            self.events.put(("server_err", "เปิดพอร์ต %d ไม่ได้: %s" % (self.port, e.strerror or e)))
+        # รับการเชื่อมต่อผ่าน Relay เท่านั้น — ไม่เปิดพอร์ตใด ๆ บนเครื่องนี้
+        if not self.relay or not self.relay.get("addr"):
+            self.events.put(("server_err", "ยังไม่ได้ตั้งค่า Relay Server\n\nตั้งค่าที่แท็บ \"การเชื่อมต่อ (Relay)\" "
+                                           "หรือในไฟล์ .env (RELAY_ADDR / RELAY_KEY)"))
             return
-        self.log("เปิดรับการเชื่อมต่อที่พอร์ต %d" % self.port)
-        while not self.stop_event.is_set():
-            try:
-                conn, addr = ls.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            threading.Thread(target=self._client, args=(conn, addr), daemon=True).start()
+        r = self.relay
+        self.relay_thread = RelayHost(self, r["addr"], r.get("key", ""), r["id"], r["secret"], self.events)
+        self.relay_thread.start()
+        self.log("เปิดรับการเชื่อมต่อผ่าน Relay %s — ID %s (ไม่เปิดพอร์ตบนเครื่องนี้)" % (r["addr"], fmt_id(r["id"])))
+        self.stop_event.wait()
         self.log("ปิดการรับการเชื่อมต่อแล้ว")
 
     # ----- per connection -----
@@ -971,6 +1023,23 @@ def list_dir(path, hidden=False):
     return {"path": path, "parent": parent, "entries": entries[:10000]}
 
 
+def delete_path(p):
+    """ลบไฟล์/โฟลเดอร์ — บน macOS ย้ายไปถังขยะแทนการลบถาวร"""
+    p = os.path.abspath(p)
+    if not os.path.lexists(p):
+        raise FileNotFoundError(p)
+    if SYSTEM == "Darwin":
+        trash = os.path.join(os.path.expanduser("~"), ".Trash")
+        if os.path.isdir(trash):
+            dest = unique_path(os.path.join(trash, os.path.basename(p.rstrip("/"))))
+            shutil.move(p, dest)
+            return
+    if os.path.isdir(p) and not os.path.islink(p):
+        shutil.rmtree(p)
+    else:
+        os.remove(p)
+
+
 def expand_paths(paths):
     """แปลงรายการไฟล์/โฟลเดอร์ เป็น [(path, relpath, size)] (โฟลเดอร์ = ทุกไฟล์ข้างใน)"""
     out = []
@@ -1059,7 +1128,17 @@ class FileServer:
     def _fs(self, d):
         rid = d.get("id")
         try:
-            if d.get("op") == "mkdir":
+            if d.get("op") == "delete":
+                errs = []
+                for x in [str(v) for v in d.get("paths", [])][:500]:
+                    try:
+                        delete_path(x)
+                    except Exception as e:
+                        errs.append("%s: %s" % (os.path.basename(x), err_text(e)))
+                self.log("🗑 %s ลบ %d รายการ" % (self.who, len(d.get("paths", [])) - len(errs)))
+                if errs:
+                    raise RuntimeError("ลบไม่สำเร็จบางรายการ — " + "; ".join(errs[:5]))
+            elif d.get("op") == "mkdir":
                 parts = safe_parts(d.get("name", ""))
                 if len(parts) != 1:
                     raise ValueError("ชื่อโฟลเดอร์ไม่ถูกต้อง")
@@ -1480,13 +1559,45 @@ def relay_test(addr, key):
     s = _relay_socket(addr)
     try:
         s.settimeout(10)
+        t0 = time.monotonic()
         line_send(s, {"role": "ping", "key": key or "", "v": 1})
         r = line_recv(s)
+        r["rtt"] = (time.monotonic() - t0) * 1000
         if not r.get("ok"):
             raise ConnectionError(r.get("err") or "Relay ปฏิเสธ")
         return r
     finally:
         s.close()
+
+
+class RelayMonitor(threading.Thread):
+    """ตรวจสถานะการเชื่อมต่อกับ Relay เป็นระยะ ส่งผล ("relay_status", state, data) ทาง queue"""
+
+    def __init__(self, get_conn, out_q):
+        super().__init__(daemon=True)
+        self.get_conn, self.q = get_conn, out_q
+        self.wake = threading.Event()
+
+    def refresh(self):
+        self.wake.set()
+
+    def run(self):
+        while True:
+            addr, key = self.get_conn()
+            ok = False
+            if not addr:
+                self.q.put(("relay_status", "unset", None))
+            else:
+                self.q.put(("relay_status", "checking", addr))
+                try:
+                    r = relay_test(addr, key)
+                    r["addr"] = addr
+                    ok = True
+                    self.q.put(("relay_status", "ok", r))
+                except Exception as e:
+                    self.q.put(("relay_status", "error", "%s" % err_text(e)))
+            self.wake.wait(10 if ok else 5)
+            self.wake.clear()
 
 
 class RelayHost(threading.Thread):
@@ -1574,7 +1685,7 @@ class RelayHost(threading.Thread):
         except Exception as e:
             self.server.log("เชื่อมต่อข้อมูลผ่าน Relay ไม่สำเร็จ: %s" % err_text(e))
             return
-        self.server._client(ds, ("%s (ผ่านอินเทอร์เน็ต)" % from_ip, 0))
+        self.server._client(ds, ("%s ผ่าน Relay" % from_ip, 0))
 
 
 # ============================================================================
@@ -1583,10 +1694,9 @@ class RelayHost(threading.Thread):
 def client_connect(host, port, password, confirm_fp, relay=None):
     """เชื่อมต่อ + ยืนยันตัวตน คืนค่า (tls_socket, info, fingerprint)
     confirm_fp(host, fp) -> bool  ใช้ตรวจ Certificate ของปลายทาง"""
-    if relay:                                     # ผ่านอินเทอร์เน็ต: ต่อผ่าน Relay ด้วย ID
-        raw = relay_dial(relay["addr"], relay.get("key", ""), relay["id"])
-    else:
-        raw = socket.create_connection((host, port), timeout=8)
+    if not relay or not relay.get("addr"):
+        raise ConnectionError("ต้องตั้งค่า Relay Server ก่อน (เชื่อมต่อผ่าน Relay เท่านั้น)")
+    raw = relay_dial(relay["addr"], relay.get("key", ""), relay["id"])
     raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         tls = client_context().wrap_socket(raw)
@@ -2424,189 +2534,364 @@ def run_gui():
         return LocalPicker(parent, title, "folder", initial).result or ""
 
     # ------------------------------------------------------------------
-    class FileWindow:
-        """หน้าต่างรับ-ส่งไฟล์: เรียกดูไฟล์เครื่องปลายทาง / อัปโหลด / ดาวน์โหลด"""
+    FILE_KINDS = {
+        "pdf": ("pdf",), "img": ("jpg", "jpeg", "png", "gif", "bmp", "heic", "webp", "svg", "tif", "tiff", "ico", "icns"),
+        "audio": ("mp3", "wav", "aac", "m4a", "flac", "ogg", "aiff"),
+        "video": ("mp4", "mov", "avi", "mkv", "wmv", "m4v", "webm"),
+        "zip": ("zip", "rar", "7z", "tar", "gz", "bz2", "xz", "dmg", "iso", "tgz"),
+        "doc": ("doc", "docx", "rtf", "odt", "pages"), "sheet": ("xls", "xlsx", "csv", "ods", "numbers"),
+        "slide": ("ppt", "pptx", "key", "odp"),
+        "code": ("py", "js", "ts", "html", "htm", "css", "json", "xml", "sh", "c", "cpp", "h", "java", "go", "rs",
+                 "php", "yml", "yaml", "sql", "swift", "kt"),
+        "app": ("exe", "msi", "app", "pkg", "bat", "command", "apk"),
+        "text": ("txt", "md", "log", "ini", "cfg", "conf", "env"),
+        "cad": ("dwg", "dxf", "stl", "step", "stp", "obj", "3mf"),
+    }
+    KIND_OF = {ext: k for k, exts in FILE_KINDS.items() for ext in exts}
+    KIND_COLOR = {"pdf": "#E5372B", "img": "#2EAD5B", "audio": "#9B51E0", "video": "#E0457B", "zip": "#F08C1B",
+                  "doc": "#2F6FDE", "sheet": "#1E8E3E", "slide": "#E8590C", "code": "#5865F2", "app": "#374151",
+                  "text": "#8A94A6", "cad": "#0EA5A4", "file": "#B5BCC9"}
+    _icon_cache = {}
 
-        def __init__(self, viewer):
-            self.v, self.fc, self.app = viewer, viewer.files, viewer.app
-            self.cur_path = None
-            self.parent_path = None
-            self.pending = None
-            self.entries = {}
-            self.speed = {}
-            w = self.win = T.track(tk.Toplevel(viewer.win), bg="bg")
-            w.title("รับ-ส่งไฟล์ — %s" % viewer.info.get("name", viewer.host))
-            w.geometry("900x660")
-            w.minsize(640, 480)
-            w.protocol("WM_DELETE_WINDOW", w.withdraw)
+    def file_icon(kind):
+        """ไอคอนชนิดไฟล์ 16px (วาดด้วย Pillow)"""
+        if kind in _icon_cache:
+            return _icon_cache[kind]
+        from PIL import ImageDraw
+        S = 4
+        im = Image.new("RGBA", (16 * S, 16 * S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        if kind == "folder":
+            d.rounded_rectangle([1 * S, 3 * S, 7 * S, 6 * S], radius=S, fill="#3D8EF0")
+            d.rounded_rectangle([1 * S, 4.5 * S, 15 * S, 14 * S], radius=1.4 * S, fill="#5AA9FF")
+            d.rectangle([1 * S, 6 * S, 15 * S, 7 * S], fill="#7BBBFF")
+        elif kind == "up":
+            d.rounded_rectangle([1 * S, 3 * S, 7 * S, 6 * S], radius=S, fill="#8FB8E8")
+            d.rounded_rectangle([1 * S, 4.5 * S, 15 * S, 14 * S], radius=1.4 * S, fill="#A9CBF2")
+        else:
+            col = KIND_COLOR.get(kind, KIND_COLOR["file"])
+            d.polygon([(3 * S, 1 * S), (10 * S, 1 * S), (13 * S, 4 * S), (13 * S, 15 * S), (3 * S, 15 * S)],
+                      fill="#FFFFFF", outline="#C3C8D2")
+            d.polygon([(10 * S, 1 * S), (10 * S, 4 * S), (13 * S, 4 * S)], fill="#DDE1E8")
+            d.rectangle([3 * S, 9 * S, 13 * S, 13 * S], fill=col)
+        img = ImageTk.PhotoImage(im.resize((16, 16), resample=1))
+        _icon_cache[kind] = img
+        return img
 
-            nav = ttk.Frame(w, padding=(10, 10, 10, 4))
-            nav.pack(fill="x")
-            ttk.Button(nav, text="⬆ ขึ้น", width=6, command=self.go_up).pack(side="left")
-            ttk.Button(nav, text="⌂ Home", width=7, command=lambda: self.go(None)).pack(side="left", padx=4)
-            ttk.Button(nav, text="⟳", width=3, command=self.refresh).pack(side="left")
+    def kind_of(name, isdir):
+        if isdir:
+            return "folder"
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        return KIND_OF.get(ext, "file")
+
+    def fmt_be(ts):
+        if not ts:
+            return ""
+        t = datetime.fromtimestamp(ts)
+        return "%d/%d/%d %02d:%02d" % (t.day, t.month, t.year + 543, t.hour, t.minute)
+
+    class FilePane:
+        """รายการไฟล์ 1 ฝั่ง — side = "local" (เครื่องนี้) หรือ "remote" (เครื่องปลายทาง)"""
+
+        def __init__(self, fw, parent, side, title, subtitle):
+            self.fw, self.side = fw, side
+            self.cur, self.parent_path, self.pending = None, None, None
+            self.back, self.hist = [], []
+            self.data, self.entries = [], {}
+            self.sort_col, self.sort_rev = "name", False
+            right = side == "remote"
+            self.frame = f = box(parent, bg="bg")
+
+            hdr = box(f, bg="bg")
+            hdr.pack(fill="x", padx=12, pady=(12, 2))
+            av = T.track(tk.Canvas(hdr, width=40, height=40, highlightthickness=0), bg="bg")
+            av.pack(side="right" if right else "left")
+
+            def draw_av():
+                av.delete("all")
+                av.create_oval(2, 2, 38, 38, fill=T.c("subtle"), outline=T.c("border"))
+                av.create_oval(14, 9, 26, 21, outline=T.c("muted"), width=2)
+                av.create_arc(9, 22, 31, 42, start=0, extent=180, style="arc", outline=T.c("muted"), width=2)
+            draw_av()
+            T.on_change(draw_av)
+            tx = box(hdr, bg="bg")
+            tx.pack(side="right" if right else "left", padx=10)
+            lbl(tx, title, fg="ok", bg="bg", font="bold", anchor="e" if right else "w").pack(fill="x")
+            lbl(tx, subtitle, fg="muted", bg="bg", font="small", anchor="e" if right else "w").pack(fill="x")
+
+            act = box(f, bg="bg")
+            act.pack(fill="x", padx=12, pady=(0, 6))
+            side_ = "left" if right else "right"
+            main = ("⬇  Download" if right else "⬆  Upload")
+            ttk.Button(act, text=main, style="Tool.Accent.TButton",
+                       command=self.fw.download if right else self.fw.upload).pack(side=side_)
+            ttk.Button(act, text="+ โฟลเดอร์ใหม่", style="Tool.TButton", command=self.mkdir).pack(side=side_, padx=4)
+            ttk.Button(act, text="✕ ลบ", style="Tool.TButton", command=self.delete).pack(side=side_)
+
+            nav = box(f, bg="bg")
+            nav.pack(fill="x", padx=12, pady=(0, 6))
+            for txt, cmd in (("←", self.go_back), ("↑", self.go_up), ("⌂", self.go_home), ("⟳", self.refresh)):
+                ttk.Button(nav, text=txt, width=3, style="Tool.TButton", command=cmd).pack(side="left", padx=(0, 3))
             self.path_var = tk.StringVar()
-            pe = ttk.Entry(nav, textvariable=self.path_var)
-            pe.pack(side="left", fill="x", expand=True, padx=6)
-            pe.bind("<Return>", lambda e: self.go(self.path_var.get().strip() or None))
-            self.hidden_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(nav, text="แสดงไฟล์ซ่อน", variable=self.hidden_var, command=self.refresh).pack(side="left")
+            self.path_cb = ttk.Combobox(nav, textvariable=self.path_var)
+            self.path_cb.pack(side="left", fill="x", expand=True, padx=(4, 0))
+            self.path_cb.bind("<Return>", lambda e: self.go(self.path_var.get().strip() or None))
+            self.path_cb.bind("<<ComboboxSelected>>", lambda e: self.go(self.path_var.get().strip() or None))
 
-            ttk.Label(w, text="ไฟล์บนเครื่องปลายทาง — %s   (ดับเบิลคลิกโฟลเดอร์เพื่อเปิด, ดับเบิลคลิกไฟล์เพื่อดาวน์โหลด)"
-                      % viewer.info.get("name", viewer.host), style="Muted.TLabel",
-                      padding=(10, 2)).pack(fill="x")
-            fr = ttk.Frame(w, padding=(10, 4, 10, 0))
-            fr.pack(fill="both", expand=True)
-            t = self.tree = ttk.Treeview(fr, columns=("name", "size", "mtime"), show="headings", selectmode="extended")
-            for c, txt, wd, st in (("name", "ชื่อ", 420, True), ("size", "ขนาด", 100, False),
-                                   ("mtime", "แก้ไขล่าสุด", 150, False)):
-                t.heading(c, text=txt)
-                t.column(c, width=wd, stretch=st, anchor="e" if c == "size" else "w")
-            sb = ttk.Scrollbar(fr, orient="vertical", command=t.yview)
+            tf = box(f, bg="card")
+            tf.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+            t = self.tree = ttk.Treeview(tf, columns=("mtime", "size"), show="tree headings", selectmode="extended")
+            t.heading("#0", text="Name", anchor="w", command=lambda: self.sort_by("name"))
+            t.heading("mtime", text="Modified", anchor="w", command=lambda: self.sort_by("mtime"))
+            t.heading("size", text="Size", anchor="e", command=lambda: self.sort_by("size"))
+            t.column("#0", width=260, stretch=True)
+            t.column("mtime", width=130, stretch=False)
+            t.column("size", width=80, stretch=False, anchor="e")
+            sb = ttk.Scrollbar(tf, orient="vertical", command=t.yview)
             t.configure(yscrollcommand=sb.set)
             t.pack(side="left", fill="both", expand=True)
             sb.pack(side="right", fill="y")
             t.bind("<Double-1>", self.on_open)
+            t.bind("<Return>", self.on_open)
             t.bind("<BackSpace>", lambda e: self.go_up())
+            t.bind("<Delete>", lambda e: self.delete())
+            t.bind("<ButtonPress-1>", self._drag_start, add="+")
+            t.bind("<B1-Motion>", self._drag_motion, add="+")
+            t.bind("<ButtonRelease-1>", self._drag_end, add="+")
+            self.status = lbl(f, "", fg="muted", bg="bg", font="small")
+            self.status.pack(fill="x", padx=14, pady=(0, 4))
+            self._drag = None
 
-            act = ttk.Frame(w, padding=(10, 6))
-            act.pack(fill="x")
-            ttk.Button(act, text="⬆ อัปโหลดไฟล์…", style="Accent.TButton", command=self.upload_files).pack(side="left")
-            ttk.Button(act, text="⬆ อัปโหลดโฟลเดอร์…", command=self.upload_folder).pack(side="left", padx=6)
-            ttk.Button(act, text="⬇ ดาวน์โหลดที่เลือก", style="Accent.TButton", command=self.download).pack(side="left")
-            ttk.Button(act, text="+ สร้างโฟลเดอร์", command=self.mkdir).pack(side="left", padx=4)
+        # ----- navigation -----
+        def go(self, path, record=True):
+            if record and self.cur is not None and path != self.cur:
+                self.back.append(self.cur)
+            if self.side == "local":
+                try:
+                    d = list_dir(path)
+                except Exception as e:
+                    messagebox.showerror(APP, "เปิดโฟลเดอร์ไม่ได้: %s" % err_text(e), parent=self.fw.win)
+                    return
+                self.populate(d)
+            else:
+                self.pending = self.fw.fc.list(path)
+                self.status.configure(text="กำลังโหลด…")
 
-            dl = ttk.Frame(w, padding=(10, 0, 10, 4))
-            dl.pack(fill="x")
-            ttk.Label(dl, text="บันทึกไฟล์ที่ดาวน์โหลดไว้ที่:").pack(side="left")
-            self.dl_var = tk.StringVar(value=self._dl_dir())
-            ttk.Label(dl, textvariable=self.dl_var, style="Link.TLabel").pack(side="left", padx=6)
-            ttk.Button(dl, text="เปลี่ยน…", command=self.change_dl).pack(side="left")
-            ttk.Button(dl, text="เปิดโฟลเดอร์", command=lambda: open_path(self.dl_var.get())).pack(side="left", padx=4)
+        def go_back(self):
+            if self.back:
+                self.go(self.back.pop(), record=False)
 
-            ttk.Label(w, text="การรับ-ส่งไฟล์", style="H2.TLabel", padding=(10, 8, 10, 4)).pack(fill="x")
-            tf = ttk.Frame(w, padding=(10, 0, 10, 0))
-            tf.pack(fill="x")
+        def go_up(self):
+            if self.parent_path is not None:
+                self.go(self.parent_path)
+
+        def go_home(self):
+            self.go(None)
+
+        def refresh(self):
+            self.go(self.cur, record=False)
+
+        def populate(self, d):
+            self.cur, self.parent_path = d.get("path"), d.get("parent")
+            self.data = d.get("entries", [])
+            shown = self.cur or ("(ไดรฟ์ทั้งหมด)" if self.side == "remote" else "")
+            self.path_var.set(shown)
+            if self.cur and self.cur not in self.hist:
+                self.hist.insert(0, self.cur)
+                del self.hist[20:]
+            extra = []
+            if self.side == "local":
+                home = os.path.expanduser("~")
+                extra = [home] + [os.path.join(home, x) for x in ("Desktop", "Documents", "Downloads")
+                                  if os.path.isdir(os.path.join(home, x))]
+            self.path_cb.configure(values=list(dict.fromkeys(self.hist + extra)))
+            self.render()
+
+        def sort_by(self, col):
+            self.sort_rev = (not self.sort_rev) if self.sort_col == col else False
+            self.sort_col = col
+            self.render()
+
+        def render(self):
+            t = self.tree
+            t.delete(*t.get_children(""))
+            self.entries.clear()
+            if self.parent_path is not None:
+                t.insert("", "end", iid="up", text="  ..", image=file_icon("up"), values=("", "--"))
+            key = {"name": lambda e: e["n"].lower(), "mtime": lambda e: e.get("m", 0),
+                   "size": lambda e: e.get("s", 0)}[self.sort_col]
+            dirs = sorted([e for e in self.data if e["d"]], key=key, reverse=self.sort_rev)
+            files = sorted([e for e in self.data if not e["d"]], key=key, reverse=self.sort_rev)
+            for i, e in enumerate(dirs + files):
+                iid = "e%d" % i
+                self.entries[iid] = e
+                t.insert("", "end", iid=iid, text="  " + e["n"], image=file_icon(kind_of(e["n"], e["d"])),
+                         values=(fmt_be(e.get("m")), "--" if e["d"] else fmt_size(e["s"])))
+            for c, name in (("#0", "name"), ("mtime", "mtime"), ("size", "size")):
+                base = {"name": "Name", "mtime": "Modified", "size": "Size"}[name]
+                arrow = (" ▼" if self.sort_rev else " ▲") if self.sort_col == name else ""
+                t.heading(c, text=base + arrow)
+            nd, nf = len(dirs), len(files)
+            self.status.configure(text="%d โฟลเดอร์ · %d ไฟล์" % (nd, nf))
+
+        def selected_paths(self):
+            return [self.entries[i]["p"] for i in self.tree.selection() if i in self.entries]
+
+        def on_open(self, e=None):
+            sel = self.tree.selection()
+            if not sel:
+                return
+            if sel[0] == "up":
+                self.go_up()
+                return
+            ent = self.entries.get(sel[0])
+            if ent and ent["d"]:
+                self.go(ent["p"])
+            elif ent:
+                (self.fw.download if self.side == "remote" else self.fw.upload)()
+
+        # ----- actions -----
+        def mkdir(self):
+            if not self.cur:
+                return
+            name = simpledialog.askstring(APP, "ชื่อโฟลเดอร์ใหม่:", parent=self.fw.win)
+            if not name or not name.strip():
+                return
+            if self.side == "local":
+                try:
+                    parts = safe_parts(name.strip())
+                    os.mkdir(os.path.join(self.cur, parts[0]))
+                except Exception as e:
+                    messagebox.showerror(APP, "สร้างโฟลเดอร์ไม่ได้: %s" % err_text(e), parent=self.fw.win)
+                self.refresh()
+            else:
+                self.pending = self.fw.fc.mkdir(self.cur, name.strip())
+
+        def delete(self):
+            paths = self.selected_paths()
+            if not paths:
+                return
+            where = "เครื่องนี้" if self.side == "local" else "เครื่องปลายทาง"
+            names = "\n".join("• " + os.path.basename(p.rstrip("\\/")) for p in paths[:8])
+            more = "\n… และอีก %d รายการ" % (len(paths) - 8) if len(paths) > 8 else ""
+            trash = " (ย้ายไปถังขยะ)" if (self.side == "local" and SYSTEM == "Darwin") else ""
+            if not messagebox.askyesno(APP, "ลบ %d รายการบน%s%s?\n\n%s%s" % (len(paths), where, trash, names, more),
+                                       icon="warning", default="no", parent=self.fw.win):
+                return
+            if self.side == "local":
+                errs = []
+                for p in paths:
+                    try:
+                        delete_path(p)
+                    except Exception as e:
+                        errs.append("%s: %s" % (os.path.basename(p), err_text(e)))
+                if errs:
+                    messagebox.showerror(APP, "ลบไม่สำเร็จบางรายการ:\n" + "\n".join(errs[:10]), parent=self.fw.win)
+                self.refresh()
+            else:
+                self.pending = self.fw.fc._fs("delete", path=self.cur, paths=paths)
+
+        # ----- drag & drop ไปอีกฝั่ง -----
+        def _drag_start(self, e):
+            row = self.tree.identify_row(e.y)
+            self._drag = {"x": e.x_root, "y": e.y_root, "on": False} if row and row != "up" else None
+
+        def _drag_motion(self, e):
+            if self._drag and not self._drag["on"] and (abs(e.x_root - self._drag["x"]) + abs(e.y_root - self._drag["y"])) > 12:
+                self._drag["on"] = True
+                self.tree.configure(cursor="hand2")
+
+        def _drag_end(self, e):
+            d, self._drag = self._drag, None
+            self.tree.configure(cursor="")
+            if not d or not d["on"]:
+                return
+            target = self.fw.win.winfo_containing(e.x_root, e.y_root)
+            other = self.fw.remote if self.side == "local" else self.fw.local
+            w = target
+            while w is not None:
+                if w is other.tree or w is other.frame:
+                    (self.fw.upload if self.side == "local" else self.fw.download)()
+                    return
+                w = w.master
+
+    class FileWindow:
+        """หน้าต่างรับ-ส่งไฟล์ 2 ฝั่ง: ซ้าย = เครื่องนี้, ขวา = เครื่องปลายทาง"""
+
+        def __init__(self, viewer):
+            self.v, self.fc, self.app = viewer, viewer.files, viewer.app
+            self.speed = {}
+            w = self.win = T.track(tk.Toplevel(viewer.win), bg="bg")
+            w.title("รับ-ส่งไฟล์ — %s" % viewer.info.get("name", viewer.host))
+            w.geometry("1120x780")
+            w.minsize(820, 560)
+            w.protocol("WM_DELETE_WINDOW", w.withdraw)
+            set_app_icon(w)
+
+            pw = tk.PanedWindow(w, orient="horizontal", sashwidth=6, bd=0)
+            T.track(pw, bg="border")
+            pw.pack(fill="both", expand=True)
+            my_id = fmt_id(self.app.cfg.get("host_id", ""))
+            rid = viewer.host.replace("ID ", "")
+            self.local = FilePane(self, pw, "local", "%s (%s)" % (computer_name(), my_id), "เครื่องนี้ · This device")
+            self.remote = FilePane(self, pw, "remote", "%s (%s)" % (viewer.info.get("name", ""), rid),
+                                   "เครื่องปลายทาง · Remote device")
+            pw.add(self.local.frame, stretch="always", minsize=380)
+            pw.add(self.remote.frame, stretch="always", minsize=380)
+
+            T.track(tk.Frame(w, height=1, bd=0), bg="border").pack(fill="x")
+            bottom = box(w, bg="bg")
+            bottom.pack(fill="x")
+            head = box(bottom, bg="bg")
+            head.pack(fill="x", padx=12, pady=(8, 4))
+            lbl(head, "การรับ-ส่งไฟล์", fg="text", bg="bg", font="bold").pack(side="left")
+            ttk.Button(head, text="ล้างรายการที่เสร็จแล้ว", style="Tool.TButton", command=self.clear_done).pack(side="right")
+            ttk.Button(head, text="ยกเลิกที่เลือก", style="Tool.TButton", command=self.cancel_sel).pack(side="right", padx=6)
+            self.msg = lbl(head, "ลากไฟล์ข้ามฝั่งเพื่อส่งได้", fg="muted", bg="bg", font="small")
+            self.msg.pack(side="right", padx=12)
+            tf = box(bottom, bg="card")
+            tf.pack(fill="x", padx=12, pady=(0, 12))
             x = self.xfer = ttk.Treeview(tf, columns=("dir", "name", "size", "prog", "speed", "status"),
-                                         show="headings", height=6)
-            for c, txt, wd, st in (("dir", "", 70, False), ("name", "ไฟล์", 230, True), ("size", "ขนาด", 85, False),
+                                         show="headings", height=5)
+            for c, txt, wd, st in (("dir", "", 115, False), ("name", "ไฟล์", 240, True), ("size", "ขนาด", 85, False),
                                    ("prog", "ความคืบหน้า", 175, False), ("speed", "ความเร็ว", 90, False),
-                                   ("status", "สถานะ", 260, True)):
+                                   ("status", "สถานะ", 280, True)):
                 x.heading(c, text=txt)
                 x.column(c, width=wd, stretch=st, anchor="e" if c in ("size", "speed") else "w")
             x.tag_configure("done", foreground=T.c("ok"))
             x.tag_configure("error", foreground=T.c("danger"))
             x.tag_configure("cancelled", foreground=T.c("muted"))
             x.pack(fill="x")
-            xb = ttk.Frame(w, padding=(10, 6, 10, 10))
-            xb.pack(fill="x")
-            ttk.Button(xb, text="ยกเลิกที่เลือก", command=self.cancel_sel).pack(side="left")
-            ttk.Button(xb, text="ล้างรายการที่เสร็จแล้ว", command=self.clear_done).pack(side="left", padx=4)
-            self.status = tk.StringVar(value="")
-            ttk.Label(xb, textvariable=self.status, style="Muted.TLabel").pack(side="right")
-            self.go(None)
-            self.win.after(150, self._poll)
 
-        def _dl_dir(self):
-            d = self.app.cfg.get("download_dir") or os.path.join(os.path.expanduser("~"), "Downloads")
-            return d if os.path.isdir(d) else os.path.expanduser("~")
+            self.local.go(self.app.cfg.get("download_dir") or os.path.join(os.path.expanduser("~"), "Downloads"))
+            if self.local.cur is None:
+                self.local.go(None)
+            self.remote.go(None)
+            self.win.after(150, self._poll)
 
         def show(self):
             self.win.deiconify()
             self.win.lift()
 
-        # ----- browsing -----
-        def go(self, path):
-            self.pending = self.fc.list(path, self.hidden_var.get())
-            self.status.set("กำลังโหลดรายการไฟล์…")
-
-        def refresh(self):
-            self.go(self.cur_path)
-
-        def go_up(self):
-            if self.parent_path is not None:
-                self.go(self.parent_path)
-
-        def _populate(self, d):
-            self.cur_path, self.parent_path = d.get("path"), d.get("parent")
-            self.path_var.set(self.cur_path or ("(ไดรฟ์ทั้งหมด)" if SYSTEM != "Darwin" else ""))
-            t = self.tree
-            t.delete(*t.get_children(""))
-            self.entries.clear()
-            for i, e in enumerate(d.get("entries", [])):
-                iid = "e%d" % i
-                self.entries[iid] = e
-                mt = datetime.fromtimestamp(e["m"]).strftime("%Y-%m-%d %H:%M") if e.get("m") else ""
-                t.insert("", "end", iid=iid, values=(("📁  " if e["d"] else "📄  ") + e["n"],
-                                                     "" if e["d"] else fmt_size(e["s"]), mt))
-            self.status.set("%d รายการ" % len(self.entries))
-
-        def on_open(self, e=None):
-            sel = self.tree.selection()
-            if not sel:
-                return
-            ent = self.entries.get(sel[0])
-            if ent and ent["d"]:
-                self.go(ent["p"])
-            elif ent:
-                self.download([ent["p"]])
-
-        # ----- actions -----
-        def _need_dir(self):
-            if not self.cur_path:
-                messagebox.showinfo(APP, "เปิดโฟลเดอร์ปลายทางที่ต้องการก่อน", parent=self.win)
-                return False
-            return True
-
-        def upload_files(self):
-            if not self._need_dir():
-                return
-            try:
-                paths = pick_files(self.win, "เลือกไฟล์ที่จะอัปโหลด")
-                if paths:
-                    self._add_job(self.fc.upload(list(paths), self.cur_path))
-            except Exception as e:
-                log_error(e)
-                messagebox.showerror(APP, "อัปโหลดไม่ได้: %s" % err_text(e), parent=self.win)
-
-        def upload_folder(self):
-            if not self._need_dir():
-                return
-            try:
-                d = pick_folder(self.win, "เลือกโฟลเดอร์ที่จะอัปโหลด")
-                if d:
-                    self._add_job(self.fc.upload([d], self.cur_path))
-            except Exception as e:
-                log_error(e)
-                messagebox.showerror(APP, "อัปโหลดไม่ได้: %s" % err_text(e), parent=self.win)
-
-        def download(self, paths=None):
-            if paths is None:
-                paths = [self.entries[i]["p"] for i in self.tree.selection() if i in self.entries]
+        def upload(self):
+            paths = self.local.selected_paths()
             if not paths:
-                messagebox.showinfo(APP, "เลือกไฟล์หรือโฟลเดอร์ที่จะดาวน์โหลดก่อน", parent=self.win)
+                messagebox.showinfo(APP, "เลือกไฟล์หรือโฟลเดอร์ฝั่งซ้าย (เครื่องนี้) ที่จะส่งก่อน", parent=self.win)
                 return
-            dest = self.dl_var.get()
-            try:
-                os.makedirs(dest, exist_ok=True)
-            except OSError as e:
-                messagebox.showerror(APP, "ใช้โฟลเดอร์นี้ไม่ได้: %s" % err_text(e), parent=self.win)
+            if not self.remote.cur:
+                messagebox.showinfo(APP, "เปิดโฟลเดอร์ปลายทางฝั่งขวาก่อน", parent=self.win)
                 return
-            self._add_job(self.fc.download(paths, dest))
+            self._add_job(self.fc.upload(paths, self.remote.cur))
 
-        def mkdir(self):
-            if not self._need_dir():
+        def download(self):
+            paths = self.remote.selected_paths()
+            if not paths:
+                messagebox.showinfo(APP, "เลือกไฟล์หรือโฟลเดอร์ฝั่งขวา (เครื่องปลายทาง) ที่จะดาวน์โหลดก่อน", parent=self.win)
                 return
-            name = simpledialog.askstring(APP, "ชื่อโฟลเดอร์ใหม่:", parent=self.win)
-            if name and name.strip():
-                self.pending = self.fc.mkdir(self.cur_path, name.strip(), self.hidden_var.get())
-
-        def change_dl(self):
-            d = pick_folder(self.win, "เลือกโฟลเดอร์สำหรับเก็บไฟล์ที่ดาวน์โหลด", self.dl_var.get())
-            if d:
-                self.dl_var.set(d)
-                self.app.cfg["download_dir"] = d
-                save_config(self.app.cfg)
+            if not self.local.cur:
+                messagebox.showinfo(APP, "เปิดโฟลเดอร์ปลายทางฝั่งซ้ายก่อน", parent=self.win)
+                return
+            self._add_job(self.fc.download(paths, self.local.cur))
 
         def cancel_sel(self):
             for iid in self.xfer.selection():
@@ -2633,9 +2918,8 @@ def run_gui():
                 spd = spd * 0.4 + 0.6 * (cur - b_prev) / (now - t_prev)
                 self.speed[job["tid"]] = (now, cur, spd)
             if job["state"] != "active":
-                el = max(0.001, (job["t1"] or now) - job["t0"])
-                spd = cur / el
-            arrow = "⬆ ส่ง" if job["dir"] == "up" else "⬇ รับ"
+                spd = cur / max(0.001, (job["t1"] or now) - job["t0"])
+            arrow = "⬆ Upload" if job["dir"] == "up" else "⬇ Download"
             return (arrow, job["name"], fmt_size(total) if total else "-", "%s %3.0f%%" % (bar, pct),
                     "%s/s" % fmt_size(spd) if cur else "", job["status"])
 
@@ -2645,19 +2929,21 @@ def run_gui():
             try:
                 while True:
                     kind, d = self.fc.events.get_nowait()
-                    if kind == "fs" and d.get("id") == self.pending:
+                    if kind == "fs" and d.get("id") == self.remote.pending:
                         if d.get("ok"):
-                            self._populate(d)
+                            self.remote.populate(d)
                         else:
-                            self.status.set("✗ %s" % d.get("err"))
+                            self.remote.status.configure(text="✗ %s" % d.get("err"))
                             messagebox.showerror(APP, d.get("err") or "ผิดพลาด", parent=self.win)
                     elif kind == "job_done":
                         job = self.fc.jobs.get(d)
                         if job and job["state"] == "done":
-                            if job["dir"] == "up" and job["dest"] == self.cur_path:
-                                self.refresh()
-                            self.status.set("%s เสร็จ: %s" % ("อัปโหลด" if job["dir"] == "up" else "ดาวน์โหลด",
-                                                              job["name"]))
+                            if job["dir"] == "up" and job["dest"] == self.remote.cur:
+                                self.remote.refresh()
+                            if job["dir"] == "down" and job["dest"] == self.local.cur:
+                                self.local.refresh()
+                            self.msg.configure(text="✓ %s เสร็จ: %s" % ("Upload" if job["dir"] == "up" else "Download",
+                                                                       job["name"]))
             except queue.Empty:
                 pass
             for iid in self.xfer.get_children(""):
@@ -2677,21 +2963,31 @@ def run_gui():
             if not self.cfg.get("host_id") or not self.cfg.get("host_secret"):
                 self.cfg.update({"host_id": new_host_id(), "host_secret": secrets.token_hex(24)})
                 save_config(self.cfg)
+            # ค่าจากไฟล์ .env มีผลเหนือค่าที่บันทึกในโปรแกรม
+            for env_k, cfg_k in (("ASK_BEFORE_ACCEPT", "ask"), ("ALLOW_CONTROL", "allow_control"),
+                                 ("ALLOW_FILES", "allow_files"), ("AUTOSTART_HOST", "autostart")):
+                if ENV.get(env_k, "") != "":
+                    self.cfg[cfg_k] = env_bool(env_k, self.cfg.get(cfg_k, True))
+            if env_str("HOST_PASSWORD"):
+                self.cfg["password"] = env_str("HOST_PASSWORD")
+            if env_str("DOWNLOAD_DIR"):
+                self.cfg["download_dir"] = os.path.expanduser(env_str("DOWNLOAD_DIR"))
             self.q = queue.Queue()
             self.server = None
             self.viewers = []
             self.banner_state = ("off", "")
+            self.relay_state = {"mon": "checking", "data": None, "host": None, "host_text": "", "t": None}
             self.session_who = None
             root.title("%s — Remote Desktop" % APP)
-            root.geometry("1000x720")
-            root.minsize(900, 640)
+            root.geometry("1000x780")
+            root.minsize(900, 700)
             self._build_header(root)
-            nb = ttk.Notebook(root)
+            nb = self.nb = ttk.Notebook(root)
             nb.pack(fill="both", expand=True)
             t1, t2, t3 = (ttk.Frame(nb, padding=(16, 14, 16, 16)) for _ in range(3))
             nb.add(t1, text="ควบคุมเครื่องอื่น")
             nb.add(t2, text="ให้เครื่องอื่นควบคุมเครื่องนี้")
-            nb.add(t3, text="อินเทอร์เน็ต (Relay)")
+            nb.add(t3, text="การเชื่อมต่อ (Relay)")
             self._build_client(t1)
             self._build_server(t2)
             self._build_relay(t3)
@@ -2701,6 +2997,8 @@ def run_gui():
                 nb.select(self.cfg["last_tab"])
             nb.bind("<<NotebookTabChanged>>", lambda e: self._tab(nb))
             root.after(50, self._poll)
+            self.monitor = RelayMonitor(self._relay_conn, self.q)
+            self.monitor.start()
             if self.cfg.get("autostart"):
                 root.after(300, self.start_server)
 
@@ -2732,12 +3030,16 @@ def run_gui():
             txt = box(hdr, bg="header")
             txt.pack(side="left")
             lbl(txt, "NetRemote", fg="hdr_fg", bg="header", font="h1").pack(anchor="w")
-            lbl(txt, "Remote Desktop · LAN และอินเทอร์เน็ต · v%s" % VERSION, fg="hdr_muted", bg="header",
+            lbl(txt, "Remote Desktop ผ่าน Relay · v%s" % VERSION, fg="hdr_muted", bg="header",
                 font="small").pack(anchor="w")
             self.theme_btn = lbl(hdr, self.THEME_LABEL[T.mode], fg="hdr_fg", bg="header2", font="smallbold",
                                  padx=14, pady=6, cursor="hand2")
             self.theme_btn.pack(side="right", padx=18)
             self.theme_btn.bind("<Button-1>", lambda e: self.cycle_theme())
+            self.relay_pill = tk.Label(hdr, text="●  Relay: กำลังตรวจสอบ…", font=T.f["smallbold"], padx=14, pady=6,
+                                       cursor="hand2", bg="#B45309", fg="#FFFFFF")
+            self.relay_pill.pack(side="right")
+            self.relay_pill.bind("<Button-1>", lambda e: self.nb.select(2))
 
         def cycle_theme(self):
             order = ["auto", "light", "dark"]
@@ -2755,54 +3057,104 @@ def run_gui():
             c = card(P)
             c.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
             lbl(c, "เชื่อมต่อไปยังเครื่องอื่น", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
-            lbl(c, "ใส่ IP (ในวง LAN) หรือ ID 9 หลัก (ผ่านอินเทอร์เน็ต) ของเครื่องปลายทาง",
+            lbl(c, "ใส่ ID 9 หลักของเครื่องปลายทาง — เชื่อมต่อผ่าน Relay Server เท่านั้น (เข้ารหัสต้นทางถึงปลายทาง)",
                 fg="muted", font="small", wraplength=420).pack(anchor="w", padx=22, pady=(0, 16))
-            lbl(c, "IP หรือ ID", fg="muted", font="smallbold").pack(anchor="w", padx=22)
-            self.host_var = tk.StringVar(value=(self.cfg.get("recent") or [""])[0])
-            self.host_cb = ttk.Combobox(c, textvariable=self.host_var, values=self.cfg.get("recent", []),
-                                        font=T.f["big"])
+            lbl(c, "ID เครื่องปลายทาง", fg="muted", font="smallbold").pack(anchor="w", padx=22)
+            recent = [fmt_id(i) for i in (parse_id(x) for x in self.cfg.get("recent", [])) if i]
+            self.host_var = tk.StringVar(value=recent[0] if recent else "")
+            self.host_cb = ttk.Combobox(c, textvariable=self.host_var, values=recent, font=T.f["mono"])
             self.host_cb.pack(fill="x", padx=22, pady=(4, 14))
             lbl(c, "รหัสผ่าน", fg="muted", font="smallbold").pack(anchor="w", padx=22)
             self.cpw_var = tk.StringVar()
             pw = ttk.Entry(c, textvariable=self.cpw_var, show="•", font=T.f["big"])
             pw.pack(fill="x", padx=22, pady=(4, 10))
             pw.bind("<Return>", lambda e: self.connect())
-            row = box(c)
-            row.pack(fill="x", padx=22)
             self.view_only_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(row, text="ดูหน้าจออย่างเดียว", variable=self.view_only_var,
-                            style="Card.TCheckbutton").pack(side="left")
-            self.cport_var = tk.StringVar(value=str(self.cfg.get("client_port", DEFAULT_PORT)))
-            ttk.Entry(row, textvariable=self.cport_var, width=6).pack(side="right")
-            lbl(row, "พอร์ต (LAN)", fg="muted", font="small").pack(side="right", padx=6)
+            ttk.Checkbutton(c, text="ดูหน้าจออย่างเดียว (ไม่ควบคุม)", variable=self.view_only_var,
+                            style="Card.TCheckbutton").pack(anchor="w", padx=22)
             self.conn_btn = ttk.Button(c, text="เชื่อมต่อ   →", style="Big.Accent.TButton", command=self.connect)
             self.conn_btn.pack(fill="x", padx=22, pady=(18, 10))
             self.cstatus = tk.StringVar(value="")
             lbl(c, textvariable=self.cstatus, fg="warn", font="small", wraplength=420).pack(anchor="w", padx=22)
             tips = box(c)
             tips.pack(side="bottom", fill="x", padx=22, pady=(0, 18))
-            for t in ("🔒  เข้ารหัสทุกการเชื่อมต่อด้วย TLS — รหัสผ่านไม่ถูกส่งผ่านเครือข่าย",
-                      "⌨  ใน หน้าต่างรีโมท: รับ-ส่งไฟล์, ส่งข้อความภาษาไทย, ดู Latency"):
+            for t in ("🔒  เข้ารหัสทุกการเชื่อมต่อด้วย TLS — Relay อ่านข้อมูลไม่ได้ และรหัสผ่านไม่ถูกส่งผ่านเครือข่าย",
+                      "⌨  ในหน้าต่างรีโมท: รับ-ส่งไฟล์, ส่งข้อความภาษาไทย, ดู Latency"):
                 lbl(tips, t, fg="muted", font="small").pack(anchor="w", pady=1)
 
             d = card(P)
             d.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
             head = box(d)
             head.pack(fill="x", padx=20, pady=(20, 4))
-            lbl(head, "เครื่องในวง LAN", font="h2").pack(side="left")
-            self.disc_btn = ttk.Button(head, text="ค้นหา", command=self.discover)
-            self.disc_btn.pack(side="right")
-            lbl(d, "เครื่องที่เปิดรับการเชื่อมต่ออยู่ — ดับเบิลคลิกเพื่อเลือก", fg="muted", font="small").pack(
+            lbl(head, "เครื่องที่เคยเชื่อมต่อ", font="h2").pack(side="left")
+            ttk.Button(head, text="ล้าง", command=self._clear_recent).pack(side="right")
+            lbl(d, "ดับเบิลคลิกเพื่อเลือก แล้วใส่รหัสผ่าน", fg="muted", font="small").pack(
                 anchor="w", padx=20, pady=(0, 10))
             tf = box(d)
             tf.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-            self.disc = ttk.Treeview(tf, columns=("ip", "name"), show="headings")
-            self.disc.heading("ip", text="IP")
-            self.disc.heading("name", text="ชื่อเครื่อง")
-            self.disc.column("ip", width=130, stretch=False)
-            self.disc.pack(fill="both", expand=True)
-            self.disc.bind("<Double-1>", self._pick_disc)
-            self.disc.bind("<<TreeviewSelect>>", self._pick_disc_fill)
+            self.recent_tree = ttk.Treeview(tf, columns=("id", "name", "last"), show="headings")
+            for col, txt, w, st in (("id", "ID", 120, False), ("name", "ชื่อเครื่อง", 140, True),
+                                    ("last", "ล่าสุด", 110, False)):
+                self.recent_tree.heading(col, text=txt)
+                self.recent_tree.column(col, width=w, stretch=st)
+            self.recent_tree.pack(fill="both", expand=True)
+            self.recent_tree.bind("<Double-1>", self._pick_recent)
+            self.recent_tree.bind("<<TreeviewSelect>>", self._pick_recent_fill)
+            self._refresh_recent()
+
+        def _refresh_recent(self):
+            t = self.recent_tree
+            t.delete(*t.get_children(""))
+            for i, r in enumerate(self.cfg.get("recent_info", [])[:30]):
+                when = datetime.fromtimestamp(r.get("t", 0)).strftime("%d/%m %H:%M") if r.get("t") else ""
+                t.insert("", "end", iid="r%d" % i, values=(fmt_id(r.get("id", "")), r.get("name", ""), when))
+
+        def _clear_recent(self):
+            self.cfg.update({"recent": [], "recent_info": []})
+            save_config(self.cfg)
+            self.host_cb.configure(values=[])
+            self._refresh_recent()
+
+        def _pick_recent_fill(self, e=None):
+            sel = self.recent_tree.selection()
+            if sel:
+                self.host_var.set(self.recent_tree.item(sel[0], "values")[0])
+
+        def _pick_recent(self, e=None):
+            self._pick_recent_fill()
+            if self.cpw_var.get():
+                self.connect()
+
+        def connect(self):
+            rid = parse_id(self.host_var.get())
+            pw = self.cpw_var.get()
+            if not rid:
+                messagebox.showerror(APP, "กรุณาใส่ ID 9 หลักของเครื่องปลายทาง\n(ดู ID ได้ที่แท็บ \"ให้เครื่องอื่นควบคุมเครื่องนี้\" ของเครื่องนั้น)")
+                return
+            if not pw:
+                messagebox.showerror(APP, "กรุณาใส่รหัสผ่าน")
+                return
+            addr, key = self._relay_conn()
+            if not addr:
+                messagebox.showerror(APP, "ยังไม่ได้ตั้งค่า Relay Server\nไปที่แท็บ \"การเชื่อมต่อ (Relay)\" หรือใส่ในไฟล์ .env")
+                return
+            relay = {"addr": addr, "key": key, "id": rid}
+            host = "ID " + fmt_id(rid)
+            self.conn_btn.configure(state="disabled")
+            self.cstatus.set("กำลังเชื่อมต่อ %s ผ่าน Relay … (ถ้าปลายทางตั้งให้ถามก่อน ต้องรอให้กดยอมรับ)" % host)
+
+            def work():
+                try:
+                    tls, info, fp = client_connect(host, 0, pw, self._confirm_fp_threadsafe, relay=relay)
+                    self.q.put(("connected", rid, tls, info, fp))
+                except socket.timeout:
+                    self.q.put(("connect_err", "หมดเวลา — ไม่มีการตอบรับจาก %s" % host))
+                except OSError as e:
+                    msg = str(e) if isinstance(e, ConnectionError) else (e.strerror or str(e))
+                    self.q.put(("connect_err", "เชื่อมต่อไม่ได้: %s" % msg))
+                except Exception as e:
+                    self.q.put(("connect_err", "เชื่อมต่อไม่ได้: %s" % e))
+            threading.Thread(target=work, daemon=True).start()
 
         # ---------------- server tab ----------------
         def _build_server(self, P):
@@ -2834,14 +3186,12 @@ def run_gui():
             info.pack(fill="x", pady=(14, 0))
             lbl(info, "ข้อมูลสำหรับให้อีกฝั่งเชื่อมต่อ", font="h2").grid(row=0, column=0, columnspan=3, sticky="w",
                                                                     padx=20, pady=(16, 10))
-            lbl(info, "IP ในวง LAN", fg="muted", font="smallbold").grid(row=1, column=0, sticky="w", padx=20)
-            lbl(info, "ID ผ่านอินเทอร์เน็ต", fg="muted", font="smallbold").grid(row=1, column=1, sticky="w", padx=20)
-            self.ip_lbl = lbl(info, "\n".join(get_local_ips()[:2]), font="mono")
-            self.ip_lbl.grid(row=2, column=0, sticky="nw", padx=20)
-            self.id_lbl = lbl(info, "", font="mono")
-            self.id_lbl.grid(row=2, column=1, sticky="nw", padx=20)
-            self.relay_state_lbl = lbl(info, "", fg="muted", font="small", wraplength=230)
-            self.relay_state_lbl.grid(row=3, column=1, sticky="nw", padx=20)
+            lbl(info, "ID ของเครื่องนี้", fg="muted", font="smallbold").grid(row=1, column=0, columnspan=2,
+                                                                         sticky="w", padx=20)
+            self.id_lbl = lbl(info, "", fg="accent", font="monobig")
+            self.id_lbl.grid(row=2, column=0, columnspan=2, sticky="nw", padx=20)
+            self.relay_state_lbl = lbl(info, "", fg="muted", font="small", wraplength=460)
+            self.relay_state_lbl.grid(row=3, column=0, columnspan=2, sticky="nw", padx=20)
             lbl(info, "รหัสผ่าน", fg="muted", font="smallbold").grid(row=4, column=0, columnspan=2, sticky="w",
                                                                    padx=20, pady=(12, 0))
             pwrow = box(info)
@@ -2869,11 +3219,7 @@ def run_gui():
                                             ("เปิดรับอัตโนมัติเมื่อเปิดโปรแกรม", self.auto_var))):
                 ttk.Checkbutton(opt, text=txt, variable=var, style="Card.TCheckbutton",
                                 command=self._save_server_opts).grid(row=1 + i // 2, column=i % 2, sticky="w", padx=20)
-            prow = box(opt)
-            prow.grid(row=3, column=0, columnspan=2, sticky="w", padx=20, pady=(6, 16))
-            lbl(prow, "พอร์ต (LAN)", fg="muted", font="small").pack(side="left")
-            self.sport_var = tk.StringVar(value=str(self.cfg.get("port", DEFAULT_PORT)))
-            ttk.Entry(prow, textvariable=self.sport_var, width=7).pack(side="left", padx=8)
+            lbl(opt, "").grid(row=3, column=0, pady=4)
             opt.columnconfigure(1, weight=1)
 
             # สิทธิ์ macOS
@@ -2912,121 +3258,106 @@ def run_gui():
             self.fp_lbl.pack(anchor="w", padx=20, pady=(8, 14))
             self._banner("off")
 
-        # ---------------- relay (internet) tab ----------------
+        # ---------------- relay tab ----------------
         def _build_relay(self, P):
             P.columnconfigure(0, weight=6, uniform="r")
             P.columnconfigure(1, weight=5, uniform="r")
             P.rowconfigure(0, weight=1)
-            f = card(P)
-            f.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            left = ttk.Frame(P)
+            left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            f = card(left)
+            f.pack(fill="x")
             lbl(f, "Relay Server", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
-            lbl(f, "ตัวกลางสำหรับรีโมทผ่านอินเทอร์เน็ต (โปรแกรม relay_server.py บน VPS / Cloud) — ทั้งสองเครื่อง"
-                   "เชื่อมต่อออกไปหา Relay จึงไม่ต้องตั้ง Router และข้อมูลยังเข้ารหัสจากต้นทางถึงปลายทาง",
-                fg="muted", font="small", wraplength=470).pack(anchor="w", padx=22, pady=(0, 16))
+            lbl(f, "ทุกการเชื่อมต่อผ่าน Relay เท่านั้น — ทั้งสองเครื่องเชื่อมต่อออกไปหา Relay จึงไม่ต้องเปิดพอร์ตบนเครื่อง "
+                   "และข้อมูลยังเข้ารหัสจากต้นทางถึงปลายทาง (Relay อ่านเนื้อหาไม่ได้)",
+                fg="muted", font="small", wraplength=470).pack(anchor="w", padx=22, pady=(0, 14))
+            locked = bool(env_str("RELAY_ADDR"))
             lbl(f, "ที่อยู่ Relay Server", fg="muted", font="smallbold").pack(anchor="w", padx=22)
-            self.relay_addr_var = tk.StringVar(value=self.cfg.get("relay_addr", ""))
-            ttk.Entry(f, textvariable=self.relay_addr_var, font=T.f["big"]).pack(fill="x", padx=22, pady=(4, 2))
+            self.relay_addr_var = tk.StringVar(value=self._relay_conn()[0])
+            e1 = ttk.Entry(f, textvariable=self.relay_addr_var, font=T.f["big"])
+            e1.pack(fill="x", padx=22, pady=(4, 2))
             lbl(f, "เช่น relay.example.com:5910 หรือ 203.0.113.10:5910", fg="muted", font="small").pack(
-                anchor="w", padx=22, pady=(0, 12))
+                anchor="w", padx=22, pady=(0, 10))
             lbl(f, "Relay Key", fg="muted", font="smallbold").pack(anchor="w", padx=22)
-            self.relay_key_var = tk.StringVar(value=self.cfg.get("relay_key", ""))
-            ttk.Entry(f, textvariable=self.relay_key_var, show="•", font=T.f["big"]).pack(fill="x", padx=22,
-                                                                                          pady=(4, 12))
-            self.relay_host_var = tk.BooleanVar(value=self.cfg.get("relay_host", False))
-            ttk.Checkbutton(f, text="ให้เครื่องนี้รับการเชื่อมต่อผ่านอินเทอร์เน็ตด้วย", variable=self.relay_host_var,
-                            style="Card.TCheckbutton").pack(anchor="w", padx=22)
+            self.relay_key_var = tk.StringVar(value=self._relay_conn()[1])
+            e2 = ttk.Entry(f, textvariable=self.relay_key_var, show="•", font=T.f["big"])
+            e2.pack(fill="x", padx=22, pady=(4, 8))
+            if locked:
+                e1.configure(state="disabled")
+                e2.configure(state="disabled")
+                lbl(f, "🔒  กำหนดโดยไฟล์ .env — แก้ไขที่ไฟล์แล้วเปิดโปรแกรมใหม่", fg="accent", font="smallbold").pack(
+                    anchor="w", padx=22)
             row = box(f)
-            row.pack(fill="x", padx=22, pady=(16, 8))
-            ttk.Button(row, text="บันทึก", style="Accent.TButton", command=self.save_relay).pack(side="left")
+            row.pack(fill="x", padx=22, pady=(12, 6))
+            b = ttk.Button(row, text="บันทึก", style="Accent.TButton", command=self.save_relay)
+            b.pack(side="left")
+            if locked:
+                b.configure(state="disabled")
             ttk.Button(row, text="ทดสอบการเชื่อมต่อ", command=self.test_relay).pack(side="left", padx=8)
             self.relay_test_var = tk.StringVar(value="")
             lbl(f, textvariable=self.relay_test_var, fg="muted", font="small", wraplength=470).pack(
-                anchor="w", padx=22, pady=(0, 18))
+                anchor="w", padx=22, pady=(0, 16))
+
+            st = card(left)
+            st.pack(fill="both", expand=True, pady=(14, 0))
+            lbl(st, "สถานะการเชื่อมต่อ Relay", font="h2").grid(row=0, column=0, columnspan=2, sticky="w",
+                                                             padx=22, pady=(18, 10))
+            self.rs = {}
+            for i, (k, t) in enumerate((("state", "สถานะ"), ("addr", "Server"), ("ping", "Ping"),
+                                        ("ver", "เวอร์ชัน Relay"), ("hosts", "เครื่องออนไลน์บน Relay"),
+                                        ("host", "รับการเชื่อมต่อของเครื่องนี้"), ("checked", "ตรวจล่าสุด"))):
+                lbl(st, t, fg="muted", font="small").grid(row=i + 1, column=0, sticky="w", padx=(22, 12), pady=2)
+                v = lbl(st, "–", font="smallbold" if k == "state" else "small", padx=8 if k == "state" else 0,
+                        pady=2 if k == "state" else 0)
+                v.grid(row=i + 1, column=1, sticky="w", pady=2)
+                self.rs[k] = v
+            st.columnconfigure(1, weight=1)
 
             right = ttk.Frame(P)
             right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
             idc = card(right)
             idc.pack(fill="x")
             lbl(idc, "ID ของเครื่องนี้", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
-            lbl(idc, "ให้อีกฝั่งใส่ ID นี้ในช่อง \"IP หรือ ID\"", fg="muted", font="small").pack(anchor="w", padx=22)
+            lbl(idc, "ให้อีกฝั่งใส่ ID นี้เพื่อเชื่อมต่อเข้ามา", fg="muted", font="small").pack(anchor="w", padx=22)
             self.relay_id_lbl = lbl(idc, fmt_id(self.cfg["host_id"]), fg="accent", font="monobig")
             self.relay_id_lbl.pack(anchor="w", padx=22, pady=(10, 8))
             ttk.Button(idc, text="สร้าง ID ใหม่", command=self.new_id).pack(anchor="w", padx=22, pady=(0, 20))
-            alt = card(right)
-            alt.pack(fill="both", expand=True, pady=(14, 0))
-            lbl(alt, "ไม่มี Relay?", font="h2").pack(anchor="w", padx=22, pady=(20, 4))
-            lbl(alt, "ตั้ง Port Forward ที่ Router ให้พอร์ต TCP %d มาที่เครื่องนี้ แล้วให้อีกฝั่งใส่ IP สาธารณะของ "
-                     "Router แทน — ไม่แนะนำนัก เพราะเครื่องจะถูกสแกนจากอินเทอร์เน็ตได้ ถ้าใช้วิธีนี้ควรตั้งรหัสผ่านยาว ๆ "
-                     "และเปิด \"ถามก่อนรับการเชื่อมต่อ\"" % DEFAULT_PORT,
-                fg="muted", font="small", wraplength=380).pack(anchor="w", padx=22, pady=(0, 20))
 
-        def _pick_disc_fill(self, e=None):
-            sel = self.disc.selection()
-            if sel:
-                self.host_var.set(self.disc.item(sel[0], "values")[0])
+            ec = card(right)
+            ec.pack(fill="both", expand=True, pady=(14, 0))
+            lbl(ec, "ไฟล์ตั้งค่า .env", font="h2").pack(anchor="w", padx=22, pady=(20, 4))
+            lbl(ec, ("✓ ใช้ไฟล์: %s" % ENV_PATH) if ENV_PATH else "ยังไม่มีไฟล์ .env — ใช้ค่าที่ตั้งในโปรแกรม",
+                fg="ok" if ENV_PATH else "muted", font="small", wraplength=380).pack(anchor="w", padx=22)
+            lbl(ec, "ผู้ดูแลระบบใส่ RELAY_ADDR / RELAY_KEY ไว้ในไฟล์ .env ได้ ค่าในไฟล์จะมีผลเหนือค่าในโปรแกรม "
+                    "และถ้าวางไฟล์ไว้ตอน Build จะถูกฝังมากับโปรแกรม (ผู้ใช้ไม่ต้องตั้งค่าเอง)",
+                fg="muted", font="small", wraplength=380).pack(anchor="w", padx=22, pady=(8, 10))
+            r2 = box(ec)
+            r2.pack(anchor="w", padx=22, pady=(0, 20))
+            ttk.Button(r2, text="สร้าง / แก้ไขไฟล์ .env", command=self.edit_env).pack(side="left")
+            ttk.Button(r2, text="เปิดโฟลเดอร์", command=lambda: open_path(
+                os.path.dirname(ENV_PATH) if ENV_PATH else CONF_DIR)).pack(side="left", padx=6)
 
-        def _pick_disc(self, e=None):
-            self._pick_disc_fill()
-            if self.cpw_var.get():
-                self.connect()
-
-        def discover(self):
-            try:
-                port = int(self.cport_var.get())
-            except ValueError:
-                port = DEFAULT_PORT
-            self.disc_btn.configure(state="disabled", text="กำลังค้นหา…")
-            self.disc.delete(*self.disc.get_children())
-
-            def work():
+        def edit_env(self):
+            path = ENV_PATH or os.path.join(CONF_DIR, ".env")
+            if not os.path.exists(path):
+                addr, key = self._relay_conn()
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("# NetRemote — การตั้งค่าฝั่งโปรแกรม (Client)\n"
+                            "# แก้ไขแล้วปิด-เปิดโปรแกรมใหม่\n\n"
+                            "RELAY_ADDR=%s\nRELAY_KEY=%s\n\n"
+                            "# ตัวเลือกเพิ่มเติม (ลบ # ข้างหน้าเพื่อใช้)\n"
+                            "# HOST_PASSWORD=\n# ASK_BEFORE_ACCEPT=true\n# ALLOW_CONTROL=true\n"
+                            "# ALLOW_FILES=true\n# AUTOSTART_HOST=false\n# THEME=auto\n# DOWNLOAD_DIR=\n" % (addr, key))
                 try:
-                    res = discover_lan(port)
-                except Exception as e:
-                    res = e
-                self.q.put(("discovered", res))
-            threading.Thread(target=work, daemon=True).start()
-
-        def connect(self):
-            host = self.host_var.get().strip()
-            pw = self.cpw_var.get()
-            if not host:
-                messagebox.showerror(APP, "กรุณาใส่ IP หรือชื่อเครื่องปลายทาง")
-                return
-            if not pw:
-                messagebox.showerror(APP, "กรุณาใส่รหัสผ่าน")
-                return
-            try:
-                port = int(self.cport_var.get())
-            except ValueError:
-                messagebox.showerror(APP, "พอร์ตต้องเป็นตัวเลข")
-                return
-            rid = parse_id(host)
-            relay = None
-            if rid:
-                if not self.cfg.get("relay_addr"):
-                    messagebox.showerror(APP, "การเชื่อมต่อด้วย ID ต้องตั้งค่า Relay Server ก่อน\n"
-                                              "ไปที่แท็บ \"อินเทอร์เน็ต (Relay)\"")
-                    return
-                relay = {"addr": self.cfg["relay_addr"], "key": self.cfg.get("relay_key", ""), "id": rid}
-                host = "ID " + fmt_id(rid)
-            self.conn_btn.configure(state="disabled")
-            self.cstatus.set("กำลังเชื่อมต่อ %s%s … (ถ้าปลายทางตั้งให้ถามก่อน ต้องรอให้กดยอมรับ)"
-                             % (host, " ผ่าน Relay" if relay else ""))
-
-            def work():
-                try:
-                    tls, info, fp = client_connect(host, port, pw, self._confirm_fp_threadsafe, relay=relay)
-                    self.q.put(("connected", host, port, tls, info, fp))
-                except socket.timeout:
-                    self.q.put(("connect_err", "หมดเวลา — ไม่มีการตอบรับจาก %s" % host))
-                except ConnectionRefusedError:
-                    self.q.put(("connect_err", "%s ไม่ได้เปิดรับการเชื่อมต่อที่พอร์ต %d" % (host, port)))
-                except OSError as e:
-                    msg = str(e) if isinstance(e, ConnectionError) else (e.strerror or str(e))
-                    self.q.put(("connect_err", "เชื่อมต่อไม่ได้: %s" % msg))
-                except Exception as e:
-                    self.q.put(("connect_err", "เชื่อมต่อไม่ได้: %s" % e))
-            threading.Thread(target=work, daemon=True).start()
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+                messagebox.showinfo(APP, "สร้างไฟล์ .env แล้วที่\n%s\n\nแก้ไขแล้วปิด-เปิดโปรแกรมใหม่เพื่อใช้ค่าใหม่" % path)
+            if SYSTEM == "Darwin":
+                subprocess.Popen(["open", "-t", path])
+            else:
+                open_path(path)
 
         def _confirm_fp_threadsafe(self, host, fp, name):
             known = self.cfg.setdefault("known", {})
@@ -3045,7 +3376,15 @@ def run_gui():
                 save_config(self.cfg)
             return bool(box.get("ok"))
 
+        def _relay_conn(self):
+            """ที่อยู่และ Key ของ Relay — จาก .env ก่อน ถ้าไม่มีใช้ค่าที่ตั้งในโปรแกรม"""
+            if env_str("RELAY_ADDR"):
+                return env_str("RELAY_ADDR").strip(), ENV.get("RELAY_KEY", "")
+            return self.cfg.get("relay_addr", "").strip(), self.cfg.get("relay_key", "")
+
         def save_relay(self, quiet=False):
+            if env_str("RELAY_ADDR"):
+                return True
             addr = self.relay_addr_var.get().strip()
             if addr:
                 try:
@@ -3053,10 +3392,10 @@ def run_gui():
                 except ValueError:
                     messagebox.showerror(APP, "รูปแบบ Relay Server ไม่ถูกต้อง (เช่น relay.example.com:5910)")
                     return False
-            self.cfg.update({"relay_addr": addr, "relay_key": self.relay_key_var.get(),
-                             "relay_host": self.relay_host_var.get()})
+            self.cfg.update({"relay_addr": addr, "relay_key": self.relay_key_var.get()})
             save_config(self.cfg)
             self._update_id_row()
+            self.monitor.refresh()
             if not quiet:
                 self.relay_test_var.set("บันทึกแล้ว")
                 if self.server and self.server.is_alive():
@@ -3068,7 +3407,8 @@ def run_gui():
         def test_relay(self):
             if not self.save_relay(quiet=True):
                 return
-            addr, key = self.cfg.get("relay_addr"), self.cfg.get("relay_key")
+            addr, key = self._relay_conn()
+            self.monitor.refresh()
             if not addr:
                 self.relay_test_var.set("ใส่ที่อยู่ Relay Server ก่อน")
                 return
@@ -3077,7 +3417,8 @@ def run_gui():
             def work():
                 try:
                     r = relay_test(addr, key)
-                    msg = "✓ เชื่อมต่อ Relay ได้ (เวอร์ชัน %s, ออนไลน์ %s เครื่อง)" % (r.get("v"), r.get("hosts"))
+                    msg = "✓ เชื่อมต่อ Relay ได้ — Ping %.0f ms, เวอร์ชัน %s, ออนไลน์ %s เครื่อง" % (
+                        r.get("rtt", 0), r.get("v"), r.get("hosts"))
                 except Exception as e:
                     msg = "✗ %s" % err_text(e)
                 self.q.put(("relay_test", msg))
@@ -3095,28 +3436,69 @@ def run_gui():
                 self.root.after(400, self.start_server)
 
         def _relay_cfg(self):
-            if self.cfg.get("relay_host") and self.cfg.get("relay_addr"):
-                return {"addr": self.cfg["relay_addr"], "key": self.cfg.get("relay_key", ""),
-                        "id": self.cfg["host_id"], "secret": self.cfg["host_secret"]}
+            addr, key = self._relay_conn()
+            if addr:
+                return {"addr": addr, "key": key, "id": self.cfg["host_id"], "secret": self.cfg["host_secret"]}
             return None
 
         def _update_id_row(self, state=None, text=None):
-            if self._relay_cfg():
-                self.id_lbl.configure(text=fmt_id(self.cfg["host_id"]), fg=T.c("text"))
-                if text:
-                    color = {"online": "ok", "error": "danger", "connecting": "warn"}.get(state, "muted")
-                    self.relay_state_lbl.configure(text=("● " if state == "online" else "") + text, fg=T.c(color))
-                elif not (self.server and self.server.is_alive()):
-                    self.relay_state_lbl.configure(text="จะออนไลน์เมื่อกด เริ่มเปิดรับ", fg=T.c("muted"))
+            self.id_lbl.configure(text=fmt_id(self.cfg["host_id"]), fg=T.c("accent"))
+            if state:
+                self.relay_state["host"] = state
+                self.relay_state["host_text"] = text or ""
+            running = bool(self.server and self.server.is_alive())
+            if not self._relay_cfg():
+                self.relay_state_lbl.configure(text="ยังไม่ได้ตั้งค่า Relay — ตั้งที่แท็บ \"การเชื่อมต่อ (Relay)\" หรือไฟล์ .env",
+                                               fg=T.c("danger"))
+            elif text and running:
+                color = {"online": "ok", "error": "danger", "connecting": "warn"}.get(state, "muted")
+                self.relay_state_lbl.configure(text=("● " if state == "online" else "") + text, fg=T.c(color))
+            elif not running:
+                self.relay_state["host"] = None
+                self.relay_state_lbl.configure(text="ID นี้จะใช้งานได้เมื่อกด \"เริ่มเปิดรับการเชื่อมต่อ\"", fg=T.c("muted"))
+            self._render_relay()
+
+        def _render_relay(self):
+            rs = self.relay_state
+            mon, d = rs["mon"], rs["data"]
+            if mon == "unset":
+                txt, bg = "○  ยังไม่ได้ตั้งค่า Relay", "#6B7280"
+            elif mon == "error":
+                txt, bg = "●  Relay: เชื่อมต่อไม่ได้", "#DC2626"
+            elif mon == "ok":
+                txt, bg = "●  Relay ออนไลน์ · %.0f ms" % d.get("rtt", 0), "#15803D"
+                if rs["host"] == "online":
+                    txt += " · รับการเชื่อมต่ออยู่"
             else:
-                self.id_lbl.configure(text="ปิดอยู่", fg=T.c("muted"))
-                self.relay_state_lbl.configure(text="ตั้งค่าได้ที่แท็บ \"อินเทอร์เน็ต (Relay)\"", fg=T.c("muted"))
+                txt, bg = "●  Relay: กำลังเชื่อมต่อ…", "#B45309"
+            self.relay_pill.configure(text=txt, bg=bg)
+            if not hasattr(self, "rs"):
+                return
+            pills = {"ok": ("✓ ออนไลน์", "ok"), "error": ("✗ เชื่อมต่อไม่ได้", "danger"),
+                     "unset": ("ยังไม่ได้ตั้งค่า", "muted"), "checking": ("กำลังตรวจสอบ…", "warn")}
+            t, c = pills.get(mon, pills["checking"])
+            self.rs["state"].configure(text=t, fg=T.c(c), bg=T.c(c + "_bg") if c in ("ok", "danger", "warn") else T.c("subtle"))
+            addr = self._relay_conn()[0]
+            self.rs["addr"].configure(text=addr or "–")
+            if mon == "ok":
+                self.rs["ping"].configure(text="%.0f ms" % d.get("rtt", 0))
+                self.rs["ver"].configure(text=str(d.get("v", "–")))
+                self.rs["hosts"].configure(text="%s เครื่อง · %s เซสชัน" % (d.get("hosts", "–"), d.get("sessions", "–")))
+            elif mon == "error":
+                self.rs["ping"].configure(text="–")
+                self.rs["ver"].configure(text=str(d or "–"), fg=T.c("danger"))
+                self.rs["hosts"].configure(text="–")
+            host = rs["host"]
+            running = bool(self.server and self.server.is_alive())
+            self.rs["host"].configure(
+                text=("● ออนไลน์ — ID %s" % fmt_id(self.cfg["host_id"])) if host == "online" and running else
+                (rs["host_text"] if running and rs["host_text"] else "ปิดอยู่ (ยังไม่ได้กดเริ่มเปิดรับ)"),
+                fg=T.c("ok" if host == "online" and running else ("danger" if host == "error" and running else "muted")))
+            if rs["t"]:
+                self.rs["checked"].configure(text=datetime.fromtimestamp(rs["t"]).strftime("%H:%M:%S"))
 
         def _copy_conn(self):
-            txt = "NetRemote — IP: %s  พอร์ต: %s  รหัสผ่าน: %s" % (get_local_ip(), self.sport_var.get(),
-                                                                  self.spw_var.get())
-            if self._relay_cfg():
-                txt += "  |  ผ่านอินเทอร์เน็ต ID: %s" % fmt_id(self.cfg["host_id"])
+            txt = "NetRemote — ID: %s  รหัสผ่าน: %s" % (fmt_id(self.cfg["host_id"]), self.spw_var.get())
             self.root.clipboard_clear()
             self.root.clipboard_append(txt)
             self._log("คัดลอกข้อมูลการเชื่อมต่อแล้ว")
@@ -3155,28 +3537,28 @@ def run_gui():
                 self.server = None
                 self.srv_btn.configure(text="▶  เริ่มเปิดรับการเชื่อมต่อ")
                 self._banner("off")
+                self._update_id_row()
                 return
             self.start_server()
 
         def start_server(self):
             miss = missing_modules(server=True)
             if miss:
-                messagebox.showerror(APP, "ยังไม่ได้ติดตั้ง: %s\n\nเปิดโปรแกรมผ่านไฟล์ \"Remote Desktop.command\" "
+                messagebox.showerror(APP, "ยังไม่ได้ติดตั้ง: %s\n\nเปิดโปรแกรมผ่านไฟล์ \"Run on Mac.command\" "
                                           "เพื่อติดตั้งอัตโนมัติ หรือรัน:\npip install %s" % (", ".join(miss), " ".join(miss)))
                 return
             pw = self.spw_var.get().strip()
             if len(norm_pw(pw)) < 6:
                 messagebox.showerror(APP, "รหัสผ่านต้องยาวอย่างน้อย 6 ตัวอักษร")
                 return
-            try:
-                port = int(self.sport_var.get())
-            except ValueError:
-                messagebox.showerror(APP, "พอร์ตต้องเป็นตัวเลข")
+            if not self._relay_cfg():
+                messagebox.showerror(APP, "ยังไม่ได้ตั้งค่า Relay Server\n\nไปที่แท็บ \"การเชื่อมต่อ (Relay)\" "
+                                          "หรือใส่ RELAY_ADDR / RELAY_KEY ในไฟล์ .env")
                 return
-            self.cfg.update({"password": pw, "port": port})
+            self.cfg.update({"password": pw})
             save_config(self.cfg)
             try:
-                self.server = Server(port, pw, self.q, self._ask_threadsafe if self.ask_var.get() else None,
+                self.server = Server(0, pw, self.q, self._ask_threadsafe if self.ask_var.get() else None,
                                      self.allow_var.get(), self.files_var.get(), relay=self._relay_cfg())
             except Exception as e:
                 messagebox.showerror(APP, "เริ่มไม่ได้: %s" % e)
@@ -3206,8 +3588,7 @@ def run_gui():
             elif state == "wait":
                 bg, fg, border = "ok_bg", "ok", "ok_bg"
                 title = "●   พร้อมรับการเชื่อมต่อ"
-                sub = "รอที่พอร์ต %s ในวง LAN%s" % (self.sport_var.get(), (" และผ่านอินเทอร์เน็ตด้วย ID %s"
-                                                   % fmt_id(self.cfg["host_id"])) if self._relay_cfg() else "")
+                sub = "รอการเชื่อมต่อผ่าน Relay — ID %s" % fmt_id(self.cfg["host_id"])
             else:
                 self.session_who = who
                 bg, fg, border = "danger_bg", "danger", "danger_bg"
@@ -3239,14 +3620,17 @@ def run_gui():
                     m = self.q.get_nowait()
                     k = m[0]
                     if k == "connected":
-                        _, host, port, tls, info, fp = m
+                        _, rid, tls, info, fp = m
                         self.conn_btn.configure(state="normal")
                         self.cstatus.set("")
-                        rec = [host] + [h for h in self.cfg.get("recent", []) if h != host]
-                        self.cfg.update({"recent": rec[:15], "client_port": port})
+                        rec = [rid] + [h for h in (parse_id(x) for x in self.cfg.get("recent", [])) if h and h != rid]
+                        ri = [{"id": rid, "name": info.get("name", ""), "t": time.time()}] + \
+                             [r for r in self.cfg.get("recent_info", []) if r.get("id") != rid]
+                        self.cfg.update({"recent": rec[:15], "recent_info": ri[:30]})
                         save_config(self.cfg)
-                        self.host_cb.configure(values=rec[:15])
-                        self.viewers.append(Viewer(self, tls, info, host, fp))
+                        self.host_cb.configure(values=[fmt_id(x) for x in rec[:15]])
+                        self._refresh_recent()
+                        self.viewers.append(Viewer(self, tls, info, "ID " + fmt_id(rid), fp))
                     elif k == "connect_err":
                         self.conn_btn.configure(state="normal")
                         self.cstatus.set(m[1])
@@ -3257,15 +3641,11 @@ def run_gui():
                         if not v.closed:
                             v.destroy()
                             messagebox.showinfo(APP, "การเชื่อมต่อกับ %s สิ้นสุด\n%s" % (v.host, reason))
-                    elif k == "discovered":
-                        self.disc_btn.configure(state="normal", text="ค้นหา")
-                        res = m[1]
-                        if isinstance(res, Exception):
-                            messagebox.showerror(APP, "ค้นหาไม่สำเร็จ: %s" % res)
-                        elif not res:
-                            self.disc.insert("", "end", values=("-", "ไม่พบเครื่องที่เปิดรับในวง LAN นี้"))
-                        for ip, name, own in (res if isinstance(res, list) else []):
-                            self.disc.insert("", "end", values=(ip, (name or "-") + ("  (เครื่องนี้)" if own else "")))
+                    elif k == "relay_status":
+                        self.relay_state["mon"], self.relay_state["data"] = m[1], m[2]
+                        if m[1] in ("ok", "error", "unset"):
+                            self.relay_state["t"] = time.time()
+                        self._render_relay()
                     elif k == "ask_fp":
                         _, host, old, fp, name, ev, box = m
                         box["ok"] = messagebox.askyesno(
@@ -3307,6 +3687,7 @@ def run_gui():
                         self.server = None
                         self.srv_btn.configure(text="▶  เริ่มเปิดรับการเชื่อมต่อ")
                         self._banner("off")
+                        self._update_id_row()
             except queue.Empty:
                 pass
             self.root.after(50, self._poll)
@@ -3319,7 +3700,7 @@ def run_gui():
             self.root.after(200, self.root.destroy)
 
     root = tk.Tk()
-    T = Theme(root, load_config().get("theme", "auto"))
+    T = Theme(root, env_str("THEME", load_config().get("theme", "auto")))
     set_app_icon(root)
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.quit)
@@ -3340,25 +3721,27 @@ def run_headless_server(args):
     except Exception:
         pass
     cfg = load_config()
-    pw = args.password or cfg.get("password") or gen_password()
-    port = args.port or cfg.get("port", DEFAULT_PORT)
-    cfg.update({"password": pw, "port": port})
+    pw = args.password or env_str("HOST_PASSWORD") or cfg.get("password") or gen_password()
+    cfg.update({"password": pw})
+    addr = args.relay or env_str("RELAY_ADDR") or cfg.get("relay_addr", "")
+    key = args.relay_key if args.relay_key is not None else (ENV.get("RELAY_KEY", "") if env_str("RELAY_ADDR")
+                                                            else cfg.get("relay_key", ""))
+    if not addr:
+        print("ต้องระบุ Relay Server: --relay HOST:PORT หรือใส่ RELAY_ADDR ในไฟล์ .env")
+        return 1
+    if not cfg.get("host_id") or not cfg.get("host_secret"):
+        cfg.update({"host_id": new_host_id(), "host_secret": secrets.token_hex(24)})
     save_config(cfg)
     q = queue.Queue()
-    relay = None
-    if args.relay:
-        if not cfg.get("host_id") or not cfg.get("host_secret"):
-            cfg.update({"host_id": new_host_id(), "host_secret": secrets.token_hex(24)})
-            save_config(cfg)
-        relay = {"addr": args.relay, "key": args.relay_key or "", "id": cfg["host_id"], "secret": cfg["host_secret"]}
-    srv = Server(port, pw, q, None, not args.view_only, not args.no_files, relay=relay)
-    print("%s %s — เปิดรับการเชื่อมต่อ" % (APP, VERSION))
-    print("  IP       : %s" % "  ".join(get_local_ips()))
-    print("  พอร์ต    : %d" % port)
+    relay = {"addr": addr, "key": key, "id": cfg["host_id"], "secret": cfg["host_secret"]}
+    srv = Server(0, pw, q, None, not args.view_only, not args.no_files, relay=relay)
+    print("%s %s — เปิดรับการเชื่อมต่อผ่าน Relay" % (APP, VERSION))
+    print("  ID       : %s" % fmt_id(relay["id"]))
     print("  รหัสผ่าน : %s" % pw)
+    print("  Relay    : %s" % addr)
     print("  Cert     : %s" % srv.fp[:47])
-    if relay:
-        print("  ID       : %s  (ผ่าน Relay %s)" % (fmt_id(relay["id"]), args.relay))
+    if ENV_PATH:
+        print("  .env     : %s" % ENV_PATH)
     print("กด Ctrl+C เพื่อหยุด\n")
     srv.start()
     try:
@@ -3387,13 +3770,12 @@ def main():
             resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
     except Exception:
         pass
-    p = argparse.ArgumentParser(description="NetRemote — Remote Desktop สำหรับวง LAN")
+    p = argparse.ArgumentParser(description="NetRemote — Remote Desktop ผ่าน Relay")
     p.add_argument("--server", action="store_true", help="เปิดรับการเชื่อมต่อแบบไม่มีหน้าต่าง")
     p.add_argument("--password", help="รหัสผ่าน (โหมด --server)")
-    p.add_argument("--port", type=int, help="พอร์ต (ค่าเริ่มต้น %d)" % DEFAULT_PORT)
     p.add_argument("--view-only", action="store_true", help="ให้ดูหน้าจออย่างเดียว (โหมด --server)")
     p.add_argument("--no-files", action="store_true", help="ไม่อนุญาตรับ-ส่งไฟล์ (โหมด --server)")
-    p.add_argument("--relay", help="Relay Server สำหรับเชื่อมต่อผ่านอินเทอร์เน็ต เช่น relay.example.com:5910")
+    p.add_argument("--relay", help="Relay Server เช่น relay.example.com:5910 (หรือ RELAY_ADDR ใน .env)")
     p.add_argument("--relay-key", help="Relay Key")
     args = p.parse_args()
     if args.server:

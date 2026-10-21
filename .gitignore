@@ -1,4 +1,5 @@
 .venv/
+.work/
 __pycache__/
 *.pyc
 .DS_Store
@@ -6,3 +7,6 @@ build/
 dist/
 *.spec
 *.dmg
+# ไฟล์ตั้งค่าที่มีรหัสลับ (ใช้ .env.example เป็นตัวอย่าง)
+.env
+!.env.example

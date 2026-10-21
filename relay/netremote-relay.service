@@ -1,0 +1,23 @@
+[Unit]
+Description=NetRemote Relay Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# แก้ YOUR-RELAY-KEY เป็นรหัสของคุณ (ต้องตรงกับที่ใส่ในโปรแกรม NetRemote)
+Environment=RELAY_KEY=YOUR-RELAY-KEY
+Environment=RELAY_PORT=5910
+Environment=RELAY_STORE=/var/lib/netremote-relay/relay_ids.json
+ExecStart=/usr/bin/python3 /opt/netremote-relay/relay_server.py
+Restart=always
+RestartSec=3
+DynamicUser=yes
+StateDirectory=netremote-relay
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,61 @@
+# Build NetRemote เป็น .exe (Windows) และ .dmg (macOS) อัตโนมัติบน GitHub
+# ทำงานเองทุกครั้งที่ push ขึ้น main หรือกด Actions > Build NetRemote > Run workflow
+name: Build NetRemote
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip pyinstaller mss Pillow pynput cryptography
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ICON=ico; ONE=--onefile; PLAT=_win32
+          else
+            ICON=icns; ONE=; PLAT=_darwin
+          fi
+          pyinstaller --noconfirm --windowed $ONE --name NetRemote \
+            --icon "icons/netremote.$ICON" \
+            --osx-bundle-identifier com.networktools.netremote \
+            --hidden-import pynput.keyboard.$PLAT --hidden-import pynput.mouse.$PLAT \
+            remote_desktop.py
+
+      - name: Package DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p pkg
+          ditto dist/NetRemote.app pkg/NetRemote.app
+          ln -s /Applications pkg/Applications
+          hdiutil create -volname "NetRemote" -srcfolder pkg -ov -format UDZO "NetRemote-macOS-$(uname -m).dmg"
+
+      - name: Upload (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetRemote-Windows
+          path: dist/NetRemote.exe
+
+      - name: Upload (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetRemote-macOS
+          path: NetRemote-macOS-*.dmg

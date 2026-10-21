@@ -21,6 +21,7 @@ NetRemote — โปรแกรม Remote Desktop (ค้นหาเครื�
 import argparse
 import base64
 import errno
+import glob
 import hashlib
 import hmac
 import io
@@ -51,7 +52,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 APP = "NetRemote"
-VERSION = "1.5"
+VERSION = "1.5.1"
 PROTO = 1
 DEFAULT_PORT = 5905
 SYSTEM = platform.system()
@@ -148,6 +149,7 @@ def _detect_lang():
 LANG = _detect_lang()
 RESTART = []
 _EN = {
+    'ไม่มีสิทธิ์เขียนไฟล์ในโฟลเดอร์ของโปรแกรม — ย้ายโปรแกรมไปไว้ที่โฟลเดอร์อื่น (เช่น Desktop) แล้วลองใหม่': "No permission to write in the app's folder — move the app to another folder (e.g. Desktop) and try again",
 "ดีมาก": "Excellent",
 "ดี": "Good",
 "พอใช้": "Fair",
@@ -2884,6 +2886,35 @@ def update_platform():
 UPDATE_DIR = os.path.join(CONF_DIR, "updates")
 
 
+def relaunch_self(cmd):
+    """เปิดโปรแกรมตัวเองใหม่ — ล้างตัวแปรของ PyInstaller onefile ไม่ให้ตัวใหม่ไปใช้โฟลเดอร์ชั่วคราวของตัวเก่า"""
+    env = {k: v for k, v in os.environ.items() if not (k.startswith("_MEI") or k.startswith("_PYI"))}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    kw = {}
+    if SYSTEM == "Windows":
+        kw["creationflags"] = 0x00000200 | 0x00000008          # NEW_PROCESS_GROUP | DETACHED_PROCESS
+    else:
+        kw["start_new_session"] = True
+    try:
+        subprocess.Popen(cmd, close_fds=True, env=env, **kw)
+    except Exception:
+        pass
+
+
+def cleanup_old_exe():
+    """ลบไฟล์ .exe ตัวเก่าที่เหลือจากการอัปเดตครั้งก่อน"""
+    if SYSTEM != "Windows" or not getattr(sys, "frozen", False):
+        return
+    exe = os.path.abspath(sys.executable)
+    for f in glob.glob(glob.escape(exe) + ".old*"):
+        for _ in range(10):
+            try:
+                os.remove(f)
+                break
+            except OSError:
+                time.sleep(0.5)
+
+
 def install_target():
     """โปรแกรมที่จะถูกแทนที่ตอนอัปเดตอัตโนมัติ — (ชนิด, path) หรือ (None, None) ถ้าติดตั้งเองไม่ได้"""
     if getattr(sys, "frozen", False):
@@ -2931,24 +2962,32 @@ def launch_installer(pkg, relaunch=True):
             RESTART.append(True)
         return True
     if kind == "win-exe":
-        bat = os.path.join(UPDATE_DIR, "install_%d.bat" % pid)
-        with open(bat, "w", encoding="utf-8") as f:
-            f.write("@echo off\r\nchcp 65001 >nul\r\n"
-                    ":wait\r\n"
-                    'tasklist /FI "PID eq %d" /NH 2>nul | find " %d " >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n'
-                    "set n=0\r\n"
-                    ":copy\r\n"
-                    'copy /Y "%s" "%s" >nul && goto done\r\n'
-                    "set /a n+=1\r\n"
-                    "if %%n%% lss 15 (timeout /t 1 /nobreak >nul & goto copy)\r\n"
-                    "goto end\r\n"
-                    ":done\r\n"
-                    'del "%s" >nul 2>&1\r\n'
-                    "%s"
-                    ":end\r\n"
-                    'del "%%~f0"\r\n' % (pid, pid, pkg, target, pkg,
-                                         ('start "" "%s"\r\n' % target) if relaunch else ""))
-        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000 | 0x00000008, close_fds=True)
+        # Windows ยอมให้ "เปลี่ยนชื่อ" ไฟล์ .exe ที่กำลังทำงานอยู่ได้ → ย้ายตัวเก่าออก วางตัวใหม่แทน
+        # แล้วเปิดใหม่ตอนปิดโปรแกรม (ไม่ต้องใช้สคริปต์ .bat / หน้าต่าง Command)
+        old = target + ".old"
+        try:
+            if os.path.exists(old):
+                os.remove(old)
+        except OSError:
+            old = target + ".old%d" % pid
+        try:
+            os.replace(target, old)
+        except OSError as e:
+            raise OSError(tr("ไม่มีสิทธิ์เขียนไฟล์ในโฟลเดอร์ของโปรแกรม — ย้ายโปรแกรมไปไว้ที่โฟลเดอร์อื่น (เช่น Desktop) แล้วลองใหม่")) from e
+        try:
+            shutil.copyfile(pkg, target)
+        except BaseException:
+            try:
+                os.replace(old, target)
+            except OSError:
+                pass
+            raise
+        try:
+            os.remove(pkg)
+        except OSError:
+            pass
+        if relaunch:
+            RESTART.append(True)
         return True
     if kind == "mac-app":
         sh = os.path.join(UPDATE_DIR, "install_%d.sh" % pid)
@@ -4222,7 +4261,7 @@ def run_gui():
             att.pack(fill="x", padx=8, pady=(6, 0))
             for txt, kind in (("📎 " + tr("ไฟล์"), "file"), ("🖼 " + tr("รูป"), "image"), ("🎬 " + tr("วีดีโอ"), "video")):
                 ttk.Button(att, text=txt, style="Tool.TButton", command=lambda k=kind: self._attach(k)).pack(
-                    side="left", padx=(0, 4))
+                    side="left", padx=(0, 4), fill="x", expand=True)
             row = box(body)
             row.pack(fill="x", padx=8, pady=8)
             self.entry_var = tk.StringVar()
@@ -6156,10 +6195,7 @@ def run_gui():
             cmd = [sys.executable] + sys.argv[1:]
         else:
             cmd = [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:]
-        try:
-            subprocess.Popen(cmd, close_fds=True)
-        except Exception:
-            pass
+        relaunch_self(cmd)
 
 
 # ============================================================================
@@ -6218,6 +6254,7 @@ def run_headless_server(args):
 
 
 def main():
+    threading.Thread(target=cleanup_old_exe, daemon=True).start()
     try:
         import resource
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)

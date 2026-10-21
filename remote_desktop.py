@@ -149,6 +149,29 @@ def _detect_lang():
 LANG = _detect_lang()
 RESTART = []
 _EN = {
+    '%s กำลังควบคุมเครื่องนี้': '%s is controlling this computer',
+    'กำลังควบคุมเครื่องนี้': 'Controlling this computer',
+    'กำลังส่ง…': 'Sending…',
+    'กำลังส่ง… %d%%': 'Sending… %d%%',
+    'กำลังโทร…': 'Calling…',
+    'ตัดสาย': 'End',
+    'ปฏิเสธ': 'Decline',
+    'ปล่อยปุ่ม': 'Keys',
+    'ปิดไมค์': 'Muted',
+    'พิมพ์': 'Type',
+    'พิมพ์ข้อความ…': 'Type a message…',
+    'รับด้วยเสียงอย่างเดียว': 'Answer with audio only',
+    'วันนี้': 'Today',
+    'วีดีโอคอล': 'Video call',
+    'ส่งแล้ว': 'Sent',
+    'อ่านแล้ว': 'Read',
+    'เครื่องปลายทางใช้โปรแกรมเวอร์ชันเก่าที่ยังไม่มีแชท': 'The remote computer runs an older version without chat',
+    'เต็มจอ': 'Full',
+    'เปิดกล้องไม่ได้ — ไม่พบกล้อง หรือกล้องถูกโปรแกรมอื่นใช้อยู่': "Can't open the camera — no camera found, or it's being used by another app",
+    'เมื่อสักครู่': 'just now',
+    'โทรเสียง': 'Voice call',
+    'ได้รับแล้ว': 'Received',
+    'ไม่ตอบสนอง': 'Not responding',
     'ไม่มีสิทธิ์เขียนไฟล์ในโฟลเดอร์ของโปรแกรม — ย้ายโปรแกรมไปไว้ที่โฟลเดอร์อื่น (เช่น Desktop) แล้วลองใหม่': "No permission to write in the app's folder — move the app to another folder (e.g. Desktop) and try again",
 "ดีมาก": "Excellent",
 "ดี": "Good",
@@ -2121,7 +2144,8 @@ def _relay_socket(addr, timeout=10):
 T_CHAT = 70
 T_CF_BEGIN, T_CF_DATA, T_CF_END, T_CF_CANCEL = 71, 72, 73, 74
 T_CALL, T_AUDIO, T_VIDEO = 80, 81, 82
-CHAT_TYPES = {T_CHAT, T_CF_BEGIN, T_CF_DATA, T_CF_END, T_CF_CANCEL}
+T_CHAT_META = 75                     # กำลังพิมพ์ / อ่านแล้ว (เวอร์ชันเก่าไม่รู้จัก → ไม่สนใจ)
+CHAT_TYPES = {T_CHAT, T_CF_BEGIN, T_CF_DATA, T_CF_END, T_CF_CANCEL, T_CHAT_META}
 CALL_TYPES = {T_CALL, T_AUDIO, T_VIDEO}
 CHAT_MAX_FILE = 2 * 1024 ** 3
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".heic", ".tif", ".tiff")
@@ -2163,6 +2187,34 @@ def media_available():
     return _MEDIA
 
 
+def open_camera():
+    """เปิดกล้องตัวแรก — Windows ลอง DirectShow ก่อน (ค่าเริ่มต้นของ OpenCV มักเปิดกล้อง USB ไม่ได้) แล้วค่อย MSMF"""
+    import cv2
+    if SYSTEM == "Windows":
+        apis = [getattr(cv2, "CAP_DSHOW", 700), getattr(cv2, "CAP_MSMF", 1400), None]
+    elif SYSTEM == "Darwin":
+        apis = [getattr(cv2, "CAP_AVFOUNDATION", 1200), None]
+    else:
+        apis = [None]
+    for api in apis:
+        for idx in (0, 1):
+            try:
+                cap = cv2.VideoCapture(idx) if api is None else cv2.VideoCapture(idx, api)
+            except Exception:
+                continue
+            if cap.isOpened():
+                ok, _f = cap.read()
+                if ok:
+                    try:
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    except Exception:
+                        pass
+                    return cap
+            cap.release()
+    return None
+
+
 class ChatEngine:
     """ส่ง/รับข้อความและไฟล์ในแชท — ไม่มี UI; ส่งเหตุการณ์ออกทาง deliver(dict) (เรียกจาก thread อื่น)"""
 
@@ -2172,6 +2224,7 @@ class ChatEngine:
         self.cancelled = set()
         self.lock = threading.Lock()
         self.closed = False
+        self.last_typing = 0
 
     def _id(self):
         return secrets.token_hex(6)
@@ -2184,6 +2237,17 @@ class ChatEngine:
         self.chan.send(T_CHAT, jdump(m))
         self.deliver(dict(m, ev="msg", mine=True))
         return m["id"]
+
+    def send_typing(self):
+        now = time.time()
+        if now - self.last_typing > 2.5 and self.chan.alive:
+            self.last_typing = now
+            self.chan.send(T_CHAT_META, jdump({"op": "typing"}))
+
+    def send_read(self, ids):
+        ids = [str(i) for i in ids if i][:200]
+        if ids and self.chan.alive:
+            self.chan.send(T_CHAT_META, jdump({"op": "read", "ids": ids}))
 
     def send_file(self, path):
         try:
@@ -2236,7 +2300,13 @@ class ChatEngine:
                           "text": err_text(e) if not isinstance(e, InterruptedError) else tr("ยกเลิกแล้ว")})
 
     def handle(self, t, p):
-        if t == T_CHAT:
+        if t == T_CHAT_META:
+            m = jload(p)
+            if m.get("op") == "typing":
+                self.deliver({"ev": "typing"})
+            elif m.get("op") == "read":
+                self.deliver({"ev": "read", "ids": [str(i) for i in (m.get("ids") or [])]})
+        elif t == T_CHAT:
             m = jload(p)
             self.deliver(dict(m, ev="msg", mine=False))
         elif t == T_CF_BEGIN:
@@ -2317,6 +2387,7 @@ class CallEngine:
         self.state = "idle"                  # idle / calling / ringing / active
         self.video = False                   # เปิดกล้องฝั่งเรา
         self.muted = False
+        self.speaker_off = False
         self.started = 0
         self.lock = threading.Lock()
         self.play = bytearray()
@@ -2453,7 +2524,7 @@ class CallEngine:
                 if not self.play_ready and len(self.play) >= AUDIO_RATE * 2 * 0.06:
                     self.play_ready = True             # รอเก็บเสียงไว้ 60 ms ก่อนเริ่มเล่น ลดเสียงสะดุด
                 if self.play_ready and len(self.play) >= need:
-                    outdata[:] = bytes(self.play[:need])
+                    outdata[:] = bytes(self.play[:need]) if not self.speaker_off else b"\0" * need
                     del self.play[:need]
                     return
                 got = bytes(self.play) if self.play_ready else b""
@@ -2475,11 +2546,11 @@ class CallEngine:
     def _camera_loop(self, stop):
         try:
             import cv2
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                raise OSError(tr("เปิดกล้องไม่ได้"))
-        except Exception as e:
-            self.deliver({"ev": "call_error", "text": tr("เปิดกล้องไม่ได้: %s") % err_text(e)})
+            cap = open_camera()
+        except Exception:
+            cap = None
+        if cap is None:
+            self.deliver({"ev": "call_error", "text": tr("เปิดกล้องไม่ได้ — ไม่พบกล้อง หรือกล้องถูกโปรแกรมอื่นใช้อยู่")})
             self.video = False
             self._sig("video", on=False)
             return
@@ -3596,54 +3667,16 @@ def run_gui():
             win.protocol("WM_DELETE_WINDOW", self.disconnect)
 
             T.track(win, bg="bg")
-            bar = T.track(tk.Frame(win, bd=0), bg="card")
-            bar.pack(fill="x")
-            inner = box(bar)
-            inner.pack(fill="x", padx=12, pady=8)
             mons = info.get("monitors") or [{"w": 0, "h": 0}]
-            self.mon_var = tk.StringVar()
-            mvals = [tr("จอ %d (%d×%d)") % (i + 1, m["w"], m["h"]) for i, m in enumerate(mons)]
-            lbl(inner, "●", fg="ok", font="h2").pack(side="left")
-            lbl(inner, info.get("name", host)[:18], font="bold").pack(side="left", padx=(6, 12))
-            if len(mons) > 1:
-                cb = ttk.Combobox(inner, values=mvals, textvariable=self.mon_var, state="readonly", width=15)
-                cb.current(0)
-                cb.pack(side="left", padx=(0, 8))
-                cb.bind("<<ComboboxSelected>>", lambda e: self.request(full=True))
-            else:
-                self.mon_var.set(mvals[0])
-            self.mvals = mvals
+            self.mvals = [tr("จอ %d (%d×%d)") % (i + 1, m["w"], m["h"]) for i, m in enumerate(mons)]
+            self.mon_var = tk.StringVar(value=self.mvals[0])
             self.q_var = tk.StringVar(value=app.cfg.get("quality", tr("ปกติ")))
-            qb = ttk.Combobox(inner, values=[q[0] for q in QUALITY], textvariable=self.q_var,
-                              state="readonly", width=8)
-            qb.pack(side="left", padx=(0, 12))
-            qb.bind("<<ComboboxSelected>>", lambda e: self._quality_changed())
             self.ctrl_var = tk.BooleanVar(value=self.can_control and not app.view_only_var.get())
-            cbx = ttk.Checkbutton(inner, text=tr("ควบคุม"), variable=self.ctrl_var, style="Card.TCheckbutton",
-                                  command=self._release_all)
-            cbx.pack(side="left")
-            if not self.can_control:
-                cbx.configure(state="disabled")
             remote_mac = info.get("os") == "Darwin"
             self.swap_var = tk.BooleanVar(value=(SYSTEM == "Darwin") != remote_mac)
-            ttk.Checkbutton(inner, text=tr("สลับ ⌘↔Ctrl"), variable=self.swap_var,
-                            style="Card.TCheckbutton").pack(side="left", padx=(10, 0))
-            ttk.Button(inner, text=tr("ตัดการเชื่อมต่อ"), style="Tool.Danger.TButton",
-                       command=self.disconnect).pack(side="right")
-            ttk.Button(inner, text=tr("⛶ เต็มจอ"), style="Tool.TButton", command=self.toggle_full).pack(side="right", padx=(0, 5))
-            ttk.Button(inner, text=tr("⟲ ปล่อยปุ่ม"), style="Tool.TButton",
-                       command=self._release_all).pack(side="right", padx=(0, 5))
-            ttk.Button(inner, text=tr("✎ ข้อความ"), style="Tool.TButton", command=self.send_text).pack(side="right", padx=(0, 5))
-            ttk.Button(inner, text=tr("📁 ไฟล์"), style="Tool.Accent.TButton",
-                       command=self.open_files).pack(side="right", padx=(0, 5))
-            self.chat_btn = ttk.Button(inner, text="💬 " + tr("แชท"), style="Tool.Accent.TButton",
-                                       command=self.toggle_chat)
-            self.chat_btn.pack(side="right", padx=(0, 5))
-            self.lat_lbl = lbl(inner, "Latency —", fg="muted", bg="subtle", font="smallbold", padx=10, pady=4)
-            self.lat_lbl.pack(side="right", padx=(0, 12))
             self.rtt = self.rtt_avg = self.rtt_min = self.rtt_max = None
             self.last_pong = time.time()
-            T.track(tk.Frame(win, height=1, bd=0), bg="border").pack(fill="x")
+            self.peer_name = info.get("name", host)
 
             self.body = box(win, bg="viewer")
             self.body.pack(fill="both", expand=True)
@@ -3654,10 +3687,6 @@ def run_gui():
             self.wait_item = self.canvas.create_text(300, 200, text=tr("กำลังรับภาพหน้าจอ…"), fill="#9AA3B2",
                                                      font=T.f["h2"])
 
-            st = box(win, bg="bg")
-            st.pack(fill="x")
-            self.status = tk.StringVar(value=tr("เชื่อมต่อแล้ว"))
-            lbl(st, textvariable=self.status, fg="muted", bg="bg", font="small").pack(side="left", padx=12, pady=5)
 
             c = self.canvas
             c.bind("<Configure>", lambda e: self._mark_dirty())
@@ -3682,13 +3711,14 @@ def run_gui():
             self.cq = queue.Queue()
             self.chat = ChatEngine(self.chan, self.cq.put, info.get("name", host))
             self.call = CallEngine(self.chan, self.cq.put)
-            pw = max(260, int(win.winfo_screenwidth() / 8))
-            self.panel = ChatPanel(self.body, self.chat, self.call, info.get("name", host), on_hide=self.toggle_chat,
-                                   width=pw)
+            pw = max(344, int(win.winfo_screenwidth() / 8))
+            self.panel = ChatPanel(self.body, self.chat, self.call, self.peer_name, mode="controller", width=pw,
+                                   on_hide=lambda: self.toggle_chat(False), viewer=self,
+                                   chat_ok=bool(info.get("chat")), subtitle=tr("เชื่อมต่อแล้ว"))
             self.panel.on_unread = self._on_unread
             self.panel_shown = False
-            if app.cfg.get("chat_open"):
-                self.toggle_chat()
+            self._build_dock()
+            self.toggle_chat(bool(app.cfg.get("panel_open", True)))
             self.chan.start()
             self.win.after(40, self._chat_poll)
             self.request(full=True)
@@ -3814,12 +3844,13 @@ def run_gui():
                                           "rtt": None if self.rtt_avg is None else round(self.rtt_avg, 1)}))
             stale = time.time() - self.last_pong > 3
             if self.rtt_avg is not None and stale:
-                self.lat_lbl.configure(text=tr("●  ไม่ตอบสนอง"), fg=T.c("danger"), bg=T.c("danger_bg"))
+                self.panel.set_latency(tr("ไม่ตอบสนอง"), "danger")
+                self.dock_lat.configure(text="—", fg=T.c("danger"))
             elif self.rtt_avg is not None:
                 word, _c = latency_style(self.rtt_avg)
                 lv = "ok" if self.rtt_avg < 80 else ("warn" if self.rtt_avg < 150 else "danger")
-                self.lat_lbl.configure(text="●  %.0f ms · %s" % (self.rtt_avg, word),
-                                       fg=T.c(lv), bg=T.c(lv + "_bg"))
+                self.panel.set_latency("%.0f ms · %s" % (self.rtt_avg, word), lv)
+                self.dock_lat.configure(text="%.0f ms" % self.rtt_avg, fg=T.c(lv))
             self.win.after(1000, self._ping_loop)
 
         def _stats_loop(self):
@@ -3830,8 +3861,6 @@ def run_gui():
             fps = self.stats["frames"] / dt if dt else 0
             kbs = (self.chan.bytes_in - self.stats["b0"]) / 1024 / dt if dt else 0
             self.stats.update({"frames": 0, "t0": now, "b0": self.chan.bytes_in})
-            mode = tr("ควบคุมได้") if self.ctrl_var.get() else tr("ดูอย่างเดียว")
-            self.status.set(tr("เชื่อมต่อกับ %s (%s)  ·  %s") % (self.info.get("name", ""), self.host, mode))
             self.win.after(1000, self._stats_loop)
 
         # ----- input -----
@@ -3948,31 +3977,102 @@ def run_gui():
             self.win.attributes("-fullscreen", full)
 
         # ----- แชท / โทร -----
+        def _build_dock(self):
+            """แถบเมนูลอยด้านขวา ตอนพับแผงเก็บ"""
+            d = self.dock = T.track(tk.Canvas(self.body, width=60, height=10, highlightthickness=0, bd=0), bg="viewer")
+            inner = self.dock_inner = box(d)
+            items = []
+            av = avatar(inner, self.peer_name, 38)
+            items.append((av, 4))
+            self.dock_lat = lbl(inner, "—", fg="muted", font="smallbold")
+            items.append((self.dock_lat, 2))
+            self.dock_chat = RoundButton(inner, "chat", kind="primary", w=44, h=44, r=12, icon_px=20,
+                                         command=lambda: self.toggle_chat(True))
+            items.append((self.dock_chat.cv, 6))
+            for ic, kind, cmd in (("phone", "soft", lambda: (self.toggle_chat(True), self.panel._call(False))),
+                                  ("folder", "soft", self.open_files),
+                                  ("fullscreen", "soft", self.toggle_full),
+                                  ("power", "danger_soft", self.disconnect),
+                                  ("chevron-left", "ghost", lambda: self.toggle_chat(True))):
+                items.append((RoundButton(inner, ic, kind=kind, w=44, h=40 if kind == "ghost" else 44, r=12,
+                                          command=cmd).cv, 3))
+            for w, py in items:
+                w.pack(pady=(py, 0))
+            self.dock_win = d.create_window(30, 10, window=inner, anchor="n")
+            inner.update_idletasks()
+            h = inner.winfo_reqheight() + 20
+            d.configure(height=h)
+            d.bind("<Configure>", lambda e: self._dock_bg())
+            T.on_change(self._dock_bg)
+            self.toast = None
+
+        def _dock_bg(self):
+            try:
+                d = self.dock
+                h = int(d.cget("height"))
+                d.delete("bg")
+                d.create_image(0, 0, anchor="nw", image=shape_img(60, h, 18, T.c("card"), T.c("border"), 1), tags="bg")
+                d.tag_lower("bg")
+                d.configure(bg=T.c("viewer"))
+            except tk.TclError:
+                pass
+
         def toggle_chat(self, show=None):
             show = (not self.panel_shown) if show is None else show
-            if show and not self.info.get("chat"):
-                messagebox.showinfo(APP, tr("เครื่องปลายทาง (%s) ใช้โปรแกรมเวอร์ชันเก่าที่ยังไม่มีแชท\n\n"
-                                            "ให้อัปเดตโปรแกรมบนเครื่องปลายทาง แล้วเชื่อมต่อใหม่") % self.info.get("name", ""),
-                                    parent=self.win)
-                return
-            if show == self.panel_shown:
+            if show == self.panel_shown and (show or self.dock.winfo_ismapped()):
                 return
             self.panel_shown = show
             if show:
+                self.dock.place_forget()
+                self._hide_toast()
                 self.panel.frame.pack(side="right", fill="y", before=self.canvas)
                 self.panel.seen()
-                self.panel.entry.focus_set()
+                if self.info.get("chat"):
+                    self.panel.entry.focus_set()
             else:
                 self.panel.frame.pack_forget()
+                self.dock.place(relx=1.0, x=-14, rely=0.5, anchor="e")
+                self.dock.tk.call("raise", self.dock._w)
                 self.canvas.focus_set()
-            self.app.cfg["chat_open"] = show
+            self.app.cfg["panel_open"] = show
             self.dirty = True
 
-        def _on_unread(self, n):
-            if n == -1:                                   # สายเรียกเข้า → เปิดแผงแชทให้เห็นปุ่มรับสาย
+        def _on_unread(self, n, ev=None):
+            if n == -1:                                   # สายเรียกเข้า → เปิดแผงให้เห็นปุ่มรับสาย
                 self.toggle_chat(True)
                 return
-            self.chat_btn.configure(text="💬 " + tr("แชท") + (" (%d)" % n if n else ""))
+            self.dock_chat.configure(badge=n)
+            if n and ev is not None and not self.panel_shown:
+                self._show_toast(ev)
+
+        def _show_toast(self, ev):
+            self._hide_toast()
+            t = self.toast = T.track(tk.Frame(self.body, bd=0, highlightthickness=1), bg="card")
+            t.configure(highlightbackground=T.c("border"))
+            row = box(t)
+            row.pack(padx=14, pady=12)
+            avatar(row, self.peer_name, 34, dot=False).pack(side="left", anchor="n")
+            col = box(row)
+            col.pack(side="left", padx=(10, 0))
+            lbl(col, "%s  ·  %s" % (self.peer_name, tr("เมื่อสักครู่")), font="smallbold").pack(anchor="w")
+            text = ev.get("text") if ev.get("ev") == "msg" else "📎 " + ev.get("name", "")
+            text = (text or "").replace("\n", " ")
+            lbl(col, text[:90] + ("…" if len(text) > 90 else ""), fg="text", font="small", wraplength=230,
+                justify="left").pack(anchor="w")
+            for w in (t, row, col) + tuple(col.winfo_children()):
+                w.bind("<Button-1>", lambda e: self.toggle_chat(True))
+            t.place(relx=1.0, x=-86, rely=0.5, anchor="e")
+            t.lift()
+            self.toast_job = self.win.after(5000, self._hide_toast)
+
+        def _hide_toast(self):
+            if self.toast is not None:
+                try:
+                    self.win.after_cancel(self.toast_job)
+                    self.toast.destroy()
+                except (tk.TclError, AttributeError, ValueError):
+                    pass
+                self.toast = None
 
         def _chat_poll(self):
             if self.closed:
@@ -4175,7 +4275,349 @@ def run_gui():
         return LocalPicker(parent, title, "folder", initial).result or ""
 
     # ------------------------------------------------------------------
-    # แผงแชท + โทร (ใช้ทั้งในหน้าต่างรีโมท และหน้าต่างแชทของเครื่องปลายทาง)
+    # ชุดเครื่องมือ UI แบบโมเดิร์น: ไอคอนเส้น, ปุ่มกลม/แคปซูล, สวิตช์, กรอบมุมมน (วาดด้วย PIL ให้คมทุกจอ)
+    # ------------------------------------------------------------------
+    from PIL import ImageDraw as _IDraw
+    _ICONS = {}
+    _SHAPES = {}
+    SS = 4                                            # วาดใหญ่ 4 เท่าแล้วย่อ → ขอบเนียน
+
+    def _hex(c):
+        c = c.lstrip("#")
+        return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+    def _draw_icon(name, px, color):
+        S = 64
+        im = Image.new("RGBA", (S * SS, S * SS), (0, 0, 0, 0))
+        d = _IDraw.Draw(im)
+        col = _hex(color) + (255,)
+        w = int(5.2 * SS)
+        k = SS
+
+        def L(*pts):
+            d.line([(x * k, y * k) for x, y in pts], fill=col, width=w, joint="curve")
+            for x, y in (pts[0], pts[-1]):
+                d.ellipse((x * k - w / 2, y * k - w / 2, x * k + w / 2, y * k + w / 2), fill=col)
+
+        def R(x0, y0, x1, y1, r, fill=False):
+            if fill:
+                d.rounded_rectangle((x0 * k, y0 * k, x1 * k, y1 * k), r * k, fill=col)
+            else:
+                d.rounded_rectangle((x0 * k, y0 * k, x1 * k, y1 * k), r * k, outline=col, width=w)
+
+        def A(x0, y0, x1, y1, a0, a1):
+            d.arc((x0 * k, y0 * k, x1 * k, y1 * k), a0, a1, fill=col, width=w)
+
+        def P(pts, fill=True):
+            if fill:
+                d.polygon([(x * k, y * k) for x, y in pts], fill=col)
+            else:
+                d.line([(x * k, y * k) for x, y in pts + [pts[0]]], fill=col, width=w, joint="curve")
+
+        def C(cx, cy, r, fill=True):
+            if fill:
+                d.ellipse(((cx - r) * k, (cy - r) * k, (cx + r) * k, (cy + r) * k), fill=col)
+            else:
+                d.ellipse(((cx - r) * k, (cy - r) * k, (cx + r) * k, (cy + r) * k), outline=col, width=w)
+
+        if name == "chat":
+            R(8, 10, 56, 46, 14)
+            P([(18, 44), (16, 56), (30, 45)])
+        elif name in ("phone", "hangup"):
+            ph = Image.new("RGBA", im.size, (0, 0, 0, 0))
+            dp = _IDraw.Draw(ph)
+            # หูโทรศัพท์: โค้งหนาด้านบน + ปลายสองข้างชี้ลง (= วางสาย) แล้วหมุน 45° (= โทร)
+            dp.arc((6 * k, 14 * k, 58 * k, 66 * k), 198, 342, fill=col, width=int(10 * SS))
+            for cx in (11, 53):
+                dp.rounded_rectangle(((cx - 8) * k, 27 * k, (cx + 8) * k, 42 * k), 5 * k, fill=col)
+            if name == "phone":
+                ph = ph.rotate(45, resample=Image.BICUBIC, center=(32 * k, 32 * k))
+            else:
+                ph = ph.transform(ph.size, Image.AFFINE, (1, 0, 0, 0, 1, -4 * k), resample=Image.BICUBIC)
+            im = Image.alpha_composite(im, ph)
+        elif name in ("video", "video-off"):
+            R(6, 18, 42, 46, 7)
+            P([(46, 28), (58, 20), (58, 44), (46, 36)])
+            if name == "video-off":
+                L((8, 8), (56, 56))
+        elif name == "chevron-right":
+            L((24, 14), (40, 32), (24, 50))
+        elif name == "chevron-left":
+            L((40, 14), (24, 32), (40, 50))
+        elif name == "minus":
+            L((16, 32), (48, 32))
+        elif name == "folder":
+            P([(8, 16), (26, 16), (31, 22), (56, 22), (56, 50), (8, 50)], fill=False)
+        elif name == "text":
+            L((14, 18), (14, 12), (50, 12), (50, 18))
+            L((32, 12), (32, 52))
+            L((24, 52), (40, 52))
+        elif name == "keyboard":
+            R(6, 18, 58, 46, 6)
+            for x in (16, 26, 36, 46):
+                C(x, 27, 2.6)
+            L((20, 37), (44, 37))
+        elif name == "fullscreen":
+            L((10, 22), (10, 10), (22, 10))
+            L((42, 10), (54, 10), (54, 22))
+            L((10, 42), (10, 54), (22, 54))
+            L((42, 54), (54, 54), (54, 42))
+        elif name == "power":
+            A(12, 14, 52, 54, -50, 230)
+            L((32, 8), (32, 32))
+        elif name in ("mic", "mic-off"):
+            R(24, 6, 40, 38, 8)
+            A(14, 16, 50, 46, 0, 180)
+            L((32, 46), (32, 56))
+            if name == "mic-off":
+                L((10, 8), (54, 56))
+        elif name in ("speaker", "speaker-off"):
+            P([(8, 24), (18, 24), (32, 12), (32, 52), (18, 40), (8, 40)])
+            if name == "speaker":
+                A(28, 20, 48, 44, -55, 55)
+                A(26, 10, 58, 54, -55, 55)
+            else:
+                L((40, 24), (56, 40))
+                L((56, 24), (40, 40))
+        elif name == "plus":
+            L((32, 12), (32, 52))
+            L((12, 32), (52, 32))
+        elif name == "send":
+            P([(8, 30), (56, 8), (40, 56), (32, 36)])
+        elif name == "download":
+            L((32, 8), (32, 40))
+            L((18, 28), (32, 42), (46, 28))
+            L((12, 54), (52, 54))
+        elif name == "x":
+            L((16, 16), (48, 48))
+            L((48, 16), (16, 48))
+        elif name == "file":
+            P([(14, 6), (38, 6), (52, 20), (52, 58), (14, 58)], fill=False)
+            L((38, 6), (38, 20), (52, 20))
+        elif name == "image":
+            R(6, 10, 58, 54, 7)
+            C(22, 25, 5)
+            P([(10, 50), (28, 32), (38, 42), (44, 36), (56, 48), (56, 50)])
+        elif name == "eye":
+            A(4, 14, 60, 50, 200, 340)
+            A(4, 14, 60, 50, 20, 160)
+            C(32, 32, 7)
+        im = im.resize((px, px), Image.LANCZOS)
+        return im
+
+    def icon(name, px=18, color="#1B1D26"):
+        key = (name, px, color)
+        if key not in _ICONS:
+            _ICONS[key] = ImageTk.PhotoImage(_draw_icon(name, px * 2 if px <= 24 else px, color).resize(
+                (px, px), Image.LANCZOS))
+        return _ICONS[key]
+
+    def shape_img(w, h, r, fill, outline=None, ow=1):
+        """สี่เหลี่ยมมุมมน / วงกลม (r = h/2) ขอบเนียน"""
+        key = (w, h, r, fill, outline, ow)
+        if key not in _SHAPES:
+            im = Image.new("RGBA", (w * SS, h * SS), (0, 0, 0, 0))
+            d = _IDraw.Draw(im)
+            box_ = (0, 0, w * SS - 1, h * SS - 1)
+            d.rounded_rectangle(box_, r * SS, fill=_hex(fill) + (255,),
+                                outline=(_hex(outline) + (255,)) if outline else None, width=ow * SS if outline else 0)
+            _SHAPES[key] = ImageTk.PhotoImage(im.resize((w, h), Image.LANCZOS))
+        return _SHAPES[key]
+
+    def rounded_photo(pil, r):
+        """รูปภาพมุมมน"""
+        pil = pil.convert("RGBA")
+        m = Image.new("L", (pil.width * SS, pil.height * SS), 0)
+        _IDraw.Draw(m).rounded_rectangle((0, 0, pil.width * SS - 1, pil.height * SS - 1), r * SS, fill=255)
+        pil.putalpha(m.resize(pil.size, Image.LANCZOS))
+        return ImageTk.PhotoImage(pil)
+
+    KIND = {   # ชนิดปุ่ม → (พื้น, พื้นตอนชี้, สีไอคอน/ตัวอักษร) เป็นชื่อสีในธีม หรือ hex
+        "soft": ("subtle", "hover", "text"),
+        "tile": ("card", "hover", "text"),
+        "primary": ("accent", "accent_hover", "accent_fg"),
+        "danger": ("danger", "danger_hover", "#FFFFFF"),
+        "danger_soft": ("danger_bg", "hover", "danger"),
+        "success": ("#16A34A", "#15803D", "#FFFFFF"),
+        "dark": ("#2A2F40", "#363C52", "#FFFFFF"),
+        "ghost": (None, "hover", "muted"),
+        "outline": ("card", "hover", "text"),
+    }
+
+    def tcol(c):
+        return c if (c or "").startswith("#") else T.c(c)
+
+    class RoundButton:
+        """ปุ่มกลม / แคปซูล / ไทล์ (ไอคอน + ข้อความ) วาดบน Canvas"""
+
+        def __init__(self, parent, icon_name=None, text="", kind="soft", w=38, h=38, r=None, command=None,
+                     bg="card", layout="row", icon_px=18, font="smallbold", badge=0):
+            self.parent_bg, self.kind, self.icon_name, self.text = bg, kind, icon_name, text
+            self.w, self.h, self.r = w, h, (h // 2 if r is None else r)
+            self.layout, self.icon_px, self.font, self.command = layout, icon_px, font, command
+            self.badge = badge
+            self.hover = False
+            self.enabled = True
+            self.cv = tk.Canvas(parent, width=w, height=h, highlightthickness=0, bd=0, cursor="hand2")
+            self.cv.bind("<Enter>", lambda e: self._set_hover(True))
+            self.cv.bind("<Leave>", lambda e: self._set_hover(False))
+            self.cv.bind("<ButtonRelease-1>", self._click)
+            T.on_change(self.draw)
+            self.draw()
+
+        def pack(self, **kw):
+            self.cv.pack(**kw)
+            return self
+
+        def grid(self, **kw):
+            self.cv.grid(**kw)
+            return self
+
+        def place(self, **kw):
+            self.cv.place(**kw)
+            return self
+
+        def pack_forget(self):
+            self.cv.pack_forget()
+
+        def destroy(self):
+            self.cv.destroy()
+
+        def _set_hover(self, v):
+            self.hover = v
+            self.draw()
+
+        def _click(self, e):
+            if self.enabled and self.command and 0 <= e.x <= self.w and 0 <= e.y <= self.h:
+                self.command()
+
+        def configure(self, **kw):
+            for k, v in kw.items():
+                setattr(self, {"icon": "icon_name"}.get(k, k), v)
+            self.draw()
+
+        def set_enabled(self, on):
+            self.enabled = bool(on)
+            self.cv.configure(cursor="hand2" if on else "arrow")
+            self.draw()
+
+        def draw(self):
+            try:
+                c = self.cv
+                c.delete("all")
+            except tk.TclError:
+                return
+            pbg = tcol(self.parent_bg)
+            c.configure(bg=pbg)
+            base, hov, fg = KIND.get(self.kind, KIND["soft"])
+            fill = tcol(hov if self.hover and self.enabled else base) if (base or self.hover) else None
+            fgc = tcol(fg)
+            if not self.enabled:
+                fgc = T.c("muted")
+            if fill:
+                c.create_image(0, 0, anchor="nw", image=shape_img(self.w, self.h, self.r, fill,
+                                                                  T.c("border") if self.kind == "outline" else None))
+            ic = icon(self.icon_name, self.icon_px, fgc) if self.icon_name else None
+            f = T.f[self.font]
+            if self.layout == "column" and ic and self.text:
+                c.create_image(self.w / 2, self.h / 2 - 8, image=ic)
+                c.create_text(self.w / 2, self.h / 2 + 13, text=self.text, fill=fgc, font=f)
+            elif ic and self.text:
+                tw = f.measure(self.text)
+                x0 = (self.w - (self.icon_px + 7 + tw)) / 2
+                c.create_image(x0 + self.icon_px / 2, self.h / 2, image=ic)
+                c.create_text(x0 + self.icon_px + 7, self.h / 2, text=self.text, fill=fgc, font=f, anchor="w")
+            elif ic:
+                c.create_image(self.w / 2, self.h / 2, image=ic)
+            else:
+                c.create_text(self.w / 2, self.h / 2, text=self.text, fill=fgc, font=f)
+            if self.badge:
+                t = str(self.badge if self.badge < 100 else "99+")
+                bw = max(18, 8 + f.measure(t))
+                c.create_image(self.w - bw + 2, -2, anchor="nw", image=shape_img(bw, 18, 9, T.c("danger"), pbg, 2))
+                c.create_text(self.w - bw / 2 + 2, 7, text=t, fill="#FFFFFF", font=T.f["smallbold"])
+
+    class Switch:
+        """สวิตช์เปิด/ปิด + ข้อความ"""
+
+        def __init__(self, parent, text, var, command=None, bg="card"):
+            self.var, self.command, self.bg, self.text = var, command, bg, text
+            self.enabled = True
+            f = T.f["smallbold"]
+            self.w = 34 + 8 + f.measure(text) + 4
+            self.cv = tk.Canvas(parent, width=self.w, height=22, highlightthickness=0, bd=0, cursor="hand2")
+            self.cv.bind("<ButtonRelease-1>", self._click)
+            var.trace_add("write", lambda *a: self.draw())
+            T.on_change(self.draw)
+            self.draw()
+
+        def pack(self, **kw):
+            self.cv.pack(**kw)
+            return self
+
+        def _click(self, e):
+            if not self.enabled:
+                return
+            self.var.set(not self.var.get())
+            if self.command:
+                self.command()
+
+        def set_enabled(self, on):
+            self.enabled = on
+            self.draw()
+
+        def draw(self):
+            try:
+                c = self.cv
+                c.delete("all")
+            except tk.TclError:
+                return
+            c.configure(bg=tcol(self.bg))
+            on = bool(self.var.get())
+            track = T.c("accent") if on and self.enabled else T.c("border")
+            c.create_image(0, 2, anchor="nw", image=shape_img(34, 20, 10, track))
+            c.create_image(16 if on else 2, 4, anchor="nw", image=shape_img(16, 16, 8, "#FFFFFF"))
+            c.create_text(42, 11, text=self.text, anchor="w", font=T.f["smallbold"],
+                          fill=T.c("text") if self.enabled else T.c("muted"))
+
+    def avatar_img(name, px=42, dot=True, ring=0):
+        """วงกลมตัวอักษรแรกของชื่อ + จุดสถานะออนไลน์"""
+        ch = (name.strip()[:1] or "?").upper()
+        palette = [("#ECE7FF", "#5B3AE6"), ("#E0F2FE", "#0369A1"), ("#DCFCE7", "#15803D"), ("#FEF3C7", "#B45309")]
+        bg, fg = palette[sum(map(ord, name or "?")) % len(palette)]
+        key = ("avatar", ch, px, dot, ring, bg, T.c("card"))
+        if key in _SHAPES:
+            return _SHAPES[key]
+        S = (px + ring * 2) * SS
+        im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        d = _IDraw.Draw(im)
+        for i in range(ring, 0, -1):
+            a = int(40 * (ring - i + 1) / ring)
+            d.ellipse((0 + (ring - i) * SS, 0 + (ring - i) * SS, S - (ring - i) * SS, S - (ring - i) * SS),
+                      fill=_hex(bg) + (a,))
+        o = ring * SS
+        d.ellipse((o, o, o + px * SS, o + px * SS), fill=_hex(bg) + (255,))
+        if dot:
+            r = px * SS * 0.14
+            cx, cy = o + px * SS - r - SS, o + px * SS - r - SS
+            d.ellipse((cx - r - 2 * SS, cy - r - 2 * SS, cx + r + 2 * SS, cy + r + 2 * SS), fill=_hex(T.c("card")) + (255,))
+            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=_hex("#16A34A") + (255,))
+        im = im.resize((px + ring * 2, px + ring * 2), Image.LANCZOS)
+        ph = ImageTk.PhotoImage(im)
+        _SHAPES[key] = (ph, ch, fg)
+        return _SHAPES[key]
+
+    def avatar(parent, name, px=42, bg="card", dot=True, ring=0):
+        ph, ch, fg = avatar_img(name, px, dot, ring)
+        size = px + ring * 2
+        c = tk.Canvas(parent, width=size, height=size, highlightthickness=0, bd=0, bg=tcol(bg))
+        c.create_image(0, 0, anchor="nw", image=ph)
+        c.create_text(size / 2, size / 2, text=ch, fill=fg,
+                      font=(T.f["bold"].actual("family"), max(10, int(px * 0.38)), "bold"))
+        return c
+
+    # ------------------------------------------------------------------
+    # แผงด้านข้าง: (ผู้ควบคุม) ปุ่มควบคุมการรีโมท + แชท + โทร  /  (เครื่องปลายทาง) แชท + โทร
     # ------------------------------------------------------------------
     def show_in_folder(p):
         try:
@@ -4188,56 +4630,61 @@ def run_gui():
         except Exception:
             pass
 
+    EXT_COLOR = {"pdf": ("#FDECEC", "#DC2626"), "doc": ("#E0ECFF", "#2563EB"), "docx": ("#E0ECFF", "#2563EB"),
+                 "xls": ("#DCFCE7", "#15803D"), "xlsx": ("#DCFCE7", "#15803D"), "csv": ("#DCFCE7", "#15803D"),
+                 "zip": ("#FEF3C7", "#B45309"), "rar": ("#FEF3C7", "#B45309"), "ppt": ("#FFEDD5", "#C2410C"),
+                 "pptx": ("#FFEDD5", "#C2410C")}
+
     class ChatPanel:
-        def __init__(self, parent, chat, call, peer, on_hide=None, width=300):
-            self.chat, self.call, self.peer, self.on_hide = chat, call, peer, on_hide
-            self.width = width
-            self.cards = {}
+        CALL_BG = "#12141C"
+
+        def __init__(self, parent, chat, call, peer, mode="controller", width=340, on_hide=None, viewer=None,
+                     chat_ok=True, subtitle=""):
+            self.chat, self.call, self.peer, self.mode = chat, call, peer, mode
+            self.width, self.on_hide, self.viewer, self.chat_ok = width, on_hide, viewer, chat_ok
+            self.items = {}                 # id → ข้อมูลข้อความ/ไฟล์ที่แสดงอยู่
             self.imgs = []
             self.unread = 0
+            self.unread_ids = []
             self.on_unread = None
-            self.call_dialog = None
+            self.visible = True
             self.remote_photo = self.self_photo = None
+            self.last_day = None
+            self.typing_until = 0
             f = self.frame = T.track(tk.Frame(parent, width=width, bd=0, highlightthickness=0), bg="card")
             f.pack_propagate(False)
-            T.track(tk.Frame(f, width=1, bd=0), bg="border").pack(side="left", fill="y")
+            if mode == "controller":
+                T.track(tk.Frame(f, width=1, bd=0), bg="border").pack(side="left", fill="y")
             body = self.body = box(f)
             body.pack(side="left", fill="both", expand=True)
 
-            # --- หัว: ชื่อ + ปุ่มโทร ---
+            # --- หัว ---
             head = box(body)
-            head.pack(fill="x", padx=10, pady=(10, 6))
+            head.pack(fill="x", padx=(16, 10), pady=(14, 12))
+            avatar(head, peer, 42).pack(side="left")
+            names = box(head)
+            names.pack(side="left", fill="x", expand=True, padx=(12, 6))
+            lbl(names, peer, font="bold").pack(anchor="w")
+            self.sub = lbl(names, subtitle, fg="muted", font="small")
+            self.sub.pack(anchor="w")
             if on_hide:
-                ttk.Button(head, text="⟩", width=2, style="Tool.TButton", command=on_hide).pack(side="right")
-            self.vbtn = ttk.Button(head, text="🎥", width=3, style="Tool.TButton", command=lambda: self._call(True))
-            self.vbtn.pack(side="right", padx=(4, 4))
-            self.abtn = ttk.Button(head, text="📞", width=3, style="Tool.TButton", command=lambda: self._call(False))
-            self.abtn.pack(side="right")
-            lbl(head, "💬 " + tr("แชท"), font="h2").pack(side="left")
-            self.sub = lbl(body, peer, fg="muted", font="small")
-            self.sub.pack(fill="x", padx=12)
+                RoundButton(head, "chevron-right" if mode == "controller" else "minus", kind="ghost", w=30, h=38,
+                            r=10, command=on_hide).pack(side="right")
+            self.vbtn = RoundButton(head, "video", command=lambda: self._call(True)).pack(side="right", padx=(6, 4))
+            self.abtn = RoundButton(head, "phone", command=lambda: self._call(False)).pack(side="right")
 
-            # --- พื้นที่โทร (ซ่อนจนกว่าจะมีการโทร) ---
-            self.callbox = T.track(tk.Frame(body, bd=0), bg="viewer")
-            self.remote_lbl = T.track(tk.Label(self.callbox, bd=0, text="", font=T.f["h2"], fg="#FFFFFF"), bg="viewer")
-            self.remote_lbl.pack(fill="x")
-            self.self_lbl = T.track(tk.Label(self.callbox, bd=1, relief="solid"), bg="viewer")
-            self.call_info = T.track(tk.Label(self.callbox, text="", font=T.f["smallbold"], fg="#FFFFFF"), bg="viewer")
-            self.call_info.pack(fill="x", pady=(4, 2))
-            cb = T.track(tk.Frame(self.callbox, bd=0), bg="viewer")
-            cb.pack(pady=(2, 8))
-            self.mute_btn = ttk.Button(cb, text="🎤", width=3, style="Tool.TButton", command=self._toggle_mute)
-            self.mute_btn.pack(side="left", padx=3)
-            self.cam_btn = ttk.Button(cb, text="📷", width=3, style="Tool.TButton", command=self._toggle_cam)
-            self.cam_btn.pack(side="left", padx=3)
-            self.answer_btn = ttk.Button(cb, text="📞 " + tr("รับสาย"), style="Tool.Accent.TButton",
-                                         command=self._answer)
-            self.hang_btn = ttk.Button(cb, text="⏹ " + tr("วางสาย"), style="Tool.Danger.TButton", command=self._hang)
-            self.hang_btn.pack(side="left", padx=3)
+            # --- ปุ่มควบคุมการรีโมท (เฉพาะผู้ควบคุม) ---
+            if mode == "controller" and viewer is not None:
+                self._build_controls(body, viewer)
+
+            # --- พื้นที่โทร ---
+            self.callbox = tk.Frame(body, bd=0, bg=self.CALL_BG)
+            self._build_call()
 
             # --- ข้อความ ---
-            mid = box(body)
-            mid.pack(fill="both", expand=True, pady=(8, 0))
+            T.track(tk.Frame(body, height=1, bd=0), bg="border").pack(fill="x")
+            mid = box(body, bg="bg")
+            mid.pack(fill="both", expand=True)
             self.cv = T.track(tk.Canvas(mid, highlightthickness=0, bd=0), bg="bg")
             sb = ttk.Scrollbar(mid, orient="vertical", command=self.cv.yview)
             self.cv.configure(yscrollcommand=sb.set)
@@ -4251,36 +4698,132 @@ def run_gui():
                 w.bind("<MouseWheel>", self._wheel)
                 w.bind("<Button-4>", lambda e: self.cv.yview_scroll(-2, "units"))
                 w.bind("<Button-5>", lambda e: self.cv.yview_scroll(2, "units"))
-            self.empty = lbl(self.inner, tr("ยังไม่มีข้อความ\nพิมพ์ข้อความ หรือส่งไฟล์ รูป วีดีโอได้ที่ด้านล่าง"),
-                             fg="muted", bg="bg", font="small", justify="center", anchor="center")
-            self.empty.pack(fill="x", pady=30)
+            self.empty = lbl(self.inner, tr("ยังไม่มีข้อความ\nพิมพ์ข้อความ หรือส่งไฟล์ รูป วีดีโอได้ที่ด้านล่าง")
+                             if chat_ok else tr("เครื่องปลายทางใช้โปรแกรมเวอร์ชันเก่าที่ยังไม่มีแชท"),
+                             fg="muted", bg="bg", font="small", justify="center", anchor="center",
+                             wraplength=width - 60)
+            self.empty.pack(fill="x", pady=40)
+            self.typing_row = box(self.inner, bg="bg")
+            tc = tk.Canvas(self.typing_row, width=58, height=34, highlightthickness=0, bd=0)
+            self.typing_cv = tc
+            T.on_change(self._draw_typing)
+            self._draw_typing()
+            tc.pack(side="left", padx=14, pady=(2, 8))
 
-            # --- ช่องพิมพ์ ---
-            T.track(tk.Frame(body, height=1, bd=0), bg="border").pack(fill="x")
-            att = box(body)
-            att.pack(fill="x", padx=8, pady=(6, 0))
-            for txt, kind in (("📎 " + tr("ไฟล์"), "file"), ("🖼 " + tr("รูป"), "image"), ("🎬 " + tr("วีดีโอ"), "video")):
-                ttk.Button(att, text=txt, style="Tool.TButton", command=lambda k=kind: self._attach(k)).pack(
-                    side="left", padx=(0, 4), fill="x", expand=True)
-            row = box(body)
-            row.pack(fill="x", padx=8, pady=8)
+            # --- ช่องพิมพ์ (ติดด้านล่างเสมอ แม้กำลังโทร) ---
+            comp = box(body)
+            comp.pack(side="bottom", fill="x", padx=12, pady=(10, 14), before=mid)
+            T.track(tk.Frame(body, height=1, bd=0), bg="border").pack(side="bottom", fill="x", before=mid)
+            self.plus = RoundButton(comp, "plus", kind="outline", w=42, h=42, command=self._attach_menu).pack(side="left")
+            self.send_btn = RoundButton(comp, "send", kind="primary", w=42, h=42, icon_px=17,
+                                        command=self._send).pack(side="right")
+            pill = self.pill = tk.Canvas(comp, height=42, highlightthickness=0, bd=0)
+            pill.pack(side="left", fill="x", expand=True, padx=8)
             self.entry_var = tk.StringVar()
-            e = self.entry = ttk.Entry(row, textvariable=self.entry_var)
-            e.pack(side="left", fill="x", expand=True, ipady=3)
+            self.placeholder = tr("พิมพ์ข้อความ…")
+            e = self.entry = tk.Entry(pill, textvariable=self.entry_var, bd=0, highlightthickness=0, relief="flat",
+                                      font=T.f["base"])
+            self.pill_win = pill.create_window(16, 21, window=e, anchor="w")
+            self.focused = False
+            self.ph_on = False
+            e.bind("<FocusIn>", lambda ev: self._pill_focus(True))
+            e.bind("<FocusOut>", lambda ev: self._pill_focus(False))
             e.bind("<Return>", lambda ev: self._send())
-            ttk.Button(row, text="➤", width=3, style="Accent.TButton", command=self._send).pack(side="left", padx=(6, 0))
+            e.bind("<KeyRelease>", lambda ev: self.chat.send_typing()
+                   if self.chat_ok and not self.ph_on and ev.keysym != "Return" else None)
+            pill.bind("<Configure>", lambda ev: self._draw_pill())
+            pill.bind("<Button-1>", lambda ev: e.focus_set())
+            T.on_change(self._draw_pill)
+            if not chat_ok:
+                for b in (self.plus, self.send_btn, self.abtn, self.vbtn):
+                    b.set_enabled(False)
+                e.configure(state="disabled")
             self._tick()
 
-        # ----- ข้อความ -----
-        def _wheel(self, e):
-            self.cv.yview_scroll(-1 if e.delta > 0 else 1, "units") if abs(e.delta) < 120 else \
-                self.cv.yview_scroll(int(-e.delta / 120), "units")
+        # ================= ปุ่มควบคุมการรีโมท =================
+        def _build_controls(self, body, v):
+            outer = box(body)
+            outer.pack(fill="x", padx=12, pady=(0, 12))
+            cb = T.track(tk.Frame(outer, bd=0, highlightthickness=0), bg="subtle")
+            cb.pack(fill="x")
+            r1 = box(cb, bg="subtle")
+            r1.pack(fill="x", padx=10, pady=(10, 8))
+            qb = ttk.Combobox(r1, values=[q[0] for q in QUALITY], textvariable=v.q_var, state="readonly", width=7)
+            qb.pack(side="left")
+            qb.bind("<<ComboboxSelected>>", lambda e: v._quality_changed())
+            if len(v.mvals) > 1:
+                mb = ttk.Combobox(r1, values=v.mvals, textvariable=v.mon_var, state="readonly", width=7)
+                mb.pack(side="left", padx=(6, 0))
+                mb.bind("<<ComboboxSelected>>", lambda e: v.request(full=True))
+            Switch(r1, "⌘↔Ctrl", v.swap_var, bg="subtle").pack(side="right")
+            sw = Switch(r1, tr("ควบคุม"), v.ctrl_var, command=v._release_all, bg="subtle").pack(side="right", padx=(0, 10))
+            if not v.can_control:
+                sw.set_enabled(False)
+            r2 = box(cb, bg="subtle")
+            r2.pack(fill="x", padx=10, pady=(0, 10))
+            tw = max(46, int((self.width - 24 - 20 - 4 * 6) / 5))
+            for i, (ic, txt, kind, cmd) in enumerate((
+                    ("folder", tr("ไฟล์"), "tile", v.open_files),
+                    ("text", tr("พิมพ์"), "tile", v.send_text),
+                    ("keyboard", tr("ปล่อยปุ่ม"), "tile", v._release_all),
+                    ("fullscreen", tr("เต็มจอ"), "tile", v.toggle_full),
+                    ("power", tr("ตัดสาย"), "danger_soft", v.disconnect))):
+                RoundButton(r2, ic, text=txt, kind=kind, w=tw, h=56, r=12, layout="column", bg="subtle",
+                            font="small", command=cmd).grid(row=0, column=i, padx=(0 if i == 0 else 6, 0))
+
+        def set_latency(self, text, color):
+            self.sub.configure(text=text, fg=T.c(color))
+
+        # ================= ช่องพิมพ์ =================
+        def _draw_pill(self):
+            try:
+                c = self.pill
+                w = max(60, c.winfo_width())
+            except tk.TclError:
+                return
+            c.delete("bg")
+            c.configure(bg=T.c("card"))
+            if self.focused:
+                c.create_image(0, 0, anchor="nw", image=shape_img(w, 42, 21, T.c("sel")), tags="bg")
+                c.create_image(3, 3, anchor="nw", image=shape_img(w - 6, 36, 18, T.c("card"), T.c("accent"), 2), tags="bg")
+            else:
+                c.create_image(0, 0, anchor="nw", image=shape_img(w, 42, 21, T.c("card"), T.c("border"), 1), tags="bg")
+            c.tag_lower("bg")
+            c.itemconfigure(self.pill_win, width=w - 32)
+            self.entry.configure(bg=T.c("card"), fg=T.c("text"), insertbackground=T.c("text"),
+                                 disabledbackground=T.c("card"))
+            self._placeholder()
+
+        def _pill_focus(self, on):
+            self.focused = on
+            if on and self.ph_on:
+                self.ph_on = False
+                self.entry.delete(0, "end")
+            self._draw_pill()
+
+        def _placeholder(self):
+            """ข้อความจาง ๆ ในช่องพิมพ์ตอนว่าง"""
+            if not self.focused and not self.ph_on and not self.entry_var.get():
+                self.ph_on = True
+                self.entry.insert(0, self.placeholder)
+            self.entry.configure(fg=T.c("muted") if self.ph_on else T.c("text"))
 
         def _send(self):
             text = self.entry_var.get()
-            if text.strip():
+            if text.strip() and self.chat_ok and not self.ph_on:
                 self.chat.send_text(text)
                 self.entry_var.set("")
+
+        def _attach_menu(self):
+            m = tk.Menu(self.frame, tearoff=0)
+            m.add_command(label="  " + tr("ไฟล์") + "…", command=lambda: self._attach("file"))
+            m.add_command(label="  " + tr("รูป") + "…", command=lambda: self._attach("image"))
+            m.add_command(label="  " + tr("วีดีโอ") + "…", command=lambda: self._attach("video"))
+            x, y = self.plus.cv.winfo_rootx(), self.plus.cv.winfo_rooty()
+            try:
+                m.tk_popup(x, y - 90)
+            finally:
+                m.grab_release()
 
         def _attach(self, kind):
             title = {"file": tr("เลือกไฟล์ที่จะส่ง"), "image": tr("เลือกรูปที่จะส่ง"), "video": tr("เลือกวีดีโอที่จะส่ง")}[kind]
@@ -4299,70 +4842,152 @@ def run_gui():
                 if os.path.isfile(p):
                     self.chat.send_file(p)
 
-        def _row(self, mine):
-            row = box(self.inner, bg="bg")
-            row.pack(fill="x", padx=8, pady=3)
-            if self.empty is not None:
-                self.empty.destroy()
-                self.empty = None
-            return row
+        # ================= ข้อความ =================
+        def _wheel(self, e):
+            if abs(e.delta) >= 120:
+                self.cv.yview_scroll(int(-e.delta / 120), "units")
+            else:
+                self.cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
 
         def _scroll_end(self):
             self.inner.update_idletasks()
             self.cv.configure(scrollregion=self.cv.bbox("all"))
             self.cv.yview_moveto(1.0)
 
-        def _bubble_colors(self, mine):
-            return ("accent", "accent_fg") if mine else ("subtle", "text")
+        def _row(self, ts=None):
+            if self.empty is not None:
+                self.empty.destroy()
+                self.empty = None
+            day = time.strftime("%Y%m%d", time.localtime(ts or time.time()))
+            if day != self.last_day:
+                self.last_day = day
+                today = day == time.strftime("%Y%m%d")
+                txt = tr("วันนี้") if today else time.strftime("%d/%m/%Y", time.localtime(ts or time.time()))
+                dv = box(self.inner, bg="bg")
+                dv.pack(fill="x", pady=(12, 4), before=self.typing_row if self.typing_row.winfo_ismapped() else None)
+                ccv = tk.Canvas(dv, height=22, highlightthickness=0, bd=0, bg=T.c("bg"))
+                f = T.f["smallbold"]
+                wd = f.measure(txt) + 20
+                ccv.configure(width=wd)
+                ccv.create_image(0, 1, anchor="nw", image=shape_img(wd, 20, 10, T.c("subtle")))
+                ccv.create_text(wd / 2, 11, text=txt, fill=T.c("muted"), font=f)
+                ccv.pack()
+            row = box(self.inner, bg="bg")
+            row.pack(fill="x", padx=12, pady=4, before=self.typing_row if self.typing_row.winfo_ismapped() else None)
+            return row
+
+        def _bubble(self, parent, text, mine):
+            f = T.f["base"]
+            maxw = self.width - 120
+            c = tk.Canvas(parent, highlightthickness=0, bd=0, bg=T.c("bg"))
+            tid = c.create_text(13, 9, text=text, anchor="nw", width=maxw, font=f,
+                                fill=T.c("accent_fg") if mine else T.c("text"))
+            x0, y0, x1, y1 = c.bbox(tid)
+            w, h = max(36, x1 + 13), max(34, y1 + 9)
+            c.configure(width=w, height=h)
+            if mine:
+                bgc = T.c("accent")
+                c.create_image(0, 0, anchor="nw", image=shape_img(w, h, 16, bgc))
+                c.create_rectangle(w - 12, h - 12, w, h, fill=bgc, outline=bgc)      # มุมล่างขวาแหลม = ฝั่งเรา
+            else:
+                c.create_image(0, 0, anchor="nw", image=shape_img(w, h, 16, T.c("card"), T.c("border"), 1))
+            c.tag_raise(tid)
+            return c
+
+        def _meta(self, parent, mine, text):
+            m = lbl(parent, text, fg="muted", bg="bg", font="small")
+            m.pack(anchor="e" if mine else "w", padx=4, pady=(2, 0))
+            return m
+
+        def _stamp(self, ts):
+            return time.strftime("%H:%M", time.localtime(ts or time.time()))
 
         def add_msg(self, m):
             mine = m.get("mine")
-            row = self._row(mine)
-            bg, fg = self._bubble_colors(mine)
-            wrap = max(120, self.width - 70)
-            b = lbl(row, m.get("text", ""), fg=fg, bg=bg, font="base", wraplength=wrap, padx=10, pady=6)
-            b.pack(side="right" if mine else "left")
-            self._meta(row, m, mine)
+            row = self._row(m.get("t"))
+            col = box(row, bg="bg")
+            col.pack(side="right" if mine else "left")
+            self._bubble(col, m.get("text", ""), mine).pack(anchor="e" if mine else "w")
+            meta = self._meta(col, mine, self._stamp(m.get("t")) if mine else
+                              "%s · %s" % (m.get("name") or self.peer, self._stamp(m.get("t"))))
+            self.items[m["id"]] = {"meta": meta, "mine": mine, "t": m.get("t"), "status": ""}
             self._scroll_end()
 
-        def _meta(self, row, m, mine):
-            ts = time.strftime("%H:%M", time.localtime(m.get("t") or time.time()))
-            who = "" if mine else (m.get("name_from") if "name_from" in m else m.get("name") or "") + " · "
-            lbl(row, who + ts, fg="muted", bg="bg", font="small").pack(side="right" if mine else "left", padx=6,
-                                                                       anchor="s")
-
+        # ----- ไฟล์ / รูป / วีดีโอ -----
         def add_file(self, m):
             mine = m.get("mine")
-            row = self._row(mine)
-            bg, fg = ("sel", "text") if mine else ("subtle", "text")
-            c = T.track(tk.Frame(row, bd=0, highlightthickness=0), bg=bg)
-            c.pack(side="right" if mine else "left")
-            icon = {"image": "🖼", "video": "🎬"}.get(m.get("kind"), "📎")
-            top = box(c, bg=bg)
-            top.pack(fill="x", padx=8, pady=(6, 2))
-            thumb = box(c, bg=bg)
-            thumb.pack(fill="x", padx=8)
-            lbl(top, "%s  %s" % (icon, m.get("name", "")), fg=fg, bg=bg, font="smallbold",
-                wraplength=max(120, self.width - 90)).pack(anchor="w")
-            st = lbl(c, fmt_size(m.get("size", 0)), fg="muted", bg=bg, font="small")
-            st.pack(fill="x", padx=8)
-            pb = ttk.Progressbar(c, mode="determinate", maximum=max(1, m.get("size", 1)), length=max(120, self.width - 100))
-            pb.pack(fill="x", padx=8, pady=(2, 2))
-            btns = box(c, bg=bg)
-            btns.pack(fill="x", padx=6, pady=(2, 6))
-            card = {"m": m, "status": st, "pb": pb, "btns": btns, "thumb": thumb, "path": m.get("path"), "bg": bg}
-            self.cards[m["id"]] = card
-            if mine:
-                ttk.Button(btns, text=tr("ยกเลิก"), style="Tool.TButton",
-                           command=lambda: self.chat.cancel(m["id"])).pack(side="left")
-                if m.get("kind") in ("image", "video"):
-                    self._thumb(card, m["path"])
-            self._meta(row, m, mine)
+            row = self._row(m.get("t"))
+            col = box(row, bg="bg")
+            col.pack(side="right" if mine else "left")
+            holder = box(col, bg="bg")
+            holder.pack(anchor="e" if mine else "w")
+            it = {"m": m, "mine": mine, "holder": holder, "path": m.get("path"), "t": m.get("t"), "status": "",
+                  "done": 0}
+            it["meta"] = self._meta(col, mine, self._stamp(m.get("t")) if mine else
+                                    "%s · %s" % (m.get("name_from") or self.peer, self._stamp(m.get("t"))))
+            self.items[m["id"]] = it
+            if mine and m.get("kind") in ("image", "video") and self._thumb(it, m["path"]):
+                it["meta"].configure(text=self._stamp(m.get("t")) + " · " + tr("กำลังส่ง…"))
+            else:
+                self._file_card(it)
             self._scroll_end()
 
-        def _thumb(self, card, path):
+        def _file_card(self, it):
+            m, mine = it["m"], it["mine"]
+            for w in it["holder"].winfo_children():
+                w.destroy()
+            W, H = min(250, self.width - 90), 62
+            c = tk.Canvas(it["holder"], width=W, height=H, highlightthickness=0, bd=0, bg=T.c("bg"))
+            c.pack()
+            c.create_image(0, 0, anchor="nw", image=shape_img(W, H, 14, T.c("sel") if mine else T.c("card"),
+                                                              None if mine else T.c("border"), 1))
+            ext = os.path.splitext(m.get("name", ""))[1].lstrip(".").lower()
+            kind = m.get("kind")
+            tb, tf = EXT_COLOR.get(ext, ("#ECE7FF", "#5B3AE6"))
+            c.create_image(11, 11, anchor="nw", image=shape_img(40, 40, 10, tb))
+            if kind in ("image", "video"):
+                c.create_image(31, 31, image=icon("image" if kind == "image" else "video", 18, tf))
+            else:
+                c.create_text(31, 31, text=(ext[:4] or "FILE").upper(), fill=tf, font=T.f["smallbold"])
+            name = m.get("name", "")
+            f = T.f["smallbold"]
+            maxw = W - 112
+            while f.measure(name) > maxw and len(name) > 6:
+                name = name[:len(name) // 2 - 2] + "…" + name[len(name) // 2 + 1:]
+            c.create_text(61, 22, text=name, anchor="w", font=f, fill=T.c("text"))
+            it["size_id"] = c.create_text(61, 40, text=fmt_size(m.get("size", 0)), anchor="w", font=T.f["small"],
+                                          fill=T.c("muted"))
+            it["bar_bg"] = c.create_rectangle(61, 52, W - 52, 55, fill=T.c("border"), outline="")
+            it["bar"] = c.create_rectangle(61, 52, 61, 55, fill=T.c("accent"), outline="")
+            it["card"], it["W"] = c, W
+            self._card_action(it)
+
+        def _card_action(self, it):
+            c, W = it["card"], it["W"]
+            if it.get("btn"):
+                it["btn"].destroy()
+            st = it["status"]
+            if st in ("sent", "received") and it.get("path") and os.path.exists(it["path"]):
+                b = RoundButton(c, "download" if not it["mine"] else "folder", kind="soft", w=32, h=32, icon_px=16,
+                                bg=T.c("sel") if it["mine"] else T.c("card"),
+                                command=lambda p=it["path"]: open_path(p) if not it["mine"] else show_in_folder(p))
+                for k in ("bar", "bar_bg"):
+                    c.delete(it[k])
+            elif st in ("", "sending", "receiving"):
+                b = RoundButton(c, "x", kind="soft", w=28, h=28, icon_px=13,
+                                bg=T.c("sel") if it["mine"] else T.c("card"),
+                                command=lambda: self.chat.cancel(it["m"]["id"]))
+            else:
+                b = None
+                for k in ("bar", "bar_bg"):
+                    c.delete(it[k])
+            if b:
+                c.create_window(W - 12, 31, window=b.cv, anchor="e")
+            it["btn"] = b
+
+        def _thumb(self, it, path):
             try:
-                if card["m"].get("kind") == "image":
+                if it["m"].get("kind") == "image":
                     im = Image.open(path)
                     im.load()
                 else:
@@ -4371,102 +4996,207 @@ def run_gui():
                     ok, fr = cap.read()
                     cap.release()
                     if not ok:
-                        return
+                        return False
                     im = Image.fromarray(fr[:, :, ::-1])
                 im = im.convert("RGB")
-                im.thumbnail((max(120, self.width - 90), 200))
-                if card["m"].get("kind") == "video":
-                    from PIL import ImageDraw
-                    d = ImageDraw.Draw(im)
-                    cx, cy, r = im.width // 2, im.height // 2, 18
-                    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(0, 0, 0))
+                im.thumbnail((min(230, self.width - 100), 180))
+                if it["m"].get("kind") == "video":
+                    d = _IDraw.Draw(im)
+                    cx, cy, r = im.width // 2, im.height // 2, 20
+                    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(18, 20, 28))
                     d.polygon([(cx - 6, cy - 10), (cx - 6, cy + 10), (cx + 11, cy)], fill=(255, 255, 255))
-                ph = ImageTk.PhotoImage(im)
+                ph = rounded_photo(im, 14)
                 self.imgs.append(ph)
-                for w in card["thumb"].winfo_children():
+                for w in it["holder"].winfo_children():
                     w.destroy()
-                t = T.track(tk.Label(card["thumb"], image=ph, cursor="hand2", bd=0), bg=card["bg"])
-                t.pack(anchor="w", pady=(2, 2))
+                t = T.track(tk.Label(it["holder"], image=ph, cursor="hand2", bd=0), bg="bg")
+                t.pack()
                 t.bind("<Button-1>", lambda e, p=path: open_path(p))
-                self._scroll_end()
+                it["thumb"] = True
+                return True
             except Exception:
-                pass
+                return False
 
         def progress(self, ev):
-            card = self.cards.get(ev.get("id"))
-            if not card:
+            it = self.items.get(ev.get("id"))
+            if not it or "m" not in it:
                 return
-            m = card["m"]
-            if "done" in ev and ev.get("size"):
-                card["pb"].configure(value=ev["done"])
-                card["status"].configure(text="%s / %s" % (fmt_size(ev["done"]), fmt_size(ev["size"])))
-            status = ev.get("status")
-            if status in ("sent", "received"):
-                card["pb"].pack_forget()
-                path = ev.get("path") or card["path"]
-                card["path"] = path
-                card["status"].configure(text=fmt_size(m.get("size", 0)) + "  ·  " +
-                                         (tr("ส่งแล้ว ✓") if status == "sent" else tr("ได้รับแล้ว ✓")))
-                for w in card["btns"].winfo_children():
-                    w.destroy()
-                if path and os.path.exists(path):
-                    ttk.Button(card["btns"], text=tr("เปิด"), style="Tool.TButton",
-                               command=lambda: open_path(path)).pack(side="left")
-                    ttk.Button(card["btns"], text=tr("แสดงในโฟลเดอร์"), style="Tool.TButton",
-                               command=lambda: show_in_folder(path)).pack(side="left", padx=(4, 0))
-                    if status == "received" and m.get("kind") in ("image", "video"):
-                        self._thumb(card, path)
-            elif status == "failed":
-                card["pb"].pack_forget()
-                for w in card["btns"].winfo_children():
-                    w.destroy()
-                card["status"].configure(text="✗ " + (ev.get("text") or tr("ส่งไม่สำเร็จ")), fg=T.c("danger"))
+            m = it["m"]
+            size = ev.get("size") or m.get("size") or 1
+            if "done" in ev:
+                it["done"] = ev["done"]
+            st = ev.get("status")
+            if st:
+                it["status"] = st
+            if ev.get("path"):
+                it["path"] = ev["path"]
+            if it.get("thumb"):
+                if st == "sent":
+                    it["meta"].configure(text=self._stamp(it["t"]) + " · " + tr("ส่งแล้ว"))
+                elif st == "failed":
+                    it["meta"].configure(text="✗ " + (ev.get("text") or tr("ส่งไม่สำเร็จ")), fg=T.c("danger"))
+                elif "done" in ev:
+                    it["meta"].configure(text=self._stamp(it["t"]) + " · " + tr("กำลังส่ง… %d%%") % (100 * it["done"] / size))
+                return
+            c = it.get("card")
+            if c is None:
+                return
+            try:
+                if st in ("sent", "received"):
+                    c.itemconfigure(it["size_id"], text=fmt_size(m.get("size", 0)) + "  ·  " +
+                                    (tr("ส่งแล้ว") if st == "sent" else tr("ได้รับแล้ว")))
+                    if st == "received" and m.get("kind") in ("image", "video") and self._thumb(it, it["path"]):
+                        self._scroll_end()
+                        return
+                    self._card_action(it)
+                elif st == "failed":
+                    c.itemconfigure(it["size_id"], text="✗ " + (ev.get("text") or tr("ส่งไม่สำเร็จ")), fill=T.c("danger"))
+                    self._card_action(it)
+                elif "done" in ev:
+                    W = it["W"]
+                    c.coords(it["bar"], 61, 52, 61 + (W - 113) * min(1.0, it["done"] / size), 55)
+                    c.itemconfigure(it["size_id"], text="%s / %s" % (fmt_size(it["done"]), fmt_size(size)))
+            except tk.TclError:
+                pass
 
         def note(self, text, color="muted"):
-            row = self._row(False)
+            row = self._row()
             lbl(row, text, fg=color, bg="bg", font="small", justify="center", anchor="center",
-                wraplength=max(120, self.width - 40)).pack(fill="x")
+                wraplength=self.width - 50).pack(fill="x")
             self._scroll_end()
+
+        # ----- กำลังพิมพ์ / อ่านแล้ว -----
+        def _draw_typing(self):
+            c = self.typing_cv
+            try:
+                c.delete("all")
+            except tk.TclError:
+                return
+            c.configure(bg=T.c("bg"))
+            c.create_image(0, 0, anchor="nw", image=shape_img(58, 34, 16, T.c("card"), T.c("border"), 1))
+            for i in range(3):
+                c.create_image(16 + i * 11, 14, anchor="nw", image=shape_img(6, 6, 3, T.c("muted")))
+
+        def _show_typing(self):
+            self.typing_until = time.time() + 4
+            if not self.typing_row.winfo_ismapped():
+                self.typing_row.pack(fill="x")
+                self._scroll_end()
+
+        def _mark_read(self, ids):
+            for i in ids:
+                it = self.items.get(i)
+                if it and it["mine"] and "meta" in it and not it.get("thumb") and "m" not in it:
+                    it["meta"].configure(text=self._stamp(it["t"]) + " · " + tr("อ่านแล้ว"))
 
         # ----- เหตุการณ์จาก engine -----
         def on_event(self, ev, visible=True):
+            self.visible = visible
             k = ev.get("ev")
-            if k == "msg":
-                self.add_msg(ev)
+            if k in ("msg", "file"):
+                if self.typing_row.winfo_ismapped() and not ev.get("mine"):
+                    self.typing_row.pack_forget()
+                (self.add_msg if k == "msg" else self.add_file)(ev)
                 if not ev.get("mine"):
-                    self._bump(visible)
-            elif k == "file":
-                self.add_file(ev)
-                if not ev.get("mine"):
-                    self._bump(visible)
+                    if visible:
+                        self.chat.send_read([ev["id"]])
+                    else:
+                        self.unread_ids.append(ev["id"])
+                        self.unread += 1
+                        if self.on_unread:
+                            self.on_unread(self.unread, ev)
             elif k == "progress":
                 self.progress(ev)
+            elif k == "typing":
+                self._show_typing()
+            elif k == "read":
+                self._mark_read(ev.get("ids") or [])
             elif k == "error":
                 self.note("✗ " + ev.get("text", ""), "danger")
             elif k in ("call_state", "call_incoming", "remote_video", "self_video", "call_error"):
                 self.on_call(ev)
 
-        def _bump(self, visible):
-            if not visible:
-                self.unread += 1
-                if self.on_unread:
-                    self.on_unread(self.unread)
-
         def seen(self):
-            self.unread = 0
+            self.visible = True
+            if self.unread_ids:
+                self.chat.send_read(self.unread_ids)
+            self.unread_ids, self.unread = [], 0
             if self.on_unread:
-                self.on_unread(0)
+                self.on_unread(0, None)
 
-        # ----- โทร -----
+        # ================= โทร =================
+        def _build_call(self):
+            cb = self.callbox
+            self.c_head = tk.Frame(cb, bd=0, bg=self.CALL_BG)
+            self.c_head.pack(fill="x", padx=12, pady=(12, 10))
+            self.c_title = tk.Label(self.c_head, text=self.peer, font=T.f["bold"], fg="#FFFFFF", bg=self.CALL_BG)
+            self.c_title.pack(anchor="w")
+            self.c_sub = tk.Label(self.c_head, text="", font=T.f["small"], fg="#A9B0C2", bg=self.CALL_BG)
+            self.c_sub.pack(anchor="w")
+            self.stage = tk.Canvas(cb, highlightthickness=0, bd=0, bg=self.CALL_BG, height=10)
+            self.stage.pack(fill="x", padx=12)
+            self.c_ctrl = tk.Frame(cb, bd=0, bg=self.CALL_BG)
+            self.c_ctrl.pack(pady=(12, 14))
+            B = self.CALL_BG
+            self.mic_btn = RoundButton(self.c_ctrl, "mic", kind="dark", w=46, h=46, icon_px=20, bg=B,
+                                       command=self._toggle_mute)
+            self.cam_btn = RoundButton(self.c_ctrl, "video", kind="dark", w=46, h=46, icon_px=20, bg=B,
+                                       command=self._toggle_cam)
+            self.spk_btn = RoundButton(self.c_ctrl, "speaker", kind="dark", w=46, h=46, icon_px=20, bg=B,
+                                       command=self._toggle_spk)
+            self.hang_btn = RoundButton(self.c_ctrl, "hangup", kind="danger", w=64, h=46, icon_px=22, bg=B,
+                                        command=self._hang)
+            self.decline_btn = RoundButton(self.c_ctrl, "hangup", text=tr("ปฏิเสธ"), kind="danger",
+                                           w=int((self.width - 60) / 2), h=44, bg=B, font="bold",
+                                           command=lambda: self.call.decline())
+            self.accept_btn = RoundButton(self.c_ctrl, "video", text=tr("รับสาย"), kind="success",
+                                          w=int((self.width - 60) / 2), h=44, bg=B, font="bold",
+                                          command=self._answer)
+            self.audio_only = tk.Label(cb, text=tr("รับด้วยเสียงอย่างเดียว"), font=T.f["small"], fg="#C9CFDD", bg=B,
+                                       cursor="hand2")
+            self.audio_only.bind("<Button-1>", lambda e: self.call.accept(video=False))
+
+        def _ctrl_layout(self, which):
+            for b in (self.mic_btn, self.cam_btn, self.spk_btn, self.hang_btn, self.decline_btn, self.accept_btn):
+                b.pack_forget()
+            for b in which:
+                b.pack(side="left", padx=5)
+
+        def _stage_avatar(self, text):
+            c = self.stage
+            w = self.width - 24
+            c.configure(height=150)
+            c.delete("all")
+            ph, ch, fg = avatar_img(self.peer, 64, dot=False, ring=16)
+            c.create_image(w / 2, 62, image=ph)
+            c.create_text(w / 2, 62, text=ch, fill=fg, font=(T.f["bold"].actual("family"), 24, "bold"))
+            c.create_text(w / 2, 128, text=text, fill="#C9CFDD", font=T.f["base"])
+
+        def _stage_video(self):
+            c = self.stage
+            w = self.width - 24
+            h = int(w * 0.75)
+            c.configure(height=h)
+            c.delete("all")
+            if self.remote_photo is not None:
+                c.create_image(0, 0, anchor="nw", image=self.remote_photo)
+            else:
+                c.create_image(0, 0, anchor="nw", image=shape_img(w, h, 14, "#2B3245"))
+                ph, ch, fg = avatar_img(self.peer, 64, dot=False)
+                c.create_image(w / 2, h / 2, image=ph)
+                c.create_text(w / 2, h / 2, text=ch, fill=fg, font=(T.f["bold"].actual("family"), 24, "bold"))
+            if self.self_photo is not None:
+                c.create_image(w - 8, 8, anchor="ne", image=self.self_photo)
+
         def _call(self, video):
-            if self.call.state != "idle":
+            if self.call.state != "idle" or not self.chat_ok:
                 return
             a, v = media_available()
             if not a:
-                messagebox.showinfo(APP, tr("ไม่พบไมโครโฟนหรือลำโพงในเครื่องนี้ จึงโทรไม่ได้"), parent=self.frame)
+                self.note("✗ " + tr("ไม่พบไมโครโฟนหรือลำโพงในเครื่องนี้ จึงโทรไม่ได้"), "danger")
                 return
             if video and not v:
-                messagebox.showinfo(APP, tr("ไม่พบกล้องในเครื่องนี้ — จะโทรด้วยเสียงอย่างเดียว"), parent=self.frame)
+                self.note(tr("ไม่พบกล้องในเครื่องนี้ — จะโทรด้วยเสียงอย่างเดียว"))
             self.call.start_call(video)
 
         def _answer(self):
@@ -4480,18 +5210,31 @@ def run_gui():
 
         def _toggle_mute(self):
             self.call.set_mute(not self.call.muted)
-            self.mute_btn.configure(text="🔇" if self.call.muted else "🎤")
+            self.mic_btn.configure(icon="mic-off" if self.call.muted else "mic",
+                                   kind="danger_soft" if self.call.muted else "dark")
 
         def _toggle_cam(self):
             self.call.set_video(not self.call.video)
-            self.cam_btn.configure(text="📷" if self.call.video else "🚫")
+            self.cam_btn.configure(icon="video" if self.call.video else "video-off",
+                                   kind="dark" if self.call.video else "danger_soft")
+            if not self.call.video:
+                self.self_photo = None
+                self._stage_video() if self.call.peer_video or self.remote_photo else None
 
-        def _video_img(self, jpg, maxw, maxh):
+        def _toggle_spk(self):
+            self.call.speaker_off = not getattr(self.call, "speaker_off", False)
+            self.spk_btn.configure(icon="speaker-off" if self.call.speaker_off else "speaker",
+                                   kind="danger_soft" if self.call.speaker_off else "dark")
+
+        def _video_photo(self, jpg, w, h, r):
             im = Image.open(io.BytesIO(jpg))
             im.load()
             im = im.convert("RGB")
-            im.thumbnail((maxw, maxh))
-            return ImageTk.PhotoImage(im)
+            iw, ih = im.size
+            sc = max(w / iw, h / ih)
+            im = im.resize((max(1, int(iw * sc)), max(1, int(ih * sc))), Image.BILINEAR)
+            x0, y0 = (im.width - w) // 2, (im.height - h) // 2
+            return rounded_photo(im.crop((x0, y0, x0 + w, y0 + h)), r)
 
         def on_call(self, ev):
             k = ev.get("ev")
@@ -4500,95 +5243,98 @@ def run_gui():
                 self.note("✗ " + ev.get("text", ""), "danger")
                 return
             if k == "remote_video":
+                if st != "active":
+                    return
+                w = self.width - 24
                 if ev.get("jpg") is None:
                     self.remote_photo = None
-                    self.remote_lbl.configure(image="", text="🎧", height=4)
-                    return
-                try:
-                    w = max(160, self.width - 20)
-                    self.remote_photo = self._video_img(ev["jpg"], w, int(w * 0.75))
-                    self.remote_lbl.configure(image=self.remote_photo, text="", height=0)
-                except Exception:
-                    pass
+                else:
+                    try:
+                        self.remote_photo = self._video_photo(ev["jpg"], w, int(w * 0.75), 14)
+                    except Exception:
+                        return
+                self._stage_video()
                 return
             if k == "self_video":
                 if ev.get("jpg") is None:
-                    self.self_lbl.place_forget()
-                    return
-                try:
-                    self.self_photo = self._video_img(ev["jpg"], 96, 72)
-                    self.self_lbl.configure(image=self.self_photo)
-                    self.self_lbl.place(relx=1.0, x=-6, y=6, anchor="ne")
-                except Exception:
-                    pass
+                    self.self_photo = None
+                else:
+                    try:
+                        self.self_photo = self._video_photo(ev["jpg"], 84, 112, 10)
+                    except Exception:
+                        return
+                if st == "active" and (self.call.peer_video or self.remote_photo is not None or self.call.video):
+                    self._stage_video()
                 return
             if k == "call_incoming":
-                self.callbox.pack(fill="x", padx=8, pady=(6, 0), after=self.sub)
-                self.remote_lbl.configure(image="", text="📞", height=3)
-                self.call_info.configure(text=(tr("วีดีโอคอลเข้า…") if ev.get("video") else tr("สายเรียกเข้า…")))
-                self.answer_btn.pack(side="left", padx=3, before=self.hang_btn)
-                self.mute_btn.pack_forget()
-                self.cam_btn.pack_forget()
-                self._ring_notice(ev)
+                self.callbox.pack(fill="x", padx=12, pady=(0, 12), after=self._anchor())
+                video = ev.get("video")
+                self.c_title.configure(text=self.peer)
+                self.c_sub.configure(text=tr("วีดีโอคอลเข้า…") if video else tr("สายเรียกเข้า…"))
+                self._stage_avatar(tr("วีดีโอคอลเข้า…") if video else tr("สายเรียกเข้า…"))
+                self.accept_btn.configure(icon="video" if video else "phone")
+                self._ctrl_layout([self.decline_btn, self.accept_btn])
+                if video and media_available()[1]:
+                    self.audio_only.pack(pady=(0, 12))
+                if self.on_unread:
+                    self.on_unread(-1, ev)
+                try:
+                    self.frame.winfo_toplevel().bell()
+                except tk.TclError:
+                    pass
                 return
             # call_state
+            self.audio_only.pack_forget()
             if st == "idle":
                 self.callbox.pack_forget()
-                self.self_lbl.place_forget()
                 self.remote_photo = self.self_photo = None
-                self.mute_btn.configure(text="🎤")
+                self.mic_btn.configure(icon="mic", kind="dark")
+                self.cam_btn.configure(icon="video", kind="dark")
                 reason = ev.get("reason")
                 if ev.get("was") == "active":
                     d = int(ev.get("duration", 0))
-                    self.note("📞 " + tr("วางสายแล้ว · %d:%02d") % (d // 60, d % 60))
+                    self.note(tr("วางสายแล้ว · %d:%02d") % (d // 60, d % 60))
                 elif reason in ("declined", "busy", "nodev"):
-                    self.note("📞 " + {"declined": tr("อีกฝั่งไม่รับสาย"), "busy": tr("อีกฝั่งสายไม่ว่าง"),
-                                      "nodev": tr("อีกฝั่งไม่มีไมโครโฟน/ลำโพง")}[reason])
+                    self.note({"declined": tr("อีกฝั่งไม่รับสาย"), "busy": tr("อีกฝั่งสายไม่ว่าง"),
+                               "nodev": tr("อีกฝั่งไม่มีไมโครโฟน/ลำโพง")}[reason])
                 elif ev.get("was") in ("ringing", "calling"):
-                    self.note("📞 " + tr("ยกเลิกการโทร"))
-                self._close_ring()
+                    self.note(tr("ยกเลิกการโทร"))
                 return
-            self.callbox.pack(fill="x", padx=8, pady=(6, 0), after=self.sub)
+            self.callbox.pack(fill="x", padx=12, pady=(0, 12), after=self._anchor())
             if st == "calling":
-                self.remote_lbl.configure(image="", text="📞", height=3)
-                self.call_info.configure(text=tr("กำลังโทรหา %s …") % self.peer)
-                self.answer_btn.pack_forget()
-                self.mute_btn.pack_forget()
-                self.cam_btn.pack_forget()
+                self.c_sub.configure(text=tr("กำลังโทรหา %s …") % self.peer)
+                self._stage_avatar(tr("กำลังโทร…"))
+                self._ctrl_layout([self.hang_btn])
             elif st == "active":
-                self._close_ring()
-                self.answer_btn.pack_forget()
-                self.mute_btn.pack(side="left", padx=3, before=self.hang_btn)
+                ctrls = [self.mic_btn]
                 if media_available()[1]:
-                    self.cam_btn.pack(side="left", padx=3, before=self.hang_btn)
-                self.cam_btn.configure(text="📷" if self.call.video else "🚫")
-                if not self.call.peer_video and self.remote_photo is None:
-                    self.remote_lbl.configure(image="", text="🎧", height=4)
+                    ctrls.append(self.cam_btn)
+                    self.cam_btn.configure(icon="video" if self.call.video else "video-off",
+                                           kind="dark" if self.call.video else "danger_soft")
+                self._ctrl_layout(ctrls + [self.spk_btn, self.hang_btn])
+                if self.call.peer_video or self.call.video:
+                    self._stage_video()
+                else:
+                    self._stage_avatar(tr("กำลังคุย"))
 
-        def _ring_notice(self, ev):
-            """แจ้งสายเรียกเข้า — ส่งเสียงและเด้งหน้าต่างขึ้นมา"""
-            try:
-                top = self.frame.winfo_toplevel()
-                top.deiconify()
-                top.lift()
-                top.bell()
-            except Exception:
-                pass
-            if self.on_unread:
-                self.on_unread(-1)              # -1 = มีสายเรียกเข้า ให้เปิดแผงแชท
-
-        def _close_ring(self):
-            pass
+        def _anchor(self):
+            """วางพื้นที่โทรไว้ใต้ส่วนหัว/ปุ่มควบคุม"""
+            kids = [w for w in self.body.winfo_children() if w is not self.callbox]
+            return kids[1] if self.mode == "controller" and self.viewer is not None else kids[0]
 
         def _tick(self):
             try:
                 if self.call.state == "active" and self.call.started:
                     d = int(time.time() - self.call.started)
-                    self.call_info.configure(text="● %s  %d:%02d%s" % (
-                        tr("กำลังคุย"), d // 60, d % 60, "  ·  🔇" if self.call.muted else ""))
+                    self.c_sub.configure(text="%s · %d:%02d%s" % (
+                        tr("วีดีโอคอล") if (self.call.video or self.call.peer_video) else tr("โทรเสียง"),
+                        d // 60, d % 60, "  ·  " + tr("ปิดไมค์") if self.call.muted else ""))
+                if self.typing_row.winfo_ismapped() and time.time() > self.typing_until:
+                    self.typing_row.pack_forget()
                 self.frame.after(500, self._tick)
             except tk.TclError:
                 pass
+
 
     # ------------------------------------------------------------------
     FILE_KINDS = {
@@ -6013,18 +6759,95 @@ def run_gui():
         def _open_host_chat(self, chat, call, name):
             self._close_host_chat()
             w = T.track(tk.Toplevel(self.root), bg="card")
-            w.title("💬 %s — %s" % (name, APP))
+            w.title("%s — %s" % (name, APP))
             sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
-            ww, wh = max(320, sw // 6), min(640, sh - 120)
-            w.geometry("%dx%d+%d+%d" % (ww, wh, sw - ww - 20, 60))
+            ww, wh = max(340, sw // 7), min(720, sh - 140)
+            w.geometry("%dx%d+%d+%d" % (ww, wh, sw - ww - 24, 80))
+            w.minsize(320, 420)
             w.protocol("WM_DELETE_WINDOW", w.withdraw)
-            panel = ChatPanel(w, chat, call, name, width=ww)
+            panel = ChatPanel(w, chat, call, name, mode="host", width=ww, on_hide=w.withdraw,
+                              subtitle=tr("กำลังควบคุมเครื่องนี้"))
             panel.frame.pack(fill="both", expand=True)
-            panel.on_unread = lambda n: self.show_host_chat(True) if n else None
+            panel.on_unread = self._host_unread
             w.withdraw()
             self.host_chat = (w, panel)
+            self._show_control_banner(name)
             if self.banner_state[0] == "busy":
                 self.host_chat_btn.pack(side="left", padx=(10, 0))
+
+        def _host_unread(self, n, ev=None):
+            if n == -1 or n:
+                self.show_host_chat(True)              # ข้อความ/สายเข้า → เด้งหน้าต่างแชทขึ้นมา (นับว่าอ่านแล้ว)
+            else:
+                self._banner_count(0)
+
+        # ----- แถบแดงด้านบนจอ: "X กำลังควบคุมเครื่องนี้" -----
+        def _show_control_banner(self, name):
+            self._hide_control_banner()
+            if not env_bool("CONTROL_BANNER", True):
+                return
+            b = tk.Toplevel(self.root)
+            b.overrideredirect(True)
+            try:
+                b.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            RED = "#DC2626"
+            H = 44
+            f = T.f["smallbold"]
+            text = tr("%s กำลังควบคุมเครื่องนี้") % name
+            chat_w = max(84, f.measure(tr("แชท") + " (99)") + 46)
+            disc_w = f.measure(tr("ตัดการเชื่อมต่อ")) + 30
+            W = 22 + 12 + 8 + f.measure(text) + 16 + chat_w + 6 + disc_w + 6
+            c = tk.Canvas(b, width=W, height=H, highlightthickness=0, bd=0, bg=RED)
+            c.pack()
+            c.create_oval(18, H / 2 - 5, 28, H / 2 + 5, fill="#FFFFFF", outline="")
+            c.create_text(38, H / 2, text=text, anchor="w", fill="#FFFFFF", font=f)
+            x = 38 + f.measure(text) + 16
+            self.banner_chat = RoundButton(c, "chat", text=tr("แชท"), kind="dark", w=chat_w, h=32, r=16, bg=RED,
+                                           icon_px=15, command=lambda: self.show_host_chat(True))
+            KIND["banner_w"] = ("#FFFFFF", "#FDECEC", RED)
+            disc = RoundButton(c, None, text=tr("ตัดการเชื่อมต่อ"), kind="banner_w", w=disc_w, h=32, r=16, bg=RED,
+                               command=self.kick)
+            c.create_window(x, H / 2, window=self.banner_chat.cv, anchor="w")
+            c.create_window(x + chat_w + 6, H / 2, window=disc.cv, anchor="w")
+            sw = b.winfo_screenwidth()
+            b.geometry("%dx%d+%d+%d" % (W, H, (sw - W) // 2, 6))
+            # มุมมน: macOS ใช้พื้นโปร่งใส, Windows ใช้สีโปร่งใส
+            try:
+                if SYSTEM == "Darwin":
+                    b.attributes("-transparent", True)
+                    b.configure(bg="systemTransparent")
+                    c.configure(bg="systemTransparent")
+                    c.create_image(0, 0, anchor="nw", image=shape_img(W, H, H // 2, RED), tags="bg")
+                    c.tag_lower("bg")
+                elif SYSTEM == "Windows":
+                    KEY = "#FF00FE"
+                    b.configure(bg=KEY)
+                    b.attributes("-transparentcolor", KEY)
+                    c.configure(bg=KEY)
+                    c.create_image(0, 0, anchor="nw", image=shape_img(W, H, H // 2, RED), tags="bg")
+                    c.tag_lower("bg")
+            except tk.TclError:
+                pass
+            self.banner_chat.configure(bg=RED)
+            self.ctrl_banner = b
+
+        def _banner_count(self, n):
+            try:
+                if getattr(self, "ctrl_banner", None) is not None:
+                    self.banner_chat.configure(text=tr("แชท") + (" (%d)" % n if n else ""))
+            except tk.TclError:
+                pass
+
+        def _hide_control_banner(self):
+            b = getattr(self, "ctrl_banner", None)
+            self.ctrl_banner = None
+            if b is not None:
+                try:
+                    b.destroy()
+                except tk.TclError:
+                    pass
 
         def show_host_chat(self, show=True):
             if not self.host_chat:
@@ -6037,12 +6860,14 @@ def run_gui():
                     w.attributes("-topmost", True)
                     w.after(300, lambda: w.attributes("-topmost", False))
                     panel.seen()
+                    self._banner_count(0)
                 else:
                     w.withdraw()
             except tk.TclError:
                 pass
 
         def _close_host_chat(self):
+            self._hide_control_banner()
             if self.host_chat:
                 try:
                     self.host_chat[0].destroy()
@@ -6060,8 +6885,6 @@ def run_gui():
             except tk.TclError:
                 return
             panel.on_event(ev, visible)
-            if not ev.get("mine") and ev.get("ev") in ("msg", "file") and not visible:
-                self.show_host_chat(True)                # มีข้อความเข้า → เด้งหน้าต่างแชทขึ้นมา
 
         def _ask_threadsafe(self, ip, name):
             ev, box = threading.Event(), {}

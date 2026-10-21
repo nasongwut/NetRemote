@@ -52,7 +52,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 APP = "NetRemote"
-VERSION = "1.5.1"
+VERSION = "1.6"
 PROTO = 1
 DEFAULT_PORT = 5905
 SYSTEM = platform.system()

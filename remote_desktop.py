@@ -51,7 +51,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 APP = "NetRemote"
-VERSION = "1.3"
+VERSION = "1.4"
 PROTO = 1
 DEFAULT_PORT = 5905
 SYSTEM = platform.system()
@@ -450,7 +450,17 @@ _EN = {
 "เชื่อมต่อ Server ไม่ได้ — ตรวจสอบอินเทอร์เน็ต หรือติดต่อผู้ดูแลระบบ": "Cannot reach the Server — check your internet or contact your administrator",
 "พื้นที่ดิสก์เต็ม": "The disk is full",
 "เกิดข้อผิดพลาด — ลองใหม่อีกครั้ง": "Something went wrong — please try again",
-"เปิดไฟล์ติดตั้งให้แล้ว → ปิดโปรแกรมนี้ แล้วลาก NetRemote ไปไว้ใน Applications": "The installer has been opened → quit this program, then drag NetRemote into Applications"
+"เปิดไฟล์ติดตั้งให้แล้ว → ปิดโปรแกรมนี้ แล้วลาก NetRemote ไปไว้ใน Applications": "The installer has been opened → quit this program, then drag NetRemote into Applications",
+"⬆ มีเวอร์ชันใหม่ %s — กำลังดาวน์โหลดอัตโนมัติ…": "⬆ New version %s — downloading automatically…",
+"⬇  กำลังดาวน์โหลดอัปเดต %s": "⬇  Downloading update %s",
+"✓ เวอร์ชัน %s พร้อมติดตั้ง — จะติดตั้งให้เมื่อปิดโปรแกรม": "✓ Version %s is ready — it will be installed when you close the program",
+"↻  รีสตาร์ตและอัปเดตตอนนี้": "↻  Restart and update now",
+"↻  รีสตาร์ตเพื่ออัปเดตเป็น %s": "↻  Restart to update to %s",
+"⬆ ดาวน์โหลดเวอร์ชัน %s แล้ว — กดปุ่มด้านบนเพื่อรีสตาร์ต หรือจะติดตั้งให้เมื่อปิดโปรแกรม": "⬆ Version %s downloaded — click the button at the top to restart, or it will be installed when you close the program",
+"รีสตาร์ตโปรแกรมเพื่ออัปเดตเป็นเวอร์ชัน %s ตอนนี้?": "Restart the program now to update to version %s?",
+"การรีโมทที่เปิดอยู่จะถูกตัด": "Open remote sessions will be disconnected.",
+"ติดตั้งอัปเดตไม่สำเร็จ: %s": "Could not install the update: %s",
+"กำลังอัปเดตเป็นเวอร์ชัน %s …": "Updating to version %s …"
 }
 _TH = {v: k for k, v in _EN.items()}
 
@@ -2398,6 +2408,104 @@ def update_platform():
     return "windows" if SYSTEM == "Windows" else "linux"
 
 
+UPDATE_DIR = os.path.join(CONF_DIR, "updates")
+
+
+def install_target():
+    """โปรแกรมที่จะถูกแทนที่ตอนอัปเดตอัตโนมัติ — (ชนิด, path) หรือ (None, None) ถ้าติดตั้งเองไม่ได้"""
+    if getattr(sys, "frozen", False):
+        exe = os.path.abspath(sys.executable)
+        if SYSTEM == "Darwin" and ".app/Contents/MacOS" in exe:
+            return "mac-app", exe.split(".app/Contents/MacOS")[0] + ".app"
+        if SYSTEM == "Windows":
+            return "win-exe", exe
+        return None, None
+    return "source", os.path.abspath(__file__)
+
+
+def update_plat_for(info):
+    """แพลตฟอร์มของไฟล์ที่จะขอจาก Server — รันจาก source ใช้ไฟล์ .py ("source") ถ้ามี"""
+    kind, _t = install_target()
+    files = (info or {}).get("files") or {}
+    if kind == "source" and "source" in files:
+        return "source"
+    return update_platform()
+
+
+def can_auto_install(info):
+    kind, target = install_target()
+    plat = update_plat_for(info)
+    f = ((info or {}).get("files") or {}).get(plat)
+    if not kind or not f:
+        return False
+    name = f["name"].lower()
+    ok_ext = {"mac-app": (".dmg", ".zip"), "win-exe": (".exe",), "source": (".py",)}[kind]
+    if not name.endswith(ok_ext):
+        return False
+    return os.access(os.path.dirname(target) or ".", os.W_OK) and (not os.path.exists(target) or
+                                                                    os.access(target, os.W_OK))
+
+
+def launch_installer(pkg, relaunch=True):
+    """ติดตั้งไฟล์อัปเดตหลังโปรแกรมนี้ปิด (สคริปต์แยกรอจนโปรแกรมปิด แล้วแทนที่ไฟล์ + เปิดใหม่)"""
+    kind, target = install_target()
+    pid = os.getpid()
+    if kind == "source":
+        tmp = target + ".new"
+        shutil.copyfile(pkg, tmp)
+        os.replace(tmp, target)
+        if relaunch:
+            RESTART.append(True)
+        return True
+    if kind == "win-exe":
+        bat = os.path.join(UPDATE_DIR, "install_%d.bat" % pid)
+        with open(bat, "w", encoding="utf-8") as f:
+            f.write("@echo off\r\nchcp 65001 >nul\r\n"
+                    ":wait\r\n"
+                    'tasklist /FI "PID eq %d" /NH 2>nul | find " %d " >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n'
+                    "set n=0\r\n"
+                    ":copy\r\n"
+                    'copy /Y "%s" "%s" >nul && goto done\r\n'
+                    "set /a n+=1\r\n"
+                    "if %%n%% lss 15 (timeout /t 1 /nobreak >nul & goto copy)\r\n"
+                    "goto end\r\n"
+                    ":done\r\n"
+                    'del "%s" >nul 2>&1\r\n'
+                    "%s"
+                    ":end\r\n"
+                    'del "%%~f0"\r\n' % (pid, pid, pkg, target, pkg,
+                                         ('start "" "%s"\r\n' % target) if relaunch else ""))
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000 | 0x00000008, close_fds=True)
+        return True
+    if kind == "mac-app":
+        sh = os.path.join(UPDATE_DIR, "install_%d.sh" % pid)
+        q = lambda p: "'" + p.replace("'", "'\\''") + "'"
+        with open(sh, "w", encoding="utf-8") as f:
+            f.write("#!/bin/bash\n"
+                    "while kill -0 %d 2>/dev/null; do sleep 0.5; done\n"
+                    "PKG=%s; TARGET=%s; WORK=$(mktemp -d /tmp/netremote-update.XXXXXX)\n"
+                    'if [[ "$PKG" == *.dmg ]]; then\n'
+                    '  hdiutil attach -nobrowse -noverify -noautoopen -mountpoint "$WORK/mnt" "$PKG" >/dev/null || exit 1\n'
+                    '  SRC=$(ls -d "$WORK"/mnt/*.app | head -1)\n'
+                    "else\n"
+                    '  ditto -x -k "$PKG" "$WORK/zip" || exit 1\n'
+                    '  SRC=$(ls -d "$WORK"/zip/*.app "$WORK"/zip/*/*.app 2>/dev/null | head -1)\n'
+                    "fi\n"
+                    'if [ -n "$SRC" ] && ditto "$SRC" "$TARGET.new"; then\n'
+                    '  rm -rf "$TARGET.old"; mv "$TARGET" "$TARGET.old" && mv "$TARGET.new" "$TARGET" && rm -rf "$TARGET.old"\n'
+                    '  xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null\n'
+                    "fi\n"
+                    '[[ "$PKG" == *.dmg ]] && hdiutil detach "$WORK/mnt" -quiet\n'
+                    'rm -rf "$WORK" "$PKG"\n'
+                    "%s"
+                    'rm -f "$0"\n' % (pid, q(pkg), q(target), 'open "$TARGET"\n' if relaunch else ""))
+        os.chmod(sh, 0o700)
+        subprocess.Popen(["/bin/bash", sh], start_new_session=True, close_fds=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    return False
+
+
 def relay_update_info(addr, key):
     s = _relay_socket(addr)
     try:
@@ -3996,7 +4104,8 @@ def run_gui():
             self.relay_pill.pack(side="right")
             self.update_badge = tk.Label(hdr, text="", font=T.f["smallbold"], padx=12, pady=6, cursor="hand2",
                                          bg="#F59E0B", fg="#1F1300")
-            self.update_badge.bind("<Button-1>", lambda e: self.nb.select(2))
+            self.update_badge.bind("<Button-1>", lambda e: self.install_update() if self.update_ready
+                                   else self.nb.select(2))
             self.relay_pill.bind("<Button-1>", lambda e: self.nb.select(2))
 
         def switch_lang(self):
@@ -4420,6 +4529,8 @@ def run_gui():
             self.upd_progress = ttk.Progressbar(uc, mode="determinate", maximum=100)
             self.update_info = None
             self.upd_cancel = None
+            self.update_ready = None
+            self.upd_auto = False
 
             right = ttk.Frame(P)
             right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
@@ -4449,7 +4560,7 @@ def run_gui():
         # ----- อัปเดตโปรแกรม -----
         def _update_loop(self):
             self.check_updates(manual=False)
-            self.root.after(6 * 3600 * 1000, self._update_loop)
+            self.root.after(3600 * 1000, self._update_loop)              # ตรวจทุก 1 ชั่วโมง
 
         def check_updates(self, manual=False):
             addr, key = self._relay_conn()
@@ -4457,6 +4568,8 @@ def run_gui():
                 if manual:
                     self.upd_status.configure(text=tr("ยังไม่ได้ตั้งค่า Server"), fg=T.c("danger"))
                 return
+            if self.upd_cancel is not None or self.update_ready:
+                return                                                      # กำลังดาวน์โหลด / พร้อมติดตั้งแล้ว
             if manual:
                 self.upd_status.configure(text=tr("กำลังตรวจสอบ…"), fg=T.c("muted"))
 
@@ -4467,6 +4580,13 @@ def run_gui():
                     self.q.put(("update_info", e, manual))
             threading.Thread(target=work, daemon=True).start()
 
+        def _badge(self, text, color="#F59E0B", fg="#1F1300"):
+            if text:
+                self.update_badge.configure(text=text, bg=color, fg=fg)
+                self.update_badge.pack(side="right", padx=(0, 8))
+            else:
+                self.update_badge.pack_forget()
+
         def _on_update_info(self, info, manual):
             self.upd_btn.pack_forget()
             if isinstance(info, Exception):
@@ -4475,40 +4595,40 @@ def run_gui():
                 return
             self.update_info = info
             latest = info.get("version")
-            plat = update_platform()
-            if not latest:
-                self.upd_status.configure(text=tr("✓ ใช้เวอร์ชันล่าสุดอยู่แล้ว"), fg=T.c("ok"))
-                self.upd_notes.configure(text="")
-                self.update_badge.pack_forget()
-                return
-            if version_tuple(latest) <= version_tuple(VERSION):
+            if not latest or version_tuple(latest) <= version_tuple(VERSION):
                 self.upd_status.configure(text=tr("✓ ใช้เวอร์ชันล่าสุดอยู่แล้ว (%s)") % VERSION, fg=T.c("ok"))
                 self.upd_notes.configure(text="")
-                self.update_badge.pack_forget()
+                self._badge(None)
                 return
+            plat = update_plat_for(info)
             has_file = plat in (info.get("files") or {})
+            self.upd_notes.configure(text=info.get("notes") or "")
+            if has_file and can_auto_install(info):
+                self.upd_status.configure(text=tr("⬆ มีเวอร์ชันใหม่ %s — กำลังดาวน์โหลดอัตโนมัติ…") % latest,
+                                          fg=T.c("warn"))
+                self._badge(tr("⬇  กำลังดาวน์โหลดอัปเดต %s") % latest)
+                self.download_update(auto=True)
+                return
             self.upd_status.configure(text=tr("⬆ มีเวอร์ชันใหม่: %s  (ใช้อยู่ %s)") % (latest, VERSION), fg=T.c("warn"))
-            notes = info.get("notes") or ""
-            self.upd_notes.configure(text=notes)
             if has_file:
                 f = info["files"][plat]
-                self.upd_btn.configure(text=tr("⬇  ดาวน์โหลด %s (%s)") % (f["name"], fmt_size(f["size"])), state="normal")
+                self.upd_btn.configure(text=tr("⬇  ดาวน์โหลด %s (%s)") % (f["name"], fmt_size(f["size"])),
+                                       state="normal", command=self.download_update)
                 self.upd_btn.pack(anchor="w", padx=22, pady=(10, 18))
             elif info.get("url"):
-                self.upd_btn.configure(text=tr("🌐  เปิดหน้าดาวน์โหลด"), state="normal")
+                self.upd_btn.configure(text=tr("🌐  เปิดหน้าดาวน์โหลด"), state="normal", command=self.download_update)
                 self.upd_btn.pack(anchor="w", padx=22, pady=(10, 18))
             else:
-                self.upd_notes.configure(text=notes + ("\n" if notes else "") +
+                self.upd_notes.configure(text=(info.get("notes") or "") + ("\n" if info.get("notes") else "") +
                                          tr("(ยังไม่มีไฟล์สำหรับเครื่องนี้ — ติดต่อผู้ดูแลระบบ)"))
-            self.update_badge.configure(text=tr("⬆  มีอัปเดต %s") % latest)
-            self.update_badge.pack(side="right", padx=(0, 8))
+            self._badge(tr("⬆  มีอัปเดต %s") % latest)
             if not manual and getattr(self, "_notified_ver", None) != latest:
                 self._notified_ver = latest
                 self._log(tr("⬆ มีโปรแกรมเวอร์ชันใหม่ %s — ดูที่แท็บ \"ตั้งค่า Server\"") % latest)
 
-        def download_update(self):
+        def download_update(self, auto=False):
             info = self.update_info or {}
-            plat = update_platform()
+            plat = update_plat_for(info)
             f = (info.get("files") or {}).get(plat)
             if not f:
                 if info.get("url"):
@@ -4519,11 +4639,18 @@ def run_gui():
                 self.upd_cancel.set()
                 return
             addr, key = self._relay_conn()
-            dest = os.path.join(os.path.expanduser("~"), "Downloads")
+            self.upd_auto = auto
+            if auto:
+                dest = UPDATE_DIR
+                shutil.rmtree(dest, ignore_errors=True)
+            else:
+                dest = os.path.join(os.path.expanduser("~"), "Downloads")
             self.upd_cancel = threading.Event()
-            self.upd_btn.configure(text=tr("ยกเลิกการดาวน์โหลด"))
+            self.upd_btn.configure(text=tr("ยกเลิกการดาวน์โหลด"), command=self.download_update)
+            if not auto:
+                self.upd_btn.pack(anchor="w", padx=22, pady=(10, 0))
             self.upd_progress.configure(value=0)
-            self.upd_progress.pack(fill="x", padx=22, pady=(0, 18))
+            self.upd_progress.pack(fill="x", padx=22, pady=(8, 18))
 
             def prog(got, total):
                 self.q.put(("update_progress", got, total))
@@ -4539,12 +4666,25 @@ def run_gui():
         def _on_update_done(self, res):
             self.upd_cancel = None
             self.upd_progress.pack_forget()
+            self.upd_btn.pack_forget()
+            latest = (self.update_info or {}).get("version", "")
             if isinstance(res, Exception):
                 self.upd_status.configure(text=tr("✗ ดาวน์โหลดไม่สำเร็จ: %s") % err_text(res), fg=T.c("danger"))
-                self._on_update_info(self.update_info, True)
+                self._badge(tr("⬆  มีอัปเดต %s") % latest)
+                return
+            if self.upd_auto:
+                self.update_ready = res
+                self.upd_status.configure(text=tr("✓ เวอร์ชัน %s พร้อมติดตั้ง — จะติดตั้งให้เมื่อปิดโปรแกรม") % latest,
+                                          fg=T.c("ok"))
+                self.upd_btn.configure(text=tr("↻  รีสตาร์ตและอัปเดตตอนนี้"), state="normal",
+                                       command=self.install_update)
+                self.upd_btn.pack(anchor="w", padx=22, pady=(10, 18))
+                self._badge(tr("↻  รีสตาร์ตเพื่ออัปเดตเป็น %s") % latest, "#15803D", "#FFFFFF")
+                self._log(tr("⬆ ดาวน์โหลดเวอร์ชัน %s แล้ว — กดปุ่มด้านบนเพื่อรีสตาร์ต หรือจะติดตั้งให้เมื่อปิดโปรแกรม") % latest)
+                if env_str("AUTO_UPDATE", "").lower() in ("auto", "1", "true", "yes", "on"):
+                    self._auto_install_when_idle()
                 return
             self.upd_status.configure(text=tr("✓ ดาวน์โหลดเรียบร้อย: %s") % os.path.basename(res), fg=T.c("ok"))
-            self.upd_btn.pack_forget()
             if SYSTEM == "Darwin":
                 how = (tr("เปิดไฟล์ติดตั้งให้แล้ว → ปิดโปรแกรมนี้ แล้วลาก NetRemote ไปไว้ใน Applications")
                        if res.endswith(".dmg") else tr("ปิดโปรแกรมนี้ แล้วใช้ไฟล์ใหม่แทนตัวเดิม"))
@@ -4556,6 +4696,38 @@ def run_gui():
                 how = tr("ไฟล์อยู่ที่ %s") % res
                 open_path(os.path.dirname(res))
             messagebox.showinfo(APP, tr("ดาวน์โหลดเวอร์ชันใหม่เรียบร้อย\n\n%s") % how)
+
+        def _busy(self):
+            """มีการรีโมทอยู่หรือไม่ (ทั้งควบคุมเครื่องอื่น และถูกควบคุม)"""
+            return bool(self.viewers) or bool(self.server and self.server.is_alive() and self.server.session)
+
+        def _auto_install_when_idle(self):
+            """AUTO_UPDATE=auto — สำหรับเครื่องที่ไม่มีคนเฝ้า: ติดตั้งทันทีเมื่อไม่มีการรีโมท"""
+            if not self.update_ready:
+                return
+            if self._busy():
+                self.root.after(30000, self._auto_install_when_idle)
+                return
+            self.install_update(confirm=False)
+
+        def install_update(self, confirm=True):
+            if not self.update_ready:
+                return
+            latest = (self.update_info or {}).get("version", "")
+            if confirm:
+                msg = tr("รีสตาร์ตโปรแกรมเพื่ออัปเดตเป็นเวอร์ชัน %s ตอนนี้?") % latest
+                if self._busy():
+                    msg += "\n\n" + tr("การรีโมทที่เปิดอยู่จะถูกตัด")
+                if not messagebox.askyesno(APP, msg):
+                    return
+            try:
+                launch_installer(self.update_ready, relaunch=True)
+            except Exception as e:
+                messagebox.showerror(APP, tr("ติดตั้งอัปเดตไม่สำเร็จ: %s") % err_text(e))
+                return
+            self.update_ready = None
+            self._log(tr("กำลังอัปเดตเป็นเวอร์ชัน %s …") % latest)
+            self.quit(installing=True)
 
         def _confirm_fp_threadsafe(self, host, fp, name):
             """ตรวจ Certificate ของปลายทาง (เรียกจาก thread เชื่อมต่อ) — ครั้งแรกจดจำไว้ ถ้าเปลี่ยนจะถามผู้ใช้"""
@@ -4928,7 +5100,12 @@ def run_gui():
                 pass
             self.root.after(50, self._poll)
 
-        def quit(self):
+        def quit(self, installing=False):
+            if self.update_ready and not installing:          # ติดตั้งอัปเดตที่ดาวน์โหลดไว้ตอนปิดโปรแกรม
+                try:
+                    launch_installer(self.update_ready, relaunch=False)
+                except Exception:
+                    pass
             for v in list(self.viewers):
                 v.disconnect()
             if self.server:

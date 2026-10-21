@@ -35,7 +35,7 @@ import time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.5"
+VERSION = "1.6"
 ID_RE = re.compile(r"^\d{9}$")
 
 
@@ -82,6 +82,8 @@ EVENT_EN = [
     ("ผู้ดูแลบันทึกการตั้งค่า: %s", "Admin saved settings: %s"),
     ("ผู้ดูแลโหลดการตั้งค่าใหม่: %s", "Admin reloaded settings: %s"),
     ("ผู้ดูแลสั่งรีสตาร์ต Relay", "Admin restarted the Relay"),
+    ("ผู้ดูแลเผยแพร่อัปเดตโปรแกรมเวอร์ชัน %s", "Admin published app update %s"),
+    ("ผู้ดูแลหยุดแจกอัปเดตโปรแกรม", "Admin stopped offering app updates"),
 ]
 WHY_TH = {"unreachable": "สองเครื่องต่อหากันตรงไม่ได้ (Firewall/Router)",
           "host_old": "เครื่องปลายทางใช้โปรแกรมเวอร์ชันเก่า",
@@ -521,6 +523,93 @@ class Relay:
         return {"ok": True, "version": str(meta.get("version", "")), "notes": str(meta.get("notes", ""))[:4000],
                 "url": str(meta.get("url", "")), "files": files}
 
+    UPDATE_EXT = (".exe", ".dmg", ".zip", ".pkg", ".msi", ".py", ".bin", ".appimage")
+
+    def updates_view(self):
+        d = self.updates_dir
+        meta = {}
+        try:
+            with open(os.path.join(d, "latest.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+        files = []
+        if d and os.path.isdir(d):
+            for name in sorted(os.listdir(d)):
+                path = os.path.join(d, name)
+                if os.path.isfile(path) and name.lower().endswith(self.UPDATE_EXT):
+                    st = os.stat(path)
+                    files.append({"name": name, "size": st.st_size, "mtime": st.st_mtime})
+        with self.lock:
+            hosts = [{"id": hid, "name": hc.name, "app": hc.app} for hid, hc in self.hosts.items()]
+        return {"dir": d, "latest": {"version": str(meta.get("version", "") or ""), "notes": str(meta.get("notes", "")),
+                                     "url": str(meta.get("url", "")), "files": meta.get("files") or {}},
+                "published": bool(meta.get("version")), "files": files, "hosts": hosts}
+
+    def save_update_file(self, name, stream, length):
+        name = os.path.basename(str(name or "")).strip()
+        if not name or name.startswith(".") or not name.lower().endswith(self.UPDATE_EXT):
+            raise ValueError("ext")
+        if length <= 0 or length > 1024 ** 3:
+            raise ValueError("size")
+        os.makedirs(self.updates_dir, exist_ok=True)
+        path = os.path.join(self.updates_dir, name)
+        tmp = path + ".uploading"
+        got = 0
+        try:
+            with open(tmp, "wb") as f:
+                while got < length:
+                    chunk = stream.read(min(262144, length - got))
+                    if not chunk:
+                        raise ConnectionError("cut")
+                    f.write(chunk)
+                    got += len(chunk)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        self._sha_cache.pop(path, None)
+        return name
+
+    def publish_update(self, d):
+        version = str(d.get("version", "")).strip()
+        if not re.match(r"^\d+(\.\d+){0,3}$", version):
+            raise ValueError("version")
+        files = {}
+        for plat, name in (d.get("files") or {}).items():
+            name = os.path.basename(str(name or ""))
+            if not name:
+                continue
+            if plat not in ("windows", "mac-arm64", "mac-x86_64", "linux", "source"):
+                raise ValueError("plat")
+            if not os.path.isfile(os.path.join(self.updates_dir, name)):
+                raise ValueError("file")
+            files[plat] = name
+        meta = {"version": version, "notes": str(d.get("notes", ""))[:4000], "url": str(d.get("url", ""))[:500],
+                "files": files, "published": time.strftime("%Y-%m-%d %H:%M:%S")}
+        os.makedirs(self.updates_dir, exist_ok=True)
+        tmp = os.path.join(self.updates_dir, "latest.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, os.path.join(self.updates_dir, "latest.json"))
+        self.event("info", "ผู้ดูแลเผยแพร่อัปเดตโปรแกรมเวอร์ชัน %s" % version)
+
+    def unpublish_update(self):
+        try:
+            os.remove(os.path.join(self.updates_dir, "latest.json"))
+            self.event("warn", "ผู้ดูแลหยุดแจกอัปเดตโปรแกรม")
+        except OSError:
+            pass
+
+    def delete_update_file(self, name):
+        name = os.path.basename(str(name or ""))
+        if not name.lower().endswith(self.UPDATE_EXT):
+            raise ValueError("ext")
+        os.remove(os.path.join(self.updates_dir, name))
+
     def _send_update(self, conn, ip, plat):
         info = self.update_info()
         f = (info.get("files") or {}).get(plat)
@@ -763,6 +852,7 @@ font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:9;max-width
  <nav class="nav">
   <a href="#overview" data-p="overview"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>ภาพรวม</span></a>
   <a href="#monitor" data-p="monitor"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span>Server Monitor</span></a>
+  <a href="#updates" data-p="updates"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg><span>อัปเดตโปรแกรม</span><span class="badge" id="nav-upd" hidden></span></a>
   <a href="#settings" data-p="settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>ตั้งค่า Server</span><span class="badge" id="nav-pending" hidden>!</span></a>
  </nav>
  <div class="sp"></div>
@@ -824,6 +914,30 @@ font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:9;max-width
     <tbody id="t-disk"></tbody></table></div></div>
   </div>
   <div class="card"><h2>ข้อมูลเครื่อง Server</h2><div class="kv" id="sysinfo"></div></div>
+ </section>
+
+ <!-- =============== อัปเดตโปรแกรม =============== -->
+ <section class="page" id="p-updates">
+  <div class="grid">
+   <div>
+    <div class="card" style="margin-bottom:16px"><h2>เวอร์ชันที่แจกอยู่ตอนนี้</h2>
+     <div class="hint">โปรแกรม NetRemote ทุกเครื่องตรวจหาอัปเดตจาก Server ทุก 1 ชั่วโมง (และตอนเปิดโปรแกรม) แล้วดาวน์โหลด + ติดตั้งให้เอง</div>
+     <div id="u-current" style="padding:4px 18px 18px"></div></div>
+    <div class="card" style="margin-bottom:16px"><h2>เผยแพร่เวอร์ชันใหม่</h2>
+     <div class="hint">1) อัปโหลดไฟล์ที่ Build แล้ว (จาก GitHub Actions หรือ Build เอง)  2) ใส่เลขเวอร์ชัน  3) กดเผยแพร่</div>
+     <div class="field"><div class="flab"><b>เลขเวอร์ชัน</b><code>VERSION</code></div><div class="inp"><input id="u-ver" placeholder="1.4"></div>
+      <div class="fhelp">ต้องตรงกับ VERSION ใน remote_desktop.py ของไฟล์ที่ Build — ต้องมากกว่าเวอร์ชันที่เครื่องต่าง ๆ ใช้อยู่</div></div>
+     <div class="field"><div class="flab"><b>มีอะไรใหม่</b></div><div class="inp"><textarea id="u-notes" rows="3" style="width:100%;border:1.5px solid var(--border);border-radius:10px;background:var(--field);color:var(--text);font:inherit;padding:8px 12px;outline:none;resize:vertical" placeholder="• ..."></textarea></div></div>
+     <div id="u-plats"></div>
+     <div class="field" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn pri" id="u-publish">⬆ <span>เผยแพร่อัปเดต</span></button><span class="muted small" id="u-msg"></span></div>
+    </div>
+   </div>
+   <div>
+    <div class="card" style="margin-bottom:16px"><h2>เวอร์ชันของเครื่องที่ออนไลน์</h2><div class="tw"><table><thead><tr><th>ID</th><th>ชื่อเครื่อง</th><th>เวอร์ชัน</th><th>สถานะ</th></tr></thead><tbody id="u-hosts"></tbody></table></div></div>
+    <div class="card"><h2>ไฟล์ในโฟลเดอร์อัปเดต</h2><div class="hint mono" id="u-dir" style="font-weight:400;word-break:break-all"></div>
+     <div class="tw"><table><thead><tr><th>ไฟล์</th><th style="text-align:right">ขนาด</th><th>วันที่</th><th></th></tr></thead><tbody id="u-files"></tbody></table></div></div>
+   </div>
+  </div>
  </section>
 
  <!-- =============== ตั้งค่า Server =============== -->
@@ -889,6 +1003,20 @@ const EN={
 "รีสตาร์ต Relay ตอนนี้?\n\nเครื่องที่ออนไลน์จะหลุดชั่วครู่แล้วเชื่อมต่อกลับเอง การรีโมทที่ผ่าน Relay จะถูกตัด":"Restart the Relay now?\n\nOnline computers will drop briefly and reconnect by themselves. Remote sessions via the Relay will be ended.",
 "รอ Relay กลับมา…":"Waiting for the Relay…","หน้าเว็บย้ายไปพอร์ต":"The page moved to port","Relay กลับมาแล้ว":"Relay is back",
 "มีการแก้ไขที่ยังไม่บันทึก":"You have unsaved changes",
+"อัปเดตโปรแกรม":"App Updates","เวอร์ชันที่แจกอยู่ตอนนี้":"Currently published version",
+"โปรแกรม NetRemote ทุกเครื่องตรวจหาอัปเดตจาก Server ทุก 1 ชั่วโมง (และตอนเปิดโปรแกรม) แล้วดาวน์โหลด + ติดตั้งให้เอง":"Every NetRemote app checks the Server for updates every hour (and at startup), then downloads and installs them automatically",
+"เผยแพร่เวอร์ชันใหม่":"Publish a new version","1) อัปโหลดไฟล์ที่ Build แล้ว (จาก GitHub Actions หรือ Build เอง)  2) ใส่เลขเวอร์ชัน  3) กดเผยแพร่":"1) Upload the built files (from GitHub Actions or your own build)  2) Enter the version  3) Publish",
+"เลขเวอร์ชัน":"Version","ต้องตรงกับ VERSION ใน remote_desktop.py ของไฟล์ที่ Build — ต้องมากกว่าเวอร์ชันที่เครื่องต่าง ๆ ใช้อยู่":"Must match VERSION in remote_desktop.py of the build — and be higher than what computers run now",
+"มีอะไรใหม่":"What's new","เผยแพร่อัปเดต":"Publish update","เวอร์ชันของเครื่องที่ออนไลน์":"Versions of online computers",
+"ไฟล์ในโฟลเดอร์อัปเดต":"Files in the update folder","ไฟล์":"File","ขนาด":"Size","วันที่":"Date","หยุดแจกอัปเดต":"Stop offering",
+"ไม่พบไฟล์":"File missing","ไม่มี":"None","ยังไม่ได้แจกอัปเดต — เครื่องต่าง ๆ จะไม่ได้รับเวอร์ชันใหม่จนกว่าจะเผยแพร่":"Nothing published yet — computers won't get a new version until you publish one",
+"เวอร์ชันเก่ามาก":"Very old version","รออัปเดต":"Update pending","ล่าสุด":"Up to date","ลบ":"Delete","ยังไม่มีไฟล์ — อัปโหลดด้านซ้าย":"No files yet — upload on the left",
+"ไม่แจกสำหรับเครื่องแบบนี้":"not offered for this platform","อัปโหลด…":"Upload…","อัปโหลดแล้ว":"Uploaded","อัปโหลดไม่สำเร็จ":"Upload failed",
+"ชนิดไฟล์ไม่รองรับ":"file type not supported","ใส่เลขเวอร์ชัน เช่น 1.4":"Enter a version, e.g. 1.4","เลือกไฟล์อย่างน้อย 1 แบบ":"Choose at least one file",
+"เลขเวอร์ชันไม่มากกว่าเวอร์ชันที่แจกอยู่ — เครื่องที่อัปเดตไปแล้วจะไม่ได้รับไฟล์นี้ ต้องการเผยแพร่ต่อหรือไม่?":"This version is not higher than the published one — computers already updated won't get it. Publish anyway?",
+"เผยแพร่เวอร์ชัน":"Published version","แล้ว — เครื่องต่าง ๆ จะอัปเดตภายใน 1 ชั่วโมง หรือเมื่อเปิดโปรแกรมใหม่":"— computers will update within an hour or when the app restarts",
+"เผยแพร่ไม่สำเร็จ":"Publish failed","หยุดแจกอัปเดต? เครื่องต่าง ๆ จะไม่ได้รับเวอร์ชันนี้อีก (ไฟล์ยังอยู่)":"Stop offering this update? Computers won't receive it any more (files are kept)",
+"ลบไฟล์":"Delete file",
 "สองเครื่องต่อหากันตรงไม่ได้ (Firewall/Router)":"The two computers cannot reach each other (firewall/router)",
 "เครื่องปลายทางใช้โปรแกรมเวอร์ชันเก่า":"The remote computer runs an old version",
 "เครื่องปลายทางปิดการเชื่อมต่อตรง":"Direct connection is off on the remote computer",
@@ -917,13 +1045,13 @@ $("lang").textContent=LANG==="en"?"ไทย":"English";
 $("lang").onclick=()=>{if(dirty()&&!confirm(t("มีการแก้ไขที่ยังไม่บันทึก")))return;try{localStorage.setItem("nr_lang",LANG==="en"?"th":"en")}catch(_){}location.reload()};
 
 /* ---------- routing ---------- */
-const PAGES={overview:"ภาพรวม",monitor:"Server Monitor",settings:"ตั้งค่า Server"};
+const PAGES={overview:"ภาพรวม",monitor:"Server Monitor",updates:"อัปเดตโปรแกรม",settings:"ตั้งค่า Server"};
 let page="overview";
 function go(){page=(location.hash||"#overview").slice(1);if(!PAGES[page])page="overview";
  document.querySelectorAll(".page").forEach(p=>p.classList.toggle("on",p.id==="p-"+page));
  document.querySelectorAll(".nav a").forEach(a=>a.classList.toggle("on",a.dataset.p===page));
  $("ptitle").textContent=t(PAGES[page]);document.title=t(PAGES[page])+" · NetRemote Relay";
- if(page==="monitor")loadSys();if(page==="settings")loadSettings()}
+ if(page==="monitor")loadSys();if(page==="settings")loadSettings();if(page==="updates")loadUpd()}
 window.addEventListener("hashchange",go);
 
 /* ---------- overview ---------- */
@@ -1015,6 +1143,69 @@ async function loadSys(){
   `<span></span><span class="small muted">${info.psutil?t("ใช้ psutil"):t("ติดตั้ง psutil เพื่อข้อมูลที่แม่นยำขึ้น: pip install psutil")} · ${t("10 นาทีล่าสุด")}</span>`;
 }
 
+/* ---------- updates ---------- */
+const PLATS=[["windows","Windows","(.exe)"],["mac-arm64","macOS Apple Silicon","(.dmg)"],["mac-x86_64","macOS Intel","(.dmg)"],
+ ["source","Source (remote_desktop.py)","(.py)"]];
+let UPD=null;
+const vt=v=>String(v||"0").split(".").map(x=>parseInt(x)||0);
+const vcmp=(a,b)=>{a=vt(a);b=vt(b);for(let i=0;i<Math.max(a.length,b.length);i++){const d=(a[i]||0)-(b[i]||0);if(d)return d}return 0};
+const extOk=(k,n)=>{n=n.toLowerCase();return k==="windows"?n.endsWith(".exe"):k==="source"?n.endsWith(".py"):(n.endsWith(".dmg")||n.endsWith(".zip"))};
+async function loadUpd(keep){
+ let d;try{d=await api("api/updates")}catch(e){return}UPD=d;const L=d.latest||{},files=d.files||[];
+ const fmap=Object.fromEntries(files.map(f=>[f.name,f]));
+ $("u-current").innerHTML=d.published?`<div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap"><span style="font-size:30px;font-weight:800">v${esc(L.version)}</span>
+  <button class="kick" onclick="unpublish()">${t("หยุดแจกอัปเดต")}</button></div>
+  ${L.notes?`<div class="small" style="white-space:pre-wrap;margin:6px 0 10px">${esc(L.notes)}</div>`:""}
+  <table><tbody>${PLATS.map(([k,n])=>{const f=L.files&&L.files[k];const ok=f&&fmap[f];
+   return `<tr><td class="small"><b>${n}</b></td><td class="small mono">${f?esc(f):"–"}</td><td class="num small">${ok?fb(fmap[f].size):""}</td>
+   <td>${f?(ok?`<span class="pill p-ok">✓</span>`:`<span class="pill p-busy">${t("ไม่พบไฟล์")}</span>`):`<span class="pill p-mute">${t("ไม่มี")}</span>`}</td></tr>`}).join("")}</tbody></table>`
+  :`<div class="empty" style="padding:14px 0;text-align:left">${t("ยังไม่ได้แจกอัปเดต — เครื่องต่าง ๆ จะไม่ได้รับเวอร์ชันใหม่จนกว่าจะเผยแพร่")}</div>`;
+ const hosts=d.hosts||[];
+ $("u-hosts").innerHTML=hosts.length?hosts.map(h=>{const old=d.published&&h.app&&vcmp(h.app,L.version)<0,unk=!h.app;
+  return `<tr><td class="mono small">${fid(h.id)}</td><td><b>${esc(h.name||"-")}</b></td><td class="small">${esc(h.app||"?")}</td>
+  <td>${unk?`<span class="pill p-warn">${t("เวอร์ชันเก่ามาก")}</span>`:old?`<span class="pill p-warn">${t("รออัปเดต")}</span>`:`<span class="pill p-ok">${t("ล่าสุด")}</span>`}</td></tr>`}).join("")
+  :`<tr><td colspan="4" class="empty">${t("ยังไม่มีเครื่องออนไลน์")}</td></tr>`;
+ const pend=d.published?hosts.filter(h=>!h.app||vcmp(h.app,L.version)<0).length:0;
+ $("nav-upd").hidden=!pend;$("nav-upd").textContent=pend;
+ $("u-dir").textContent=d.dir||"";
+ $("u-files").innerHTML=files.length?files.map(f=>`<tr><td class="mono small">${esc(f.name)}</td><td class="num small">${fb(f.size)}</td>
+  <td class="small muted">${new Date(f.mtime*1000).toLocaleString(LOC,{hour12:false})}</td>
+  <td class="num"><button class="kick" data-name="${esc(f.name)}" onclick="delFile(this.dataset.name)">${t("ลบ")}</button></td></tr>`).join("")
+  :`<tr><td colspan="4" class="empty">${t("ยังไม่มีไฟล์ — อัปโหลดด้านซ้าย")}</td></tr>`;
+ if(keep)return;
+ const maxV=[L.version,...hosts.map(h=>h.app)].filter(Boolean).sort(vcmp).pop();
+ if(maxV){const v=vt(maxV);v[v.length-1]++;$("u-ver").placeholder=v.join(".")}
+ const cur={};document.querySelectorAll("#u-plats select").forEach(x=>cur[x.dataset.p]=x.value);
+ $("u-plats").innerHTML=PLATS.map(([k,n,ext])=>{const want=cur[k]!==undefined?cur[k]:(L.files||{})[k];
+  return `<div class="field"><div class="flab"><b>${n}</b><span class="muted small">${ext}</span></div>
+  <div style="display:flex;gap:8px;align-items:center"><div class="inp" style="flex:1"><select data-p="${k}"><option value="">— ${t("ไม่แจกสำหรับเครื่องแบบนี้")} —</option>
+  ${files.filter(f=>extOk(k,f.name)).map(f=>`<option ${want===f.name?"selected":""}>${esc(f.name)}</option>`).join("")}</select></div>
+  <label class="btn" style="white-space:nowrap">⬆ ${t("อัปโหลด…")}<input type="file" hidden data-p="${k}" onchange="upload(this)"></label></div>
+  <div class="bar" id="ub-${k}" style="margin-top:8px;display:none"><i style="width:0%"></i></div></div>`}).join("");
+}
+function upload(inp){
+ const f=inp.files[0];if(!f)return;const k=inp.dataset.p,bar=$("ub-"+k);bar.style.display="block";
+ const x=new XMLHttpRequest();x.open("POST","api/updates/upload?name="+encodeURIComponent(f.name));
+ x.upload.onprogress=e=>{if(e.lengthComputable)bar.firstElementChild.style.width=(100*e.loaded/e.total).toFixed(1)+"%"};
+ x.onload=async()=>{bar.style.display="none";let r={};try{r=JSON.parse(x.responseText)}catch(_){}
+  if(x.status===200&&r.ok){toast("✓ "+t("อัปโหลดแล้ว")+": "+r.name);
+   const cur={};document.querySelectorAll("#u-plats select").forEach(s=>cur[s.dataset.p]=s.value);
+   if(extOk(k,r.name))cur[k]=r.name;await loadUpd();
+   document.querySelectorAll("#u-plats select").forEach(s=>{if(cur[s.dataset.p]!==undefined)s.value=cur[s.dataset.p]})}
+  else toast("✗ "+t("อัปโหลดไม่สำเร็จ")+(r.err==="ext"?" — "+t("ชนิดไฟล์ไม่รองรับ"):""))};
+ x.onerror=()=>{bar.style.display="none";toast("✗ "+t("อัปโหลดไม่สำเร็จ"))};x.send(f)}
+$("u-publish").onclick=async()=>{
+ const ver=($("u-ver").value.trim()||"");const files={};document.querySelectorAll("#u-plats select").forEach(s=>{if(s.value)files[s.dataset.p]=s.value});
+ if(!/^\d+(\.\d+){0,3}$/.test(ver)){$("u-msg").textContent=t("ใส่เลขเวอร์ชัน เช่น 1.4");return}
+ if(!Object.keys(files).length){$("u-msg").textContent=t("เลือกไฟล์อย่างน้อย 1 แบบ");return}
+ if(UPD&&UPD.published&&vcmp(ver,UPD.latest.version)<=0&&!confirm(t("เลขเวอร์ชันไม่มากกว่าเวอร์ชันที่แจกอยู่ — เครื่องที่อัปเดตไปแล้วจะไม่ได้รับไฟล์นี้ ต้องการเผยแพร่ต่อหรือไม่?")))return;
+ const r=await api("api/updates/publish",{version:ver,notes:$("u-notes").value,files});
+ if(r.ok){toast("✓ "+t("เผยแพร่เวอร์ชัน")+" "+ver+" "+t("แล้ว — เครื่องต่าง ๆ จะอัปเดตภายใน 1 ชั่วโมง หรือเมื่อเปิดโปรแกรมใหม่"),6000);
+  $("u-ver").value="";$("u-notes").value="";$("u-msg").textContent="";loadUpd()}
+ else $("u-msg").textContent="✗ "+t("เผยแพร่ไม่สำเร็จ")+" ("+(r.err||"")+")"};
+async function unpublish(){if(!confirm(t("หยุดแจกอัปเดต? เครื่องต่าง ๆ จะไม่ได้รับเวอร์ชันนี้อีก (ไฟล์ยังอยู่)")))return;await api("api/updates/unpublish",{});loadUpd()}
+async function delFile(n){if(!confirm(t("ลบไฟล์")+" "+n+"?"))return;const r=await api("api/updates/delete",{name:n});if(!r.ok)toast("✗ "+(r.err||""));loadUpd()}
+
 /* ---------- settings ---------- */
 const FIELDS={
  RELAY_PORT:{g:0,label:"พอร์ต Relay",help:"พอร์ตที่โปรแกรม NetRemote เชื่อมต่อเข้ามา (ต้องเปิดใน Firewall)"},
@@ -1083,8 +1274,9 @@ $("b-restart").onclick=restart;$("b-restart2").onclick=restart;
 window.addEventListener("beforeunload",e=>{if(dirty()){e.preventDefault();e.returnValue=""}});
 
 go();load();setInterval(load,2000);setInterval(loadSys,2000);
-setInterval(()=>{if(page==="settings")loadSettings()},15000);
+setInterval(()=>{if(page==="settings")loadSettings();if(page==="updates")loadUpd(true)},15000);
 api("api/settings").then(d=>{$("nav-pending").hidden=!(d.pending&&d.pending.length)}).catch(()=>{});
+loadUpd(true);
 </script></body></html>"""
 
 
@@ -1759,6 +1951,8 @@ def make_handler(relay):
                 self._json(200, relay.sysmon.snapshot() if getattr(relay, "sysmon", None) else {})
             elif path == "/api/settings":
                 self._json(200, relay.settings_view())
+            elif path == "/api/updates":
+                self._json(200, relay.updates_view())
             else:
                 self._send(404, "not found", "text/plain")
 
@@ -1768,11 +1962,36 @@ def make_handler(relay):
             if not self._authed():
                 return self._json(401, {"ok": False, "err": "login"})
             path = self.path.split("?")[0]
+            if path == "/api/updates/upload":
+                from urllib.parse import parse_qs, urlparse
+                name = (parse_qs(urlparse(self.path).query).get("name") or [""])[0]
+                try:
+                    saved = relay.save_update_file(name, self.rfile, int(self.headers.get("Content-Length", 0)))
+                except ValueError as e:
+                    return self._json(400, {"ok": False, "err": str(e)})
+                except Exception as e:
+                    return self._json(500, {"ok": False, "err": str(e)})
+                return self._json(200, {"ok": True, "name": saved})
             try:
                 n = min(int(self.headers.get("Content-Length", 0)), 65536)
                 d = json.loads(self.rfile.read(n) or b"{}")
             except Exception:
                 d = {}
+            if path.startswith("/api/updates/"):
+                try:
+                    if path == "/api/updates/publish":
+                        relay.publish_update(d)
+                    elif path == "/api/updates/unpublish":
+                        relay.unpublish_update()
+                    elif path == "/api/updates/delete":
+                        relay.delete_update_file(d.get("name"))
+                    else:
+                        return self._send(404, "not found", "text/plain")
+                except ValueError as e:
+                    return self._json(400, {"ok": False, "err": str(e)})
+                except OSError as e:
+                    return self._json(500, {"ok": False, "err": str(e)})
+                return self._json(200, {"ok": True})
             if path == "/api/settings":
                 return self._save_settings(d)
             if path == "/api/reload":

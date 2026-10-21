@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NetRemote — โปรแกรม Remote Desktop (เชื่อมต่อผ่าน Relay Server เท่านั้น)
+NetRemote — โปรแกรม Remote Desktop (ค้นหาเครื่องผ่าน Relay Server · เชื่อมต่อตรงเมื่อทำได้)
 =====================================================================
 ดูหน้าจอ + ควบคุมเมาส์/คีย์บอร์ด + รับ-ส่งไฟล์ ของอีกเครื่องด้วย ID 9 หลัก
 - ตั้งค่า Relay ได้ในโปรแกรม หรือไฟล์ .env (RELAY_ADDR / RELAY_KEY) — ดู .env.example
@@ -50,7 +50,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 APP = "NetRemote"
-VERSION = "1.1"
+VERSION = "1.2"
 PROTO = 1
 DEFAULT_PORT = 5905
 SYSTEM = platform.system()
@@ -359,6 +359,13 @@ def get_local_ip():
         return "127.0.0.1"
     finally:
         s.close()
+
+
+def direct_port():
+    try:
+        return max(0, min(65535, int(env_str("DIRECT_PORT", "0") or 0)))
+    except ValueError:
+        return 0
 
 
 def get_local_ips():
@@ -863,7 +870,8 @@ class Server(threading.Thread):
         r = self.relay
         self.relay_thread = RelayHost(self, r["addr"], r.get("key", ""), r["id"], r["secret"], self.events)
         self.relay_thread.start()
-        self.log("เปิดรับการเชื่อมต่อผ่าน Relay %s — ID %s (ไม่เปิดพอร์ตบนเครื่องนี้)" % (r["addr"], fmt_id(r["id"])))
+        self.log("เปิดรับการเชื่อมต่อผ่าน Relay %s — ID %s (%s)" % (
+            r["addr"], fmt_id(r["id"]), "เชื่อมต่อตรงได้เมื่อ Relay อนุญาต" if r.get("direct", True) else "ผ่าน Relay เท่านั้น"))
         self.stop_event.wait()
         self.log("ปิดการรับการเชื่อมต่อแล้ว")
 
@@ -1673,16 +1681,68 @@ def _relay_socket(addr, timeout=10):
     return s
 
 
-def relay_dial(addr, key, host_id):
-    """เครื่องที่ควบคุม: ขอเชื่อมต่อไปยัง ID ผ่าน Relay — คืน socket ที่ต่อตรงถึงปลายทาง"""
+def _try_direct(cands, token, timeout=3.0):
+    """ลองเชื่อมต่อตรงไปยังเครื่องปลายทางทุกที่อยู่พร้อมกัน — คืน socket แรกที่ยืนยัน token สำเร็จ หรือ None"""
+    won, lock, done = {}, threading.Lock(), threading.Event()
+    left = [len(cands)]
+
+    def attempt(c):
+        sock = None
+        try:
+            h, p = parse_hostport(c, 0)
+            sock = socket.create_connection((h, p), timeout=min(2.0, timeout))
+            sock.settimeout(2.0)
+            line_send(sock, {"token": token})
+            if line_recv(sock, 1024).get("ok"):
+                with lock:
+                    if "s" not in won:
+                        won["s"], won["addr"] = sock, c
+                        sock = None
+                        done.set()
+        except Exception:
+            pass
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            with lock:
+                left[0] -= 1
+                if left[0] <= 0:
+                    done.set()
+    for c in cands:
+        threading.Thread(target=attempt, args=(c,), daemon=True).start()
+    if cands:
+        done.wait(timeout)
+    with lock:
+        s = won.pop("s", None)
+        won["s"] = None                                    # ที่ต่อสำเร็จช้ากว่านี้ จะถูกปิดทิ้ง
+    return s
+
+
+def relay_dial(addr, key, host_id, direct=True):
+    """เครื่องที่ควบคุม: ขอเชื่อมต่อไปยัง ID ผ่าน Relay
+    ถ้า direct=True จะลองเชื่อมต่อตรงก่อน (เร็วกว่า ไม่ใช้ Bandwidth ของ Server) ต่อไม่ได้จึงใช้ Relay
+    คืน (socket, route, presence) — route = "direct" / "relay", presence = ช่องที่เปิดค้างกับ Relay (หรือ None)"""
     s = _relay_socket(addr)
     try:
         s.settimeout(25)
-        line_send(s, {"role": "client", "id": host_id, "key": key or "", "v": 1})
+        line_send(s, {"role": "client", "id": host_id, "key": key or "", "v": 1, "direct": 1 if direct else 0})
         r = line_recv(s)
         if not r.get("ok"):
             raise ConnectionError(r.get("err") or "Relay ปฏิเสธการเชื่อมต่อ")
-        return s
+        if r.get("phase") == "direct":
+            ds = _try_direct([str(c) for c in r.get("cands") or []], str(r.get("token", "")))
+            if ds is not None:
+                line_send(s, {"use": "direct"})
+                ds.settimeout(None)
+                return ds, "direct", s
+            line_send(s, {"use": "relay"})
+            r = line_recv(s)
+            if not r.get("ok"):
+                raise ConnectionError(r.get("err") or "Relay ปฏิเสธการเชื่อมต่อ")
+        return s, "relay", None
     except Exception:
         s.close()
         raise
@@ -1810,6 +1870,12 @@ class RelayHost(threading.Thread):
         self.host_id, self.secret, self.events = host_id, secret, events
         self.stop_event = threading.Event()
         self.sock = None
+        self.send_lock = threading.Lock()
+        self.direct = {}                          # token -> listening socket ที่รอการเชื่อมต่อตรง
+
+    def _ctl(self, obj):
+        with self.send_lock:
+            line_send(self.sock, obj)
 
     def status(self, state, text):
         self.events.put(("relay", state, text))
@@ -1845,7 +1911,7 @@ class RelayHost(threading.Thread):
                 while not self.stop_event.is_set():
                     now = time.time()
                     if now - last_ping > 20:
-                        line_send(s, {"cmd": "ping"})
+                        self._ctl({"cmd": "ping"})
                         last_ping = now
                     if now - last_rx > 70:
                         raise ConnectionError("Relay ไม่ตอบสนอง")
@@ -1863,9 +1929,23 @@ class RelayHost(threading.Thread):
                             msg = json.loads(line.decode("utf-8"))
                         except ValueError:
                             continue
-                        if msg.get("cmd") == "connect":
-                            threading.Thread(target=self._data, args=(msg.get("token", ""), msg.get("from", "?")),
-                                             daemon=True).start()
+                        cmd = msg.get("cmd")
+                        tok, frm = str(msg.get("token", "")), msg.get("from", "?")
+                        if cmd == "connect":
+                            use_direct = msg.get("direct") and self.server.relay.get("direct", True)
+                            threading.Thread(target=self._direct if use_direct else self._data,
+                                             args=(tok, frm), daemon=True).start()
+                        elif cmd == "open":                 # ต่อตรงไม่สำเร็จ → ใช้ Relay
+                            ls = self.direct.pop(tok, None)
+                            if ls:
+                                try:
+                                    ls.close()
+                                except Exception:
+                                    pass
+                            threading.Thread(target=self._data, args=(tok, frm), daemon=True).start()
+                        elif cmd == "kick":
+                            self.server.log("ผู้ดูแล Server สั่งตัดการเชื่อมต่อ")
+                            self.server.kick()
             except Exception as e:
                 if not self.stop_event.is_set() and str(e):
                     self.status("error", "Relay: %s" % err_text(e))
@@ -1878,6 +1958,63 @@ class RelayHost(threading.Thread):
                 break
             backoff = min(backoff * 2, 60)
         self.status("off", "ปิดการเชื่อมต่อ Relay")
+
+    def _direct(self, token, from_ip):
+        """เปิดพอร์ตชั่วคราว (≤ 20 วินาที) ให้เครื่องที่ควบคุมเชื่อมต่อตรง — รับเฉพาะผู้ที่มี token จาก Relay"""
+        port = self.server.relay.get("direct_port", 0)
+        ls = None
+        for p in ([port, 0] if port else [0]):
+            try:
+                ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                ls.bind(("0.0.0.0", p))
+                ls.listen(8)
+                break
+            except OSError:
+                try:
+                    ls.close()
+                except Exception:
+                    pass
+                ls = None
+        if ls is None:
+            return self._data(token, from_ip)
+        real = ls.getsockname()[1]
+        self.direct[token] = ls
+        try:
+            self._ctl({"cmd": "cands", "token": token, "lan": ["%s:%d" % (ip, real) for ip in get_local_ips()],
+                       "port": real, "fixed": bool(port and real == port)})
+        except Exception:
+            self.direct.pop(token, None)
+            ls.close()
+            return
+        deadline = time.time() + 20
+        try:
+            while time.time() < deadline and self.direct.get(token) is ls:
+                ls.settimeout(max(0.2, deadline - time.time()))
+                try:
+                    conn, addr = ls.accept()
+                except (socket.timeout, OSError):
+                    continue
+                try:
+                    conn.settimeout(3)
+                    if hmac.compare_digest(str(line_recv(conn, 1024).get("token", "")), token):
+                        line_send(conn, {"ok": True})
+                        self.direct.pop(token, None)
+                        ls.close()
+                        conn.settimeout(None)
+                        self.server.log("เชื่อมต่อตรงกับ %s (ไม่ผ่าน Relay)" % addr[0])
+                        self.server._client(conn, ("%s · ต่อตรง" % addr[0], 0))
+                        return
+                except Exception:
+                    pass
+                conn.close()
+        finally:
+            if self.direct.get(token) is ls:
+                self.direct.pop(token, None)
+            try:
+                ls.close()
+            except Exception:
+                pass
 
     def _data(self, token, from_ip):
         try:
@@ -1897,12 +2034,20 @@ def client_connect(host, port, password, confirm_fp, relay=None):
     confirm_fp(host, fp) -> bool  ใช้ตรวจ Certificate ของปลายทาง"""
     if not relay or not relay.get("addr"):
         raise ConnectionError("ต้องตั้งค่า Relay Server ก่อน (เชื่อมต่อผ่าน Relay เท่านั้น)")
-    raw = relay_dial(relay["addr"], relay.get("key", ""), relay["id"])
+    raw, route, presence = relay_dial(relay["addr"], relay.get("key", ""), relay["id"], relay.get("direct", True))
     raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def drop_presence():
+        if presence is not None:
+            try:
+                presence.close()
+            except Exception:
+                pass
     try:
         tls = client_context().wrap_socket(raw)
     except Exception:
         raw.close()
+        drop_presence()
         raise ConnectionError("เชื่อมต่อแบบเข้ารหัสไม่ได้ — ปลายทางอาจไม่ใช่ NetRemote")
     try:
         fp = fingerprint(tls.getpeercert(binary_form=True))
@@ -1922,13 +2067,21 @@ def client_connect(host, port, password, confirm_fp, relay=None):
         if t != T_OK:
             raise ConnectionError("protocol")
         info = jload(p)
+        info["route"] = route
         tls.settimeout(None)
+        if presence is not None:
+            def hold():                             # ปิดช่องกับ Relay เมื่อจบเซสชัน (ใช้แสดงในหน้ามอนิเตอร์)
+                while tls.fileno() != -1:
+                    time.sleep(2)
+                drop_presence()
+            threading.Thread(target=hold, daemon=True).start()
         return tls, info, fp
     except Exception:
         try:
             tls.close()
         except Exception:
             pass
+        drop_presence()
         raise
 
 
@@ -2266,6 +2419,11 @@ def run_gui():
                        command=self.open_files).pack(side="right", padx=(0, 5))
             self.lat_lbl = lbl(inner, "Latency —", fg="muted", bg="subtle", font="smallbold", padx=10, pady=4)
             self.lat_lbl.pack(side="right", padx=(0, 12))
+            if info.get("route") == "direct":
+                lbl(inner, "⚡ ต่อตรง", fg="ok", bg="ok_bg", font="smallbold", padx=10, pady=4).pack(side="right", padx=(0, 6))
+            else:
+                lbl(inner, "☁ ผ่าน Server", fg="muted", bg="subtle", font="smallbold", padx=10, pady=4).pack(
+                    side="right", padx=(0, 6))
             self.rtt = self.rtt_avg = self.rtt_min = self.rtt_max = None
             self.last_pong = time.time()
             T.track(tk.Frame(win, height=1, bd=0), bg="border").pack(fill="x")
@@ -3473,13 +3631,13 @@ def run_gui():
             if not addr:
                 messagebox.showerror(APP, "ยังไม่ได้ตั้งค่า Server\nไปที่แท็บ \"ตั้งค่า Server\"")
                 return
-            relay = {"addr": addr, "key": key, "id": rid}
+            relay = {"addr": addr, "key": key, "id": rid, "direct": self._direct_on()}
             host = "ID " + fmt_id(rid)
             label = self._display_name(rid, host)
             remember = self.remember_var.get()
             self.cfg["remember_pw"] = remember
             self.conn_btn.configure(state="disabled")
-            self.cstatus.set("กำลังเชื่อมต่อ %s ผ่าน Relay … (ถ้าปลายทางตั้งให้ถามก่อน ต้องรอให้กดยอมรับ)" % label)
+            self.cstatus.set("กำลังเชื่อมต่อ %s … (ถ้าปลายทางตั้งให้ถามก่อน ต้องรอให้กดยอมรับ)" % label)
 
             def work():
                 try:
@@ -3611,8 +3769,8 @@ def run_gui():
             f = card(left)
             f.pack(fill="x")
             lbl(f, "ตั้งค่า Server", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
-            lbl(f, "ทุกการเชื่อมต่อผ่าน Server (Relay) เท่านั้น — ทั้งสองเครื่องเชื่อมต่อออกไปหา Server "
-                   "จึงไม่ต้องเปิดพอร์ตบนเครื่อง และข้อมูลยังเข้ารหัสจากต้นทางถึงปลายทาง (Server อ่านเนื้อหาไม่ได้)",
+            lbl(f, "ทุกการเชื่อมต่อเริ่มที่ Server (Relay) — ค้นหาเครื่องด้วย ID และยืนยันสิทธิ์ผ่าน Server "
+                   "ข้อมูลเข้ารหัสจากต้นทางถึงปลายทางเสมอ (Server อ่านเนื้อหาไม่ได้)",
                 fg="muted", font="small", wraplength=470).pack(anchor="w", padx=22, pady=(0, 14))
             locked = bool(env_str("RELAY_ADDR"))
             lbl(f, "ที่อยู่ Server", fg="muted", font="smallbold").pack(anchor="w", padx=22)
@@ -3639,7 +3797,17 @@ def run_gui():
             ttk.Button(row, text="ทดสอบการเชื่อมต่อ", command=self.test_relay).pack(side="left", padx=8)
             self.relay_test_var = tk.StringVar(value="")
             lbl(f, textvariable=self.relay_test_var, fg="muted", font="small", wraplength=470).pack(
-                anchor="w", padx=22, pady=(0, 16))
+                anchor="w", padx=22, pady=(0, 6))
+            self.direct_var = tk.BooleanVar(value=self._direct_on())
+            cb = ttk.Checkbutton(f, text="⚡  เชื่อมต่อตรงเมื่อทำได้ (แนะนำ)", variable=self.direct_var,
+                                 style="Card.TCheckbutton", command=self.toggle_direct)
+            cb.pack(anchor="w", padx=22)
+            if ENV.get("DIRECT_CONNECT", "").strip():
+                cb.configure(state="disabled")
+            lbl(f, "ถ้าสองเครื่องต่อหากันได้ (เช่นอยู่วง LAN เดียวกัน) ภาพและไฟล์จะวิ่งตรงระหว่างเครื่อง "
+                   "เร็วกว่าและไม่ใช้ Bandwidth ของ Server — ต่อไม่ได้จะใช้ Server ให้อัตโนมัติ "
+                   "(ยังต้องหา ID และยืนยันผ่าน Server ทุกครั้ง)",
+                fg="muted", font="small", wraplength=440).pack(anchor="w", padx=(48, 22), pady=(0, 16))
 
             uc = card(left)
             uc.pack(fill="both", expand=True, pady=(14, 0))
@@ -3860,8 +4028,19 @@ def run_gui():
         def _relay_cfg(self):
             addr, key = self._relay_conn()
             if addr:
-                return {"addr": addr, "key": key, "id": self.cfg["host_id"], "secret": self.cfg["host_secret"]}
+                return {"addr": addr, "key": key, "id": self.cfg["host_id"], "secret": self.cfg["host_secret"],
+                        "direct": self._direct_on(), "direct_port": direct_port()}
             return None
+
+        def _direct_on(self):
+            if ENV.get("DIRECT_CONNECT", "").strip():
+                return env_bool("DIRECT_CONNECT", True)
+            return self.cfg.get("direct", True)
+
+        def toggle_direct(self):
+            self.cfg["direct"] = bool(self.direct_var.get())
+            save_config(self.cfg)
+            self.restart_server()
 
         def _update_id_row(self, state=None, text=None):
             self.id_lbl.configure(text=fmt_id(self.cfg["host_id"]), fg=T.c("accent"))
@@ -4188,7 +4367,8 @@ def run_headless_server(args):
         cfg.update({"host_id": new_host_id(), "host_secret": secrets.token_hex(24)})
     save_config(cfg)
     q = queue.Queue()
-    relay = {"addr": addr, "key": key, "id": cfg["host_id"], "secret": cfg["host_secret"]}
+    relay = {"addr": addr, "key": key, "id": cfg["host_id"], "secret": cfg["host_secret"],
+             "direct": env_bool("DIRECT_CONNECT", True), "direct_port": direct_port()}
     srv = Server(0, pw, q, None, not args.view_only, not args.no_files, relay=relay)
     print("%s %s — เปิดรับการเชื่อมต่อผ่าน Relay" % (APP, VERSION))
     print("  ID       : %s" % fmt_id(relay["id"]))

@@ -32,7 +32,7 @@ import time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3"
+VERSION = "1.4"
 ID_RE = re.compile(r"^\d{9}$")
 
 
@@ -216,6 +216,12 @@ class Relay:
                 m = line_recv(conn)
                 if m.get("cmd") == "ping":
                     hc.send({"cmd": "pong"})
+                elif m.get("cmd") == "cands":
+                    with self.lock:
+                        pend = self.pending.get(str(m.get("token", "")))
+                    if pend is not None and pend["cands"] is None:
+                        pend["cands"] = m
+                        pend["ev"].set()
         except Exception:
             pass
         finally:
@@ -241,25 +247,71 @@ class Relay:
             self.event("warn", "%s ขอเชื่อมต่อ ID %s แต่เครื่องไม่ออนไลน์" % (ip, hid))
             return False
         token = secrets.token_hex(16)
-        pend = {"ev": threading.Event(), "sock": None}
+        want_direct = bool(msg.get("direct"))
+        pend = {"ev": threading.Event(), "sock": None, "cands": None}
         with self.lock:
             self.pending[token] = pend
         try:
-            hc.send({"cmd": "connect", "token": token, "from": ip})
+            hc.send({"cmd": "connect", "token": token, "from": ip, "direct": 1 if want_direct else 0})
+            pend["ev"].wait(15)
+            c = pend["cands"]
+            if pend["sock"] is None and c is not None:
+                # ① ลองเชื่อมต่อตรงก่อน — ส่งรายการที่อยู่ของเครื่องปลายทางให้ Client ลอง
+                cands = [str(x) for x in (c.get("lan") or [])][:8]
+                if c.get("fixed") and c.get("port"):
+                    pub = "%s:%d" % (hc.ip, int(c["port"]))
+                    if pub not in cands:
+                        cands.append(pub)
+                line_send(conn, {"ok": True, "phase": "direct", "cands": cands, "token": token})
+                conn.settimeout(30)
+                r = line_recv(conn)
+                if r.get("use") == "direct":
+                    with self.lock:
+                        self.pending.pop(token, None)
+                    self._direct_session(conn, ip, hid, hc)
+                    return False
+                # ② ต่อตรงไม่ได้ → ใช้ Relay
+                pend["ev"].clear()
+                hc.send({"cmd": "open", "token": token})
+                pend["ev"].wait(15)
         except Exception:
             with self.lock:
                 self.pending.pop(token, None)
-            line_send(conn, {"ok": False, "err": "เครื่องปลายทางไม่ตอบสนอง"})
+            try:
+                line_send(conn, {"ok": False, "err": "เครื่องปลายทางไม่ตอบสนอง"})
+            except Exception:
+                pass
             return False
-        ok = pend["ev"].wait(15)
         with self.lock:
             self.pending.pop(token, None)
-        if not ok or pend["sock"] is None:
+        if pend["sock"] is None:
             line_send(conn, {"ok": False, "err": "เครื่องปลายทางไม่ตอบสนอง"})
             return False
-        line_send(conn, {"ok": True})
+        line_send(conn, {"ok": True, "route": "relay"})
         threading.Thread(target=self._pipe, args=(conn, pend["sock"], ip, hid, hc), daemon=True).start()
         return True
+
+    def _direct_session(self, conn, ip, hid, hc):
+        """สองเครื่องเชื่อมต่อกันตรงแล้ว — ข้อมูลไม่ผ่าน Relay; Client เปิดช่องนี้ค้างไว้เพื่อแสดงในหน้ามอนิเตอร์"""
+        sid = secrets.token_hex(6)
+        sess = {"sid": sid, "client": ip, "hid": hid, "hname": hc.name, "hip": hc.ip, "mode": "direct",
+                "start": time.time(), "up": 0, "down": 0, "socks": (conn,), "hc": hc}
+        with self.lock:
+            self.sessions[sid] = sess
+            self.stats["sessions_total"] += 1
+            self.stats["direct_total"] = self.stats.get("direct_total", 0) + 1
+        self.event("connect", "%s เริ่มควบคุมเครื่อง %s (ID %s) — เชื่อมต่อตรง ไม่ผ่าน Relay" % (ip, hc.name or "-", hid))
+        conn.settimeout(None)
+        try:
+            while conn.recv(1024):
+                pass
+        except OSError:
+            pass
+        with self.lock:
+            self.sessions.pop(sid, None)
+            self.samples.pop(sid, None)
+        self.event("disconnect", "%s เลิกควบคุมเครื่อง %s (ID %s) — เชื่อมต่อตรง, %s" % (
+            ip, hc.name or "-", hid, fmt_dur(time.time() - sess["start"])))
 
     def _data(self, conn, msg):
         with self.lock:
@@ -272,7 +324,7 @@ class Relay:
 
     def _pipe(self, a, b, ip, hid, hc):
         sid = secrets.token_hex(6)
-        sess = {"sid": sid, "client": ip, "hid": hid, "hname": hc.name, "hip": hc.ip,
+        sess = {"sid": sid, "client": ip, "hid": hid, "hname": hc.name, "hip": hc.ip, "mode": "relay",
                 "start": time.time(), "up": 0, "down": 0, "socks": (a, b)}
         with self.lock:
             self.sessions[sid] = sess
@@ -373,7 +425,7 @@ class Relay:
             self.samples[s["sid"]] = (now, s["up"], s["down"])
             out_s.append({"sid": s["sid"], "client": s["client"], "hid": s["hid"], "hname": s["hname"],
                           "hip": s["hip"], "dur": now - s["start"], "up": s["up"], "down": s["down"],
-                          "rate_up": ru, "rate_down": rd})
+                          "rate_up": ru, "rate_down": rd, "mode": s.get("mode", "relay")})
         out_s.sort(key=lambda x: -x["dur"])
         out_h = [{"id": hid, "name": hc.name, "ip": hc.ip, "online": now - hc.since, "sessions": busy[hid],
                   "app": hc.app}
@@ -394,6 +446,11 @@ class Relay:
             s = self.sessions.get(sid)
         if not s:
             return False
+        if s.get("mode") == "direct":
+            try:
+                s["hc"].send({"cmd": "kick"})          # ข้อมูลไม่ผ่าน Relay → สั่งเครื่องปลายทางตัดเอง
+            except Exception:
+                pass
         for sock in s["socks"]:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -531,8 +588,10 @@ async function load(){
   $("t-sess").innerHTML=d.sessions.length?d.sessions.map(s=>`<tr>
    <td class="mono">${esc(s.client)}</td><td class="arrow">→</td>
    <td><b>${esc(s.hname||"-")}</b><div class="small muted mono" style="white-space:nowrap">ID ${fid(s.hid)}</div></td>
-   <td class="num">${fd(s.dur)}</td><td class="num">${fb(s.up+s.down)}</td>
-   <td class="num">${fb(s.rate_up+s.rate_down)}/s<div class="small muted">↑${fb(s.rate_up)} ↓${fb(s.rate_down)}</div></td>
+   <td class="num">${fd(s.dur)}</td>${s.mode==="direct"
+     ?`<td class="num" colspan="2"><span class="pill p-ok" title="สองเครื่องเชื่อมต่อกันตรง ข้อมูลไม่ผ่าน Relay">⚡ เชื่อมต่อตรง</span></td>`
+     :`<td class="num">${fb(s.up+s.down)}<div class="small muted">ผ่าน Relay</div></td>
+   <td class="num">${fb(s.rate_up+s.rate_down)}/s<div class="small muted">↑${fb(s.rate_up)} ↓${fb(s.rate_down)}</div></td>`}
    <td class="num"><button onclick="kick('sid','${s.sid}')">ตัดการเชื่อมต่อ</button></td></tr>`).join("")
    :`<tr><td colspan="7" class="empty">ยังไม่มีใครเชื่อมต่อ</td></tr>`;
   $("t-hosts").innerHTML=d.hosts.length?d.hosts.map(h=>`<tr>

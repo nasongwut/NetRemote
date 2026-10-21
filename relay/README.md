@@ -107,6 +107,7 @@ Relay อ่านไฟล์ `.env` ที่อยู่โฟลเดอร
 | `RELAY_WEB_PORT` | `5911` | พอร์ตหน้ามอนิเตอร์ (`0` = ปิด) |
 | `RELAY_WEB_BIND` | `127.0.0.1` | `127.0.0.1` = ดูได้จากเครื่อง Relay เท่านั้น, `0.0.0.0` = เปิดให้เครื่องอื่น |
 | `RELAY_ADMIN_KEY` | (= `RELAY_KEY`) | รหัสเข้าหน้ามอนิเตอร์ |
+| `RELAY_UPDATES_DIR` | `updates/` | โฟลเดอร์ไฟล์อัปเดตโปรแกรม (ดูหัวข้อ 8) |
 
 ลำดับความสำคัญ: **ตัวเลือกคำสั่ง (`--key`)** > **ตัวแปร environment** > **ไฟล์ `.env`** > ค่าเริ่มต้น
 
@@ -145,7 +146,7 @@ python3 relay_server.py
 ### บน VPS (Ubuntu / Debian) — แนะนำสำหรับใช้งานจริง
 ```bash
 sudo mkdir -p /opt/netremote-relay
-sudo cp relay_server.py .env /opt/netremote-relay/
+sudo cp -r relay_server.py .env updates /opt/netremote-relay/
 sudo chmod 600 /opt/netremote-relay/.env
 sudo cp netremote-relay.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -158,7 +159,38 @@ Bandwidth: รีโมทปกติ ~0.2–3 Mbps ต่อเซสชัน
 
 ---
 
-## 8. แก้ปัญหา
+## 8. แจกอัปเดตโปรแกรม NetRemote
+
+Relay ทำหน้าที่เป็นเซิร์ฟเวอร์อัปเดตด้วย — โปรแกรม NetRemote จะถาม Relay ว่ามีเวอร์ชันใหม่หรือไม่
+**ตอนเปิดโปรแกรม และทุก 6 ชั่วโมง** (หรือกด "ตรวจสอบอัปเดต" ในแท็บ "ตั้งค่า Server")
+ถ้ามี จะขึ้นป้าย **⬆ มีอัปเดต x.y** มุมบน → กด "ดาวน์โหลด" → ไฟล์ลง `Downloads` พร้อมตรวจ SHA-256
+(Mac เปิดไฟล์ .dmg ให้ลากลง Applications · Windows เปิดโฟลเดอร์ที่มีไฟล์ .exe)
+
+ขั้นตอนปล่อยเวอร์ชันใหม่:
+1. แก้ `VERSION = "x.y"` บรรทัดบนของ `remote_desktop.py` → Build (หรือ push ให้ GitHub Actions Build)
+2. คัดลอกไฟล์ที่ Build แล้วไปไว้ใน `relay/updates/` บนเครื่อง Relay เช่น
+   `NetRemote-macOS-arm64.dmg`, `NetRemote.exe`
+3. สร้าง `relay/updates/latest.json` (คัดลอกจาก `latest.json.example`):
+```json
+{
+  "version": "1.2",
+  "notes": "• แก้ไข ...\n• เพิ่ม ...",
+  "files": {
+    "mac-arm64":  "NetRemote-macOS-arm64.dmg",
+    "mac-x86_64": "NetRemote-macOS-x86_64.dmg",
+    "windows":    "NetRemote.exe"
+  }
+}
+```
+   ไม่ต้องรีสตาร์ต Relay — อ่านไฟล์ใหม่ทุกครั้งที่มีการถาม (SHA-256 คำนวณให้อัตโนมัติ)
+   แพลตฟอร์มที่ไม่มีไฟล์ จะแจ้งแค่ว่ามีเวอร์ชันใหม่ + ลิงก์ `url` (ถ้าใส่ไว้)
+
+ตรวจสอบได้ที่หน้ามอนิเตอร์: หัวหน้าแสดง "เวอร์ชันล่าสุด" และคอลัมน์ **เวอร์ชัน** ของแต่ละเครื่อง
+มีป้าย **ต้องอัปเดต** ถ้ายังใช้เวอร์ชันเก่า · การดาวน์โหลดใช้ `RELAY_KEY` เดียวกัน คนนอกโหลดไม่ได้
+
+---
+
+## 9. แก้ปัญหา
 
 | อาการ (ในโปรแกรม NetRemote) | สาเหตุ / วิธีแก้ |
 |---|---|
@@ -166,6 +198,8 @@ Bandwidth: รีโมทปกติ ~0.2–3 Mbps ต่อเซสชัน
 | … — timed out | Firewall ปิดพอร์ต 5910 (ทั้งใน VPS และของผู้ให้บริการ) |
 | … — Name or service not known | `RELAY_ADDR` พิมพ์ชื่อโดเมนผิด |
 | "Relay Key ไม่ถูกต้อง" | `RELAY_KEY` ในโปรแกรม ≠ ใน `relay/.env` |
-| "ไม่พบเครื่อง ID … " | เครื่องปลายทางยังไม่ได้กด "เริ่มเปิดรับ" หรือออฟไลน์ |
+| "ไม่พบเครื่อง ID … " | เครื่องปลายทางไม่ได้เปิดโปรแกรม NetRemote หรือออฟไลน์ |
 | "ID นี้ถูกใช้โดยเครื่องอื่นแล้ว" | กด "สร้าง ID ใหม่" ในโปรแกรม (หรือลบ ID นั้นใน `relay_ids.json` แล้วรีสตาร์ต Relay) |
 | "เครื่องปลายทางไม่ตอบสนอง" | Host หลุดจาก Relay ชั่วคราว รอสักครู่แล้วลองใหม่ |
+| ไม่ขึ้นแจ้งเตือนอัปเดต | `version` ใน `latest.json` ต้องมากกว่า `VERSION` ของโปรแกรม · JSON ต้องถูกต้อง (ดู log Relay) |
+| "ไฟล์เสียระหว่างดาวน์โหลด" | ไฟล์ใน `updates/` ถูกแก้ระหว่างโหลด → ลองใหม่ |

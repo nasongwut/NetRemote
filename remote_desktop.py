@@ -50,7 +50,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 APP = "NetRemote"
-VERSION = "1.0"
+VERSION = "1.1"
 PROTO = 1
 DEFAULT_PORT = 5905
 SYSTEM = platform.system()
@@ -192,6 +192,140 @@ def log_error(e):
                                      "".join(traceback.format_exception(type(e), e, e.__traceback__))))
     except Exception:
         pass
+
+
+# ----------------------------------------------------------------------------
+# เก็บรหัสผ่านที่ "จดจำ" ไว้อย่างปลอดภัย: macOS Keychain / Windows Credential Manager
+# (ระบบอื่นหรือถ้าใช้ไม่ได้ → ไฟล์ ~/.netremote/secrets.json ที่อ่านได้เฉพาะผู้ใช้นี้)
+# ----------------------------------------------------------------------------
+SECRET_SERVICE = "NetRemote"
+SECRET_STORE_NAME = {"Darwin": "Keychain ของ macOS", "Windows": "Windows Credential Manager"}.get(
+    SYSTEM, "ไฟล์ ~/.netremote (อ่านได้เฉพาะผู้ใช้นี้)")
+_SECRET_IDX = os.path.join(CONF_DIR, "saved_ids.json")
+_SECRET_FILE = os.path.join(CONF_DIR, "secrets.json")
+_secret_ids = None
+
+
+def _json_load(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _json_save(path, data):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _ids():
+    global _secret_ids
+    if _secret_ids is None:
+        _secret_ids = set(_json_load(_SECRET_IDX, []))
+    return _secret_ids
+
+
+def _win_cred(op, target, secret=None):
+    import ctypes
+    from ctypes import wintypes as wt
+
+    class CRED(ctypes.Structure):
+        _fields_ = [("Flags", wt.DWORD), ("Type", wt.DWORD), ("TargetName", wt.LPWSTR), ("Comment", wt.LPWSTR),
+                    ("LastWritten", wt.FILETIME), ("CredentialBlobSize", wt.DWORD),
+                    ("CredentialBlob", ctypes.POINTER(ctypes.c_char)), ("Persist", wt.DWORD),
+                    ("AttributeCount", wt.DWORD), ("Attributes", ctypes.c_void_p), ("TargetAlias", wt.LPWSTR),
+                    ("UserName", wt.LPWSTR)]
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    if op == "set":
+        blob = secret.encode("utf-16-le")
+        buf = ctypes.create_string_buffer(blob, len(blob))
+        c = CRED()
+        c.Type, c.TargetName, c.UserName, c.Persist = 1, target, target, 2
+        c.CredentialBlobSize = len(blob)
+        c.CredentialBlob = ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))
+        return bool(adv.CredWriteW(ctypes.byref(c), 0))
+    if op == "get":
+        pc = ctypes.POINTER(CRED)()
+        if not adv.CredReadW(target, 1, 0, ctypes.byref(pc)):
+            return None
+        try:
+            c = pc.contents
+            return ctypes.string_at(c.CredentialBlob, c.CredentialBlobSize).decode("utf-16-le")
+        finally:
+            adv.CredFree(pc)
+    return bool(adv.CredDeleteW(target, 1, 0))
+
+
+def secret_has(rid):
+    return bool(rid) and rid in _ids()
+
+
+def secret_set(rid, pw):
+    if not rid or not pw:
+        return
+    ok = False
+    try:
+        if SYSTEM == "Darwin":
+            r = subprocess.run(["security", "add-generic-password", "-a", rid, "-s", SECRET_SERVICE,
+                                "-l", "NetRemote %s" % rid, "-w", pw, "-U"], capture_output=True, timeout=10)
+            ok = r.returncode == 0
+        elif SYSTEM == "Windows":
+            ok = _win_cred("set", "NetRemote:" + rid, pw)
+    except Exception:
+        ok = False
+    if not ok:
+        data = _json_load(_SECRET_FILE, {})
+        data[rid] = base64.b64encode(pw.encode("utf-8")).decode()
+        _json_save(_SECRET_FILE, data)
+    _ids().add(rid)
+    _json_save(_SECRET_IDX, sorted(_ids()))
+
+
+def secret_get(rid):
+    if not secret_has(rid):
+        return ""
+    try:
+        if SYSTEM == "Darwin":
+            r = subprocess.run(["security", "find-generic-password", "-a", rid, "-s", SECRET_SERVICE, "-w"],
+                               capture_output=True, timeout=10)
+            if r.returncode == 0:
+                return r.stdout.decode("utf-8").rstrip("\n")
+        elif SYSTEM == "Windows":
+            v = _win_cred("get", "NetRemote:" + rid)
+            if v:
+                return v
+    except Exception:
+        pass
+    v = _json_load(_SECRET_FILE, {}).get(rid)
+    return base64.b64decode(v).decode("utf-8") if v else ""
+
+
+def secret_del(rid):
+    if not rid:
+        return
+    try:
+        if SYSTEM == "Darwin":
+            subprocess.run(["security", "delete-generic-password", "-a", rid, "-s", SECRET_SERVICE],
+                           capture_output=True, timeout=10)
+        elif SYSTEM == "Windows":
+            _win_cred("del", "NetRemote:" + rid)
+    except Exception:
+        pass
+    data = _json_load(_SECRET_FILE, {})
+    if rid in data:
+        del data[rid]
+        _json_save(_SECRET_FILE, data)
+    if rid in _ids():
+        _ids().discard(rid)
+        _json_save(_SECRET_IDX, sorted(_ids()))
 
 
 def gen_password():
@@ -724,8 +858,7 @@ class Server(threading.Thread):
     def run(self):
         # รับการเชื่อมต่อผ่าน Relay เท่านั้น — ไม่เปิดพอร์ตใด ๆ บนเครื่องนี้
         if not self.relay or not self.relay.get("addr"):
-            self.events.put(("server_err", "ยังไม่ได้ตั้งค่า Relay Server\n\nตั้งค่าที่แท็บ \"การเชื่อมต่อ (Relay)\" "
-                                           "หรือในไฟล์ .env (RELAY_ADDR / RELAY_KEY)"))
+            self.events.put(("server_err", "ยังไม่ได้ตั้งค่า Server\n\nตั้งค่าที่แท็บ \"ตั้งค่า Server\""))
             return
         r = self.relay
         self.relay_thread = RelayHost(self, r["addr"], r.get("key", ""), r["id"], r["secret"], self.events)
@@ -1570,6 +1703,74 @@ def relay_test(addr, key):
         s.close()
 
 
+# ----------------------------------------------------------------------------
+# ตรวจสอบ / ดาวน์โหลดอัปเดตโปรแกรมจาก Server
+# ----------------------------------------------------------------------------
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))[:4]) or (0,)
+
+
+def update_platform():
+    if SYSTEM == "Darwin":
+        return "mac-" + ("arm64" if platform.machine() in ("arm64", "aarch64") else "x86_64")
+    return "windows" if SYSTEM == "Windows" else "linux"
+
+
+def relay_update_info(addr, key):
+    s = _relay_socket(addr)
+    try:
+        s.settimeout(20)
+        line_send(s, {"role": "update_info", "key": key or "", "v": 1})
+        r = line_recv(s, limit=65536)
+        if not r.get("ok"):
+            raise ConnectionError(r.get("err") or "Server ปฏิเสธ")
+        return r
+    finally:
+        s.close()
+
+
+def relay_update_download(addr, key, plat, dest_dir, progress=None, cancel=None):
+    """ดาวน์โหลดไฟล์อัปเดตผ่าน Server แล้วตรวจ SHA-256 — คืน path ของไฟล์"""
+    s = _relay_socket(addr)
+    try:
+        s.settimeout(60)
+        line_send(s, {"role": "update_get", "key": key or "", "plat": plat, "v": 1})
+        h = line_recv(s, limit=65536)
+        if not h.get("ok"):
+            raise ConnectionError(h.get("err") or "Server ปฏิเสธ")
+        size, name = int(h["size"]), os.path.basename(h["name"])
+        os.makedirs(dest_dir, exist_ok=True)
+        final = unique_path(os.path.join(dest_dir, name))
+        tmp = final + PART_EXT
+        sha = hashlib.sha256()
+        got = 0
+        try:
+            with open(tmp, "wb") as f:
+                while got < size:
+                    if cancel and cancel.is_set():
+                        raise InterruptedError("ยกเลิกแล้ว")
+                    chunk = s.recv(min(262144, size - got))
+                    if not chunk:
+                        raise ConnectionError("การดาวน์โหลดถูกตัดกลางทาง")
+                    f.write(chunk)
+                    sha.update(chunk)
+                    got += len(chunk)
+                    if progress:
+                        progress(got, size)
+            if sha.hexdigest() != h.get("sha256"):
+                raise ValueError("ไฟล์ที่ดาวน์โหลดเสียหาย (SHA-256 ไม่ตรง)")
+            os.replace(tmp, final)
+            return final
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+    finally:
+        s.close()
+
+
 class RelayMonitor(threading.Thread):
     """ตรวจสถานะการเชื่อมต่อกับ Relay เป็นระยะ ส่งผล ("relay_status", state, data) ทาง queue"""
 
@@ -1629,7 +1830,7 @@ class RelayHost(threading.Thread):
                 s = _relay_socket(self.addr)
                 self.sock = s
                 s.settimeout(15)
-                line_send(s, {"role": "host", "id": self.host_id, "secret": self.secret, "key": self.key,
+                line_send(s, {"role": "host", "id": self.host_id, "secret": self.secret, "key": self.key, "app": VERSION,
                               "name": computer_name(), "v": 1})
                 r = line_recv(s)
                 if not r.get("ok"):
@@ -2965,7 +3166,7 @@ def run_gui():
                 save_config(self.cfg)
             # ค่าจากไฟล์ .env มีผลเหนือค่าที่บันทึกในโปรแกรม
             for env_k, cfg_k in (("ASK_BEFORE_ACCEPT", "ask"), ("ALLOW_CONTROL", "allow_control"),
-                                 ("ALLOW_FILES", "allow_files"), ("AUTOSTART_HOST", "autostart")):
+                                 ("ALLOW_FILES", "allow_files")):
                 if ENV.get(env_k, "") != "":
                     self.cfg[cfg_k] = env_bool(env_k, self.cfg.get(cfg_k, True))
             if env_str("HOST_PASSWORD"):
@@ -2987,20 +3188,20 @@ def run_gui():
             t1, t2, t3 = (ttk.Frame(nb, padding=(16, 14, 16, 16)) for _ in range(3))
             nb.add(t1, text="ควบคุมเครื่องอื่น")
             nb.add(t2, text="ให้เครื่องอื่นควบคุมเครื่องนี้")
-            nb.add(t3, text="การเชื่อมต่อ (Relay)")
+            nb.add(t3, text="ตั้งค่า Server")
             self._build_client(t1)
             self._build_server(t2)
             self._build_relay(t3)
             self._update_id_row()
-            T.on_change(lambda: self._banner(*self.banner_state))
+            T.on_change(lambda: self._banner(*self.banner_state))   # noqa
             if self.cfg.get("last_tab") in (1, 2):
                 nb.select(self.cfg["last_tab"])
             nb.bind("<<NotebookTabChanged>>", lambda e: self._tab(nb))
             root.after(50, self._poll)
             self.monitor = RelayMonitor(self._relay_conn, self.q)
             self.monitor.start()
-            if self.cfg.get("autostart"):
-                root.after(300, self.start_server)
+            root.after(3000, self._update_loop)
+            root.after(400, lambda: self.start_server(auto=True))   # พร้อมรับการเชื่อมต่ออัตโนมัติเสมอ
 
         def _tab(self, nb):
             self.cfg["last_tab"] = nb.index(nb.select())
@@ -3036,9 +3237,12 @@ def run_gui():
                                  padx=14, pady=6, cursor="hand2")
             self.theme_btn.pack(side="right", padx=18)
             self.theme_btn.bind("<Button-1>", lambda e: self.cycle_theme())
-            self.relay_pill = tk.Label(hdr, text="●  Relay: กำลังตรวจสอบ…", font=T.f["smallbold"], padx=14, pady=6,
+            self.relay_pill = tk.Label(hdr, text="●  Server: กำลังตรวจสอบ…", font=T.f["smallbold"], padx=14, pady=6,
                                        cursor="hand2", bg="#B45309", fg="#FFFFFF")
             self.relay_pill.pack(side="right")
+            self.update_badge = tk.Label(hdr, text="", font=T.f["smallbold"], padx=12, pady=6, cursor="hand2",
+                                         bg="#F59E0B", fg="#1F1300")
+            self.update_badge.bind("<Button-1>", lambda e: self.nb.select(2))
             self.relay_pill.bind("<Button-1>", lambda e: self.nb.select(2))
 
         def cycle_theme(self):
@@ -3052,78 +3256,208 @@ def run_gui():
         # ---------------- client tab ----------------
         def _build_client(self, P):
             P.columnconfigure(0, weight=5, uniform="c")
-            P.columnconfigure(1, weight=4, uniform="c")
+            P.columnconfigure(1, weight=5, uniform="c")
             P.rowconfigure(0, weight=1)
             c = card(P)
             c.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
             lbl(c, "เชื่อมต่อไปยังเครื่องอื่น", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
             lbl(c, "ใส่ ID 9 หลักของเครื่องปลายทาง — เชื่อมต่อผ่าน Relay Server เท่านั้น (เข้ารหัสต้นทางถึงปลายทาง)",
-                fg="muted", font="small", wraplength=420).pack(anchor="w", padx=22, pady=(0, 16))
+                fg="muted", font="small", wraplength=400).pack(anchor="w", padx=22, pady=(0, 16))
             lbl(c, "ID เครื่องปลายทาง", fg="muted", font="smallbold").pack(anchor="w", padx=22)
             recent = [fmt_id(i) for i in (parse_id(x) for x in self.cfg.get("recent", [])) if i]
             self.host_var = tk.StringVar(value=recent[0] if recent else "")
             self.host_cb = ttk.Combobox(c, textvariable=self.host_var, values=recent, font=T.f["mono"])
-            self.host_cb.pack(fill="x", padx=22, pady=(4, 14))
+            self.host_cb.pack(fill="x", padx=22, pady=(4, 2))
+            self.host_alias = lbl(c, "", fg="accent", font="small")
+            self.host_alias.pack(anchor="w", padx=22, pady=(0, 10))
             lbl(c, "รหัสผ่าน", fg="muted", font="smallbold").pack(anchor="w", padx=22)
+            pwrow = box(c)
+            pwrow.pack(fill="x", padx=22, pady=(4, 8))
             self.cpw_var = tk.StringVar()
-            pw = ttk.Entry(c, textvariable=self.cpw_var, show="•", font=T.f["big"])
-            pw.pack(fill="x", padx=22, pady=(4, 10))
-            pw.bind("<Return>", lambda e: self.connect())
+            self.cpw_entry = ttk.Entry(pwrow, textvariable=self.cpw_var, show="•", font=T.f["big"])
+            self.cpw_entry.pack(side="left", fill="x", expand=True)
+            self.cpw_entry.bind("<Return>", lambda e: self.connect())
+            self.show_pw_btn = ttk.Button(pwrow, text="👁 แสดง", width=8, command=self._toggle_pw)
+            self.show_pw_btn.pack(side="left", padx=(6, 0))
+            self.remember_var = tk.BooleanVar(value=self.cfg.get("remember_pw", True))
+            ttk.Checkbutton(c, text="จดจำรหัสผ่านของเครื่องนี้", variable=self.remember_var,
+                            style="Card.TCheckbutton").pack(anchor="w", padx=22)
             self.view_only_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(c, text="ดูหน้าจออย่างเดียว (ไม่ควบคุม)", variable=self.view_only_var,
                             style="Card.TCheckbutton").pack(anchor="w", padx=22)
             self.conn_btn = ttk.Button(c, text="เชื่อมต่อ   →", style="Big.Accent.TButton", command=self.connect)
-            self.conn_btn.pack(fill="x", padx=22, pady=(18, 10))
+            self.conn_btn.pack(fill="x", padx=22, pady=(16, 10))
             self.cstatus = tk.StringVar(value="")
-            lbl(c, textvariable=self.cstatus, fg="warn", font="small", wraplength=420).pack(anchor="w", padx=22)
+            lbl(c, textvariable=self.cstatus, fg="warn", font="small", wraplength=400).pack(anchor="w", padx=22)
             tips = box(c)
             tips.pack(side="bottom", fill="x", padx=22, pady=(0, 18))
-            for t in ("🔒  เข้ารหัสทุกการเชื่อมต่อด้วย TLS — Relay อ่านข้อมูลไม่ได้ และรหัสผ่านไม่ถูกส่งผ่านเครือข่าย",
-                      "⌨  ในหน้าต่างรีโมท: รับ-ส่งไฟล์, ส่งข้อความภาษาไทย, ดู Latency"):
-                lbl(tips, t, fg="muted", font="small").pack(anchor="w", pady=1)
+            for t in ("🔒  เข้ารหัสด้วย TLS — Relay อ่านข้อมูลไม่ได้ และรหัสผ่านไม่ถูกส่งผ่านเครือข่าย",
+                      "🔑  รหัสผ่านที่จดจำเก็บใน %s" % SECRET_STORE_NAME):
+                lbl(tips, t, fg="muted", font="small", wraplength=400).pack(anchor="w", pady=1)
+            self.host_var.trace_add("write", lambda *a: self._on_host_change())
 
             d = card(P)
             d.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
             head = box(d)
-            head.pack(fill="x", padx=20, pady=(20, 4))
+            head.pack(fill="x", padx=20, pady=(20, 2))
             lbl(head, "เครื่องที่เคยเชื่อมต่อ", font="h2").pack(side="left")
-            ttk.Button(head, text="ล้าง", command=self._clear_recent).pack(side="right")
-            lbl(d, "ดับเบิลคลิกเพื่อเลือก แล้วใส่รหัสผ่าน", fg="muted", font="small").pack(
-                anchor="w", padx=20, pady=(0, 10))
+            ttk.Button(head, text="ล้างทั้งหมด", style="Tool.TButton", command=self._clear_recent).pack(side="right")
+            lbl(d, "ดับเบิลคลิกเพื่อรีโมททันที (ถ้าจดจำรหัสผ่านไว้) · คลิกขวาเพื่อดูเมนู", fg="muted",
+                font="small").pack(anchor="w", padx=20, pady=(0, 10))
             tf = box(d)
-            tf.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-            self.recent_tree = ttk.Treeview(tf, columns=("id", "name", "last"), show="headings")
-            for col, txt, w, st in (("id", "ID", 120, False), ("name", "ชื่อเครื่อง", 140, True),
-                                    ("last", "ล่าสุด", 110, False)):
-                self.recent_tree.heading(col, text=txt)
-                self.recent_tree.column(col, width=w, stretch=st)
-            self.recent_tree.pack(fill="both", expand=True)
-            self.recent_tree.bind("<Double-1>", self._pick_recent)
-            self.recent_tree.bind("<<TreeviewSelect>>", self._pick_recent_fill)
+            tf.pack(fill="both", expand=True, padx=20)
+            t = self.recent_tree = ttk.Treeview(tf, columns=("name", "id", "key", "last"), show="headings",
+                                                selectmode="browse")
+            for col, txt, w, st in (("name", "ชื่อเครื่อง", 170, True), ("id", "ID", 105, False),
+                                    ("key", "รหัส", 40, False), ("last", "ล่าสุด", 90, False)):
+                t.heading(col, text=txt)
+                t.column(col, width=w, stretch=st, anchor="center" if col == "key" else "w")
+            t.pack(fill="both", expand=True)
+            t.bind("<Double-1>", lambda e: self.connect_recent())
+            t.bind("<Return>", lambda e: self.connect_recent())
+            t.bind("<<TreeviewSelect>>", self._pick_recent_fill)
+            t.bind("<Button-3>", self._recent_menu)
+            t.bind("<Button-2>", self._recent_menu)
+            t.bind("<Control-Button-1>", self._recent_menu)
+            t.bind("<Delete>", lambda e: self.remove_recent())
+            t.bind("<F2>", lambda e: self.rename_recent())
+            btns = box(d)
+            btns.pack(fill="x", padx=20, pady=(10, 20))
+            ttk.Button(btns, text="▶  เชื่อมต่อ", style="Accent.TButton", command=self.connect_recent).pack(side="left")
+            ttk.Button(btns, text="✎ เปลี่ยนชื่อ", command=self.rename_recent).pack(side="left", padx=6)
+            ttk.Button(btns, text="✕ ลบ", command=self.remove_recent).pack(side="left")
+            self.recent_menu = tk.Menu(self.root, tearoff=0)
+            self.recent_menu.add_command(label="▶  เชื่อมต่อ", command=self.connect_recent)
+            self.recent_menu.add_command(label="✎  เปลี่ยนชื่อ…", command=self.rename_recent)
+            self.recent_menu.add_command(label="⧉  คัดลอก ID", command=self.copy_recent_id)
+            self.recent_menu.add_separator()
+            self.recent_menu.add_command(label="🔑  ลืมรหัสผ่าน", command=self.forget_recent_pw)
+            self.recent_menu.add_command(label="✕  ลบออกจากรายการ", command=self.remove_recent)
             self._refresh_recent()
+            self._on_host_change()
 
-        def _refresh_recent(self):
+        # ----- รหัสผ่าน -----
+        def _toggle_pw(self):
+            shown = self.cpw_entry.cget("show") == ""
+            self.cpw_entry.configure(show="•" if shown else "")
+            self.show_pw_btn.configure(text="👁 แสดง" if shown else "🙈 ซ่อน")
+
+        def _recent(self, rid):
+            return next((r for r in self.cfg.get("recent_info", []) if r.get("id") == rid), None)
+
+        def _display_name(self, rid, fallback=""):
+            r = self._recent(rid) or {}
+            return r.get("alias") or r.get("name") or fallback
+
+        def _on_host_change(self):
+            rid = parse_id(self.host_var.get())
+            if not rid:
+                self.host_alias.configure(text="")
+                return
+            r = self._recent(rid)
+            self.host_alias.configure(text=("📌 " + self._display_name(rid)) if r else "")
+            pw = secret_get(rid)
+            if pw:
+                self.cpw_var.set(pw)
+                self.remember_var.set(True)
+            elif r is not None:
+                self.cpw_var.set("")
+
+        # ----- เครื่องที่เคยเชื่อมต่อ -----
+        def _refresh_recent(self, select=None):
             t = self.recent_tree
             t.delete(*t.get_children(""))
-            for i, r in enumerate(self.cfg.get("recent_info", [])[:30]):
+            for r in self.cfg.get("recent_info", [])[:50]:
+                rid = r.get("id", "")
                 when = datetime.fromtimestamp(r.get("t", 0)).strftime("%d/%m %H:%M") if r.get("t") else ""
-                t.insert("", "end", iid="r%d" % i, values=(fmt_id(r.get("id", "")), r.get("name", ""), when))
+                name = r.get("alias") or r.get("name") or "-"
+                t.insert("", "end", iid="r" + rid, values=(name, fmt_id(rid), "🔑" if secret_has(rid) else "", when))
+            if select and t.exists("r" + select):
+                t.selection_set("r" + select)
+                t.see("r" + select)
+
+        def _sel_recent(self):
+            sel = self.recent_tree.selection()
+            return sel[0][1:] if sel else None
+
+        def _recent_menu(self, e):
+            row = self.recent_tree.identify_row(e.y)
+            if row:
+                self.recent_tree.selection_set(row)
+                self.recent_menu.tk_popup(e.x_root, e.y_root)
+
+        def _pick_recent_fill(self, e=None):
+            rid = self._sel_recent()
+            if rid:
+                self.host_var.set(fmt_id(rid))
+
+        def connect_recent(self):
+            rid = self._sel_recent()
+            if not rid:
+                messagebox.showinfo(APP, "เลือกเครื่องจากรายการก่อน")
+                return
+            self.host_var.set(fmt_id(rid))
+            pw = secret_get(rid)
+            if pw:
+                self.cpw_var.set(pw)
+                self.connect()
+            else:
+                self.cpw_var.set("")
+                self.cpw_entry.focus_set()
+                self.cstatus.set("ใส่รหัสผ่านของ %s แล้วกดเชื่อมต่อ (ติ๊ก \"จดจำรหัสผ่าน\" เพื่อครั้งหน้ากดครั้งเดียว)"
+                                 % self._display_name(rid, fmt_id(rid)))
+
+        def rename_recent(self):
+            rid = self._sel_recent()
+            if not rid:
+                return
+            r = self._recent(rid)
+            name = simpledialog.askstring(APP, "ตั้งชื่อเรียกเครื่อง ID %s\n(เว้นว่าง = ใช้ชื่อจริงของเครื่อง: %s)"
+                                          % (fmt_id(rid), r.get("name") or "-"),
+                                          initialvalue=r.get("alias") or r.get("name", ""), parent=self.root)
+            if name is None:
+                return
+            name = name.strip()[:60]
+            r["alias"] = name if name and name != r.get("name") else ""
+            save_config(self.cfg)
+            self._refresh_recent(select=rid)
+            self._on_host_change()
+
+        def copy_recent_id(self):
+            rid = self._sel_recent()
+            if rid:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(fmt_id(rid))
+
+        def forget_recent_pw(self):
+            rid = self._sel_recent()
+            if rid:
+                secret_del(rid)
+                self._refresh_recent(select=rid)
+                if parse_id(self.host_var.get()) == rid:
+                    self.cpw_var.set("")
+
+        def remove_recent(self):
+            rid = self._sel_recent()
+            if not rid or not messagebox.askyesno(APP, "ลบ %s (%s) ออกจากรายการ?\n(รหัสผ่านที่จดจำไว้จะถูกลบด้วย)"
+                                                  % (self._display_name(rid, "-"), fmt_id(rid))):
+                return
+            self.cfg["recent_info"] = [r for r in self.cfg.get("recent_info", []) if r.get("id") != rid]
+            self.cfg["recent"] = [x for x in self.cfg.get("recent", []) if parse_id(x) != rid]
+            secret_del(rid)
+            save_config(self.cfg)
+            self.host_cb.configure(values=[fmt_id(x) for x in self.cfg["recent"]])
+            self._refresh_recent()
 
         def _clear_recent(self):
+            if not messagebox.askyesno(APP, "ล้างรายการเครื่องที่เคยเชื่อมต่อทั้งหมด และรหัสผ่านที่จดจำไว้?"):
+                return
+            for r in self.cfg.get("recent_info", []):
+                secret_del(r.get("id", ""))
             self.cfg.update({"recent": [], "recent_info": []})
             save_config(self.cfg)
             self.host_cb.configure(values=[])
             self._refresh_recent()
-
-        def _pick_recent_fill(self, e=None):
-            sel = self.recent_tree.selection()
-            if sel:
-                self.host_var.set(self.recent_tree.item(sel[0], "values")[0])
-
-        def _pick_recent(self, e=None):
-            self._pick_recent_fill()
-            if self.cpw_var.get():
-                self.connect()
 
         def connect(self):
             rid = parse_id(self.host_var.get())
@@ -3133,27 +3467,37 @@ def run_gui():
                 return
             if not pw:
                 messagebox.showerror(APP, "กรุณาใส่รหัสผ่าน")
+                self.cpw_entry.focus_set()
                 return
             addr, key = self._relay_conn()
             if not addr:
-                messagebox.showerror(APP, "ยังไม่ได้ตั้งค่า Relay Server\nไปที่แท็บ \"การเชื่อมต่อ (Relay)\" หรือใส่ในไฟล์ .env")
+                messagebox.showerror(APP, "ยังไม่ได้ตั้งค่า Server\nไปที่แท็บ \"ตั้งค่า Server\"")
                 return
             relay = {"addr": addr, "key": key, "id": rid}
             host = "ID " + fmt_id(rid)
+            label = self._display_name(rid, host)
+            remember = self.remember_var.get()
+            self.cfg["remember_pw"] = remember
             self.conn_btn.configure(state="disabled")
-            self.cstatus.set("กำลังเชื่อมต่อ %s ผ่าน Relay … (ถ้าปลายทางตั้งให้ถามก่อน ต้องรอให้กดยอมรับ)" % host)
+            self.cstatus.set("กำลังเชื่อมต่อ %s ผ่าน Relay … (ถ้าปลายทางตั้งให้ถามก่อน ต้องรอให้กดยอมรับ)" % label)
 
             def work():
                 try:
                     tls, info, fp = client_connect(host, 0, pw, self._confirm_fp_threadsafe, relay=relay)
+                    if remember:
+                        secret_set(rid, pw)
+                    else:
+                        secret_del(rid)
                     self.q.put(("connected", rid, tls, info, fp))
                 except socket.timeout:
-                    self.q.put(("connect_err", "หมดเวลา — ไม่มีการตอบรับจาก %s" % host))
+                    self.q.put(("connect_err", "หมดเวลา — ไม่มีการตอบรับจาก %s" % label))
                 except OSError as e:
                     msg = str(e) if isinstance(e, ConnectionError) else (e.strerror or str(e))
-                    self.q.put(("connect_err", "เชื่อมต่อไม่ได้: %s" % msg))
+                    if "รหัสผ่าน" in msg:
+                        secret_del(rid)
+                    self.q.put(("connect_err", "เชื่อมต่อ %s ไม่ได้: %s" % (label, msg)))
                 except Exception as e:
-                    self.q.put(("connect_err", "เชื่อมต่อไม่ได้: %s" % e))
+                    self.q.put(("connect_err", "เชื่อมต่อ %s ไม่ได้: %s" % (label, e)))
             threading.Thread(target=work, daemon=True).start()
 
         # ---------------- server tab ----------------
@@ -3197,6 +3541,7 @@ def run_gui():
             pwrow = box(info)
             pwrow.grid(row=5, column=0, columnspan=2, sticky="we", padx=20, pady=(4, 18))
             self.spw_var = tk.StringVar(value=self.cfg.get("password") or gen_password())
+            self.spw_var.trace_add("write", lambda *a: self._password_changed())
             ttk.Entry(pwrow, textvariable=self.spw_var, font=T.f["mono"], width=16).pack(side="left", fill="x",
                                                                                           expand=True)
             ttk.Button(pwrow, text="สุ่มใหม่", command=lambda: self.spw_var.set(gen_password())).pack(side="left",
@@ -3212,11 +3557,9 @@ def run_gui():
             self.ask_var = tk.BooleanVar(value=self.cfg.get("ask", True))
             self.allow_var = tk.BooleanVar(value=self.cfg.get("allow_control", True))
             self.files_var = tk.BooleanVar(value=self.cfg.get("allow_files", True))
-            self.auto_var = tk.BooleanVar(value=self.cfg.get("autostart", False))
             for i, (txt, var) in enumerate((("ถามก่อนรับการเชื่อมต่อ", self.ask_var),
                                             ("อนุญาตให้ควบคุมเมาส์/คีย์บอร์ด", self.allow_var),
-                                            ("อนุญาตให้รับ-ส่งไฟล์", self.files_var),
-                                            ("เปิดรับอัตโนมัติเมื่อเปิดโปรแกรม", self.auto_var))):
+                                            ("อนุญาตให้รับ-ส่งไฟล์", self.files_var))):
                 ttk.Checkbutton(opt, text=txt, variable=var, style="Card.TCheckbutton",
                                 command=self._save_server_opts).grid(row=1 + i // 2, column=i % 2, sticky="w", padx=20)
             lbl(opt, "").grid(row=3, column=0, pady=4)
@@ -3267,25 +3610,25 @@ def run_gui():
             left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
             f = card(left)
             f.pack(fill="x")
-            lbl(f, "Relay Server", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
-            lbl(f, "ทุกการเชื่อมต่อผ่าน Relay เท่านั้น — ทั้งสองเครื่องเชื่อมต่อออกไปหา Relay จึงไม่ต้องเปิดพอร์ตบนเครื่อง "
-                   "และข้อมูลยังเข้ารหัสจากต้นทางถึงปลายทาง (Relay อ่านเนื้อหาไม่ได้)",
+            lbl(f, "ตั้งค่า Server", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
+            lbl(f, "ทุกการเชื่อมต่อผ่าน Server (Relay) เท่านั้น — ทั้งสองเครื่องเชื่อมต่อออกไปหา Server "
+                   "จึงไม่ต้องเปิดพอร์ตบนเครื่อง และข้อมูลยังเข้ารหัสจากต้นทางถึงปลายทาง (Server อ่านเนื้อหาไม่ได้)",
                 fg="muted", font="small", wraplength=470).pack(anchor="w", padx=22, pady=(0, 14))
             locked = bool(env_str("RELAY_ADDR"))
-            lbl(f, "ที่อยู่ Relay Server", fg="muted", font="smallbold").pack(anchor="w", padx=22)
+            lbl(f, "ที่อยู่ Server", fg="muted", font="smallbold").pack(anchor="w", padx=22)
             self.relay_addr_var = tk.StringVar(value=self._relay_conn()[0])
             e1 = ttk.Entry(f, textvariable=self.relay_addr_var, font=T.f["big"])
             e1.pack(fill="x", padx=22, pady=(4, 2))
             lbl(f, "เช่น relay.example.com:5910 หรือ 203.0.113.10:5910", fg="muted", font="small").pack(
                 anchor="w", padx=22, pady=(0, 10))
-            lbl(f, "Relay Key", fg="muted", font="smallbold").pack(anchor="w", padx=22)
+            lbl(f, "Server Key", fg="muted", font="smallbold").pack(anchor="w", padx=22)
             self.relay_key_var = tk.StringVar(value=self._relay_conn()[1])
             e2 = ttk.Entry(f, textvariable=self.relay_key_var, show="•", font=T.f["big"])
             e2.pack(fill="x", padx=22, pady=(4, 8))
             if locked:
                 e1.configure(state="disabled")
                 e2.configure(state="disabled")
-                lbl(f, "🔒  กำหนดโดยไฟล์ .env — แก้ไขที่ไฟล์แล้วเปิดโปรแกรมใหม่", fg="accent", font="smallbold").pack(
+                lbl(f, "🔒  ตั้งค่าไว้โดยผู้ดูแลระบบ", fg="accent", font="smallbold").pack(
                     anchor="w", padx=22)
             row = box(f)
             row.pack(fill="x", padx=22, pady=(12, 6))
@@ -3298,20 +3641,23 @@ def run_gui():
             lbl(f, textvariable=self.relay_test_var, fg="muted", font="small", wraplength=470).pack(
                 anchor="w", padx=22, pady=(0, 16))
 
-            st = card(left)
-            st.pack(fill="both", expand=True, pady=(14, 0))
-            lbl(st, "สถานะการเชื่อมต่อ Relay", font="h2").grid(row=0, column=0, columnspan=2, sticky="w",
-                                                             padx=22, pady=(18, 10))
-            self.rs = {}
-            for i, (k, t) in enumerate((("state", "สถานะ"), ("addr", "Server"), ("ping", "Ping"),
-                                        ("ver", "เวอร์ชัน Relay"), ("hosts", "เครื่องออนไลน์บน Relay"),
-                                        ("host", "รับการเชื่อมต่อของเครื่องนี้"), ("checked", "ตรวจล่าสุด"))):
-                lbl(st, t, fg="muted", font="small").grid(row=i + 1, column=0, sticky="w", padx=(22, 12), pady=2)
-                v = lbl(st, "–", font="smallbold" if k == "state" else "small", padx=8 if k == "state" else 0,
-                        pady=2 if k == "state" else 0)
-                v.grid(row=i + 1, column=1, sticky="w", pady=2)
-                self.rs[k] = v
-            st.columnconfigure(1, weight=1)
+            uc = card(left)
+            uc.pack(fill="both", expand=True, pady=(14, 0))
+            head = box(uc)
+            head.pack(fill="x", padx=22, pady=(18, 4))
+            lbl(head, "อัปเดตโปรแกรม", font="h2").pack(side="left")
+            ttk.Button(head, text="ตรวจสอบอัปเดต", command=lambda: self.check_updates(manual=True)).pack(side="right")
+            lbl(uc, "เวอร์ชันที่ใช้อยู่: %s  (%s)" % (VERSION, update_platform()), fg="muted", font="small").pack(
+                anchor="w", padx=22)
+            self.upd_status = lbl(uc, "ยังไม่ได้ตรวจสอบ", fg="muted", font="smallbold", wraplength=470)
+            self.upd_status.pack(anchor="w", padx=22, pady=(6, 2))
+            self.upd_notes = lbl(uc, "", fg="text", font="small", wraplength=470)
+            self.upd_notes.pack(anchor="w", padx=22)
+            self.upd_btn = ttk.Button(uc, text="⬇  ดาวน์โหลดเวอร์ชันใหม่", style="Accent.TButton",
+                                      command=self.download_update)
+            self.upd_progress = ttk.Progressbar(uc, mode="determinate", maximum=100)
+            self.update_info = None
+            self.upd_cancel = None
 
             right = ttk.Frame(P)
             right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
@@ -3323,58 +3669,132 @@ def run_gui():
             self.relay_id_lbl.pack(anchor="w", padx=22, pady=(10, 8))
             ttk.Button(idc, text="สร้าง ID ใหม่", command=self.new_id).pack(anchor="w", padx=22, pady=(0, 20))
 
-            ec = card(right)
-            ec.pack(fill="both", expand=True, pady=(14, 0))
-            lbl(ec, "ไฟล์ตั้งค่า .env", font="h2").pack(anchor="w", padx=22, pady=(20, 4))
-            lbl(ec, ("✓ ใช้ไฟล์: %s" % ENV_PATH) if ENV_PATH else "ยังไม่มีไฟล์ .env — ใช้ค่าที่ตั้งในโปรแกรม",
-                fg="ok" if ENV_PATH else "muted", font="small", wraplength=380).pack(anchor="w", padx=22)
-            lbl(ec, "ผู้ดูแลระบบใส่ RELAY_ADDR / RELAY_KEY ไว้ในไฟล์ .env ได้ ค่าในไฟล์จะมีผลเหนือค่าในโปรแกรม "
-                    "และถ้าวางไฟล์ไว้ตอน Build จะถูกฝังมากับโปรแกรม (ผู้ใช้ไม่ต้องตั้งค่าเอง)",
-                fg="muted", font="small", wraplength=380).pack(anchor="w", padx=22, pady=(8, 10))
-            r2 = box(ec)
-            r2.pack(anchor="w", padx=22, pady=(0, 20))
-            ttk.Button(r2, text="สร้าง / แก้ไขไฟล์ .env", command=self.edit_env).pack(side="left")
-            ttk.Button(r2, text="เปิดโฟลเดอร์", command=lambda: open_path(
-                os.path.dirname(ENV_PATH) if ENV_PATH else CONF_DIR)).pack(side="left", padx=6)
+            st = card(right)
+            st.pack(fill="both", expand=True, pady=(14, 0))
+            lbl(st, "สถานะการเชื่อมต่อ Server", font="h2").grid(row=0, column=0, columnspan=2, sticky="w",
+                                                             padx=22, pady=(18, 10))
+            self.rs = {}
+            for i, (k, t) in enumerate((("state", "สถานะ"), ("addr", "Server"), ("ping", "Ping"),
+                                        ("ver", "เวอร์ชัน Server"), ("hosts", "เครื่องออนไลน์บน Server"),
+                                        ("host", "รับการเชื่อมต่อของเครื่องนี้"), ("checked", "ตรวจล่าสุด"))):
+                lbl(st, t, fg="muted", font="small").grid(row=i + 1, column=0, sticky="w", padx=(22, 12), pady=2)
+                v = lbl(st, "–", font="smallbold" if k == "state" else "small", padx=8 if k == "state" else 0,
+                        pady=2 if k == "state" else 0)
+                v.grid(row=i + 1, column=1, sticky="w", pady=2)
+                self.rs[k] = v
+            st.columnconfigure(1, weight=1)
 
-        def edit_env(self):
-            path = ENV_PATH or os.path.join(CONF_DIR, ".env")
-            if not os.path.exists(path):
-                addr, key = self._relay_conn()
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("# NetRemote — การตั้งค่าฝั่งโปรแกรม (Client)\n"
-                            "# แก้ไขแล้วปิด-เปิดโปรแกรมใหม่\n\n"
-                            "RELAY_ADDR=%s\nRELAY_KEY=%s\n\n"
-                            "# ตัวเลือกเพิ่มเติม (ลบ # ข้างหน้าเพื่อใช้)\n"
-                            "# HOST_PASSWORD=\n# ASK_BEFORE_ACCEPT=true\n# ALLOW_CONTROL=true\n"
-                            "# ALLOW_FILES=true\n# AUTOSTART_HOST=false\n# THEME=auto\n# DOWNLOAD_DIR=\n" % (addr, key))
+
+        # ----- อัปเดตโปรแกรม -----
+        def _update_loop(self):
+            self.check_updates(manual=False)
+            self.root.after(6 * 3600 * 1000, self._update_loop)
+
+        def check_updates(self, manual=False):
+            addr, key = self._relay_conn()
+            if not addr:
+                if manual:
+                    self.upd_status.configure(text="ยังไม่ได้ตั้งค่า Server", fg=T.c("danger"))
+                return
+            if manual:
+                self.upd_status.configure(text="กำลังตรวจสอบ…", fg=T.c("muted"))
+
+            def work():
                 try:
-                    os.chmod(path, 0o600)
-                except OSError:
-                    pass
-                messagebox.showinfo(APP, "สร้างไฟล์ .env แล้วที่\n%s\n\nแก้ไขแล้วปิด-เปิดโปรแกรมใหม่เพื่อใช้ค่าใหม่" % path)
-            if SYSTEM == "Darwin":
-                subprocess.Popen(["open", "-t", path])
-            else:
-                open_path(path)
+                    self.q.put(("update_info", relay_update_info(addr, key), manual))
+                except Exception as e:
+                    self.q.put(("update_info", e, manual))
+            threading.Thread(target=work, daemon=True).start()
 
-        def _confirm_fp_threadsafe(self, host, fp, name):
-            known = self.cfg.setdefault("known", {})
-            old = known.get(host)
-            if old == fp:
-                return True
-            if old is None:
-                known[host] = fp
-                save_config(self.cfg)
-                return True
-            ev, box = threading.Event(), {}
-            self.q.put(("ask_fp", host, old, fp, name, ev, box))
-            ev.wait(120)
-            if box.get("ok"):
-                known[host] = fp
-                save_config(self.cfg)
-            return bool(box.get("ok"))
+        def _on_update_info(self, info, manual):
+            self.upd_btn.pack_forget()
+            if isinstance(info, Exception):
+                if manual:
+                    self.upd_status.configure(text="✗ ตรวจสอบไม่ได้: %s" % err_text(info), fg=T.c("danger"))
+                return
+            self.update_info = info
+            latest = info.get("version")
+            plat = update_platform()
+            if not latest:
+                self.upd_status.configure(text="✓ Server ยังไม่มีไฟล์อัปเดต — ใช้เวอร์ชันล่าสุดอยู่แล้ว", fg=T.c("ok"))
+                self.upd_notes.configure(text="")
+                self.update_badge.pack_forget()
+                return
+            if version_tuple(latest) <= version_tuple(VERSION):
+                self.upd_status.configure(text="✓ ใช้เวอร์ชันล่าสุดอยู่แล้ว (%s)" % VERSION, fg=T.c("ok"))
+                self.upd_notes.configure(text="")
+                self.update_badge.pack_forget()
+                return
+            has_file = plat in (info.get("files") or {})
+            self.upd_status.configure(text="⬆ มีเวอร์ชันใหม่: %s  (ใช้อยู่ %s)" % (latest, VERSION), fg=T.c("warn"))
+            notes = info.get("notes") or ""
+            self.upd_notes.configure(text=notes)
+            if has_file:
+                f = info["files"][plat]
+                self.upd_btn.configure(text="⬇  ดาวน์โหลด %s (%s)" % (f["name"], fmt_size(f["size"])), state="normal")
+                self.upd_btn.pack(anchor="w", padx=22, pady=(10, 18))
+            elif info.get("url"):
+                self.upd_btn.configure(text="🌐  เปิดหน้าดาวน์โหลด", state="normal")
+                self.upd_btn.pack(anchor="w", padx=22, pady=(10, 18))
+            else:
+                self.upd_notes.configure(text=notes + ("\n" if notes else "") +
+                                         "(Server ยังไม่มีไฟล์สำหรับ %s — ติดต่อผู้ดูแลระบบ)" % plat)
+            self.update_badge.configure(text="⬆  มีอัปเดต %s" % latest)
+            self.update_badge.pack(side="right", padx=(0, 8))
+            if not manual and getattr(self, "_notified_ver", None) != latest:
+                self._notified_ver = latest
+                self._log("⬆ มีโปรแกรมเวอร์ชันใหม่ %s — ดูที่แท็บ \"ตั้งค่า Server\"" % latest)
+
+        def download_update(self):
+            info = self.update_info or {}
+            plat = update_platform()
+            f = (info.get("files") or {}).get(plat)
+            if not f:
+                if info.get("url"):
+                    import webbrowser
+                    webbrowser.open(info["url"])
+                return
+            if self.upd_cancel is not None:
+                self.upd_cancel.set()
+                return
+            addr, key = self._relay_conn()
+            dest = os.path.join(os.path.expanduser("~"), "Downloads")
+            self.upd_cancel = threading.Event()
+            self.upd_btn.configure(text="ยกเลิกการดาวน์โหลด")
+            self.upd_progress.configure(value=0)
+            self.upd_progress.pack(fill="x", padx=22, pady=(0, 18))
+
+            def prog(got, total):
+                self.q.put(("update_progress", got, total))
+
+            def work():
+                try:
+                    path = relay_update_download(addr, key, plat, dest, prog, self.upd_cancel)
+                    self.q.put(("update_done", path))
+                except Exception as e:
+                    self.q.put(("update_done", e))
+            threading.Thread(target=work, daemon=True).start()
+
+        def _on_update_done(self, res):
+            self.upd_cancel = None
+            self.upd_progress.pack_forget()
+            if isinstance(res, Exception):
+                self.upd_status.configure(text="✗ ดาวน์โหลดไม่สำเร็จ: %s" % err_text(res), fg=T.c("danger"))
+                self._on_update_info(self.update_info, True)
+                return
+            self.upd_status.configure(text="✓ ดาวน์โหลดแล้ว (ตรวจ SHA-256 ผ่าน): %s" % res, fg=T.c("ok"))
+            self.upd_btn.pack_forget()
+            if SYSTEM == "Darwin":
+                how = ("เปิดไฟล์ .dmg ให้แล้ว → ปิดโปรแกรมนี้ แล้วลาก NetRemote ไปทับใน Applications"
+                       if res.endswith(".dmg") else "ปิดโปรแกรมนี้ แล้วใช้ไฟล์ใหม่แทนตัวเดิม")
+                subprocess.Popen(["open", res] if res.endswith(".dmg") else ["open", "-R", res])
+            elif SYSTEM == "Windows":
+                how = "ปิดโปรแกรมนี้ แล้วใช้ไฟล์ %s แทนไฟล์ NetRemote.exe ตัวเดิม" % os.path.basename(res)
+                subprocess.Popen(["explorer", "/select,", res])
+            else:
+                how = "ไฟล์อยู่ที่ %s" % res
+                open_path(os.path.dirname(res))
+            messagebox.showinfo(APP, "ดาวน์โหลดเวอร์ชันใหม่เรียบร้อย\n\n%s" % how)
 
         def _relay_conn(self):
             """ที่อยู่และ Key ของ Relay — จาก .env ก่อน ถ้าไม่มีใช้ค่าที่ตั้งในโปรแกรม"""
@@ -3390,19 +3810,23 @@ def run_gui():
                 try:
                     parse_hostport(addr, RELAY_PORT)
                 except ValueError:
-                    messagebox.showerror(APP, "รูปแบบ Relay Server ไม่ถูกต้อง (เช่น relay.example.com:5910)")
+                    messagebox.showerror(APP, "รูปแบบที่อยู่ Server ไม่ถูกต้อง (เช่น relay.example.com:5910)")
                     return False
             self.cfg.update({"relay_addr": addr, "relay_key": self.relay_key_var.get()})
             save_config(self.cfg)
             self._update_id_row()
             self.monitor.refresh()
             if not quiet:
-                self.relay_test_var.set("บันทึกแล้ว")
-                if self.server and self.server.is_alive():
-                    if messagebox.askyesno(APP, "เริ่มเปิดรับการเชื่อมต่อใหม่เพื่อใช้การตั้งค่านี้เลยหรือไม่?"):
-                        self.toggle_server()
-                        self.root.after(400, self.start_server)
+                self.relay_test_var.set("บันทึกแล้ว — กำลังเชื่อมต่อ Server ใหม่")
+                self.restart_server()
             return True
+
+        def restart_server(self):
+            """เริ่มรับการเชื่อมต่อใหม่ด้วยการตั้งค่าล่าสุด (ทำอัตโนมัติ)"""
+            if self.server and self.server.is_alive():
+                self.server.stop()
+                self.server = None
+            self.root.after(400, lambda: self.start_server(auto=True))
 
         def test_relay(self):
             if not self.save_relay(quiet=True):
@@ -3410,14 +3834,14 @@ def run_gui():
             addr, key = self._relay_conn()
             self.monitor.refresh()
             if not addr:
-                self.relay_test_var.set("ใส่ที่อยู่ Relay Server ก่อน")
+                self.relay_test_var.set("ใส่ที่อยู่ Server ก่อน")
                 return
             self.relay_test_var.set("กำลังทดสอบ %s …" % addr)
 
             def work():
                 try:
                     r = relay_test(addr, key)
-                    msg = "✓ เชื่อมต่อ Relay ได้ — Ping %.0f ms, เวอร์ชัน %s, ออนไลน์ %s เครื่อง" % (
+                    msg = "✓ เชื่อมต่อ Server ได้ — Ping %.0f ms, เวอร์ชัน %s, ออนไลน์ %s เครื่อง" % (
                         r.get("rtt", 0), r.get("v"), r.get("hosts"))
                 except Exception as e:
                     msg = "✗ %s" % err_text(e)
@@ -3431,9 +3855,7 @@ def run_gui():
             save_config(self.cfg)
             self.relay_id_lbl.configure(text=fmt_id(self.cfg["host_id"]))
             self._update_id_row()
-            if self.server and self.server.is_alive():
-                self.toggle_server()
-                self.root.after(400, self.start_server)
+            self.restart_server()
 
         def _relay_cfg(self):
             addr, key = self._relay_conn()
@@ -3448,29 +3870,29 @@ def run_gui():
                 self.relay_state["host_text"] = text or ""
             running = bool(self.server and self.server.is_alive())
             if not self._relay_cfg():
-                self.relay_state_lbl.configure(text="ยังไม่ได้ตั้งค่า Relay — ตั้งที่แท็บ \"การเชื่อมต่อ (Relay)\" หรือไฟล์ .env",
+                self.relay_state_lbl.configure(text="ยังไม่ได้ตั้งค่า Server — ตั้งที่แท็บ \"ตั้งค่า Server\"",
                                                fg=T.c("danger"))
             elif text and running:
                 color = {"online": "ok", "error": "danger", "connecting": "warn"}.get(state, "muted")
                 self.relay_state_lbl.configure(text=("● " if state == "online" else "") + text, fg=T.c(color))
             elif not running:
                 self.relay_state["host"] = None
-                self.relay_state_lbl.configure(text="ID นี้จะใช้งานได้เมื่อกด \"เริ่มเปิดรับการเชื่อมต่อ\"", fg=T.c("muted"))
+                self.relay_state_lbl.configure(text="หยุดรับการเชื่อมต่ออยู่ — กด \"เริ่มเปิดรับการเชื่อมต่อ\"", fg=T.c("muted"))
             self._render_relay()
 
         def _render_relay(self):
             rs = self.relay_state
             mon, d = rs["mon"], rs["data"]
             if mon == "unset":
-                txt, bg = "○  ยังไม่ได้ตั้งค่า Relay", "#6B7280"
+                txt, bg = "○  ยังไม่ได้ตั้งค่า Server", "#6B7280"
             elif mon == "error":
-                txt, bg = "●  Relay: เชื่อมต่อไม่ได้", "#DC2626"
+                txt, bg = "●  Server: เชื่อมต่อไม่ได้", "#DC2626"
             elif mon == "ok":
-                txt, bg = "●  Relay ออนไลน์ · %.0f ms" % d.get("rtt", 0), "#15803D"
+                txt, bg = "●  Server ออนไลน์ · %.0f ms" % d.get("rtt", 0), "#15803D"
                 if rs["host"] == "online":
                     txt += " · รับการเชื่อมต่ออยู่"
             else:
-                txt, bg = "●  Relay: กำลังเชื่อมต่อ…", "#B45309"
+                txt, bg = "●  Server: กำลังเชื่อมต่อ…", "#B45309"
             self.relay_pill.configure(text=txt, bg=bg)
             if not hasattr(self, "rs"):
                 return
@@ -3492,7 +3914,7 @@ def run_gui():
             running = bool(self.server and self.server.is_alive())
             self.rs["host"].configure(
                 text=("● ออนไลน์ — ID %s" % fmt_id(self.cfg["host_id"])) if host == "online" and running else
-                (rs["host_text"] if running and rs["host_text"] else "ปิดอยู่ (ยังไม่ได้กดเริ่มเปิดรับ)"),
+                (rs["host_text"] if running and rs["host_text"] else "หยุดรับการเชื่อมต่ออยู่"),
                 fg=T.c("ok" if host == "online" and running else ("danger" if host == "error" and running else "muted")))
             if rs["t"]:
                 self.rs["checked"].configure(text=datetime.fromtimestamp(rs["t"]).strftime("%H:%M:%S"))
@@ -3517,9 +3939,17 @@ def run_gui():
                                   fg=T.c("ok" if v else "danger"), bg=T.c("ok_bg" if v else "danger_bg"))
             self.root.after(3000, self._check_perms)
 
+        def _password_changed(self):
+            pw = self.spw_var.get().strip()
+            if len(norm_pw(pw)) >= 6:
+                self.cfg["password"] = pw
+                save_config(self.cfg)
+                if self.server:
+                    self.server.password = pw          # มีผลกับการเชื่อมต่อครั้งถัดไปทันที
+
         def _save_server_opts(self):
             self.cfg.update({"ask": self.ask_var.get(), "allow_control": self.allow_var.get(),
-                             "autostart": self.auto_var.get(), "allow_files": self.files_var.get()})
+                             "allow_files": self.files_var.get()})
             save_config(self.cfg)
             if self.server:
                 self.server.allow_control = self.allow_var.get()
@@ -3541,19 +3971,32 @@ def run_gui():
                 return
             self.start_server()
 
-        def start_server(self):
+        def start_server(self, auto=False):
+            """auto=True: เรียกตอนเปิดโปรแกรม/เปลี่ยนการตั้งค่า — ไม่เด้งหน้าต่างแจ้งเตือน แสดงในการ์ดสถานะแทน"""
+            if self.server and self.server.is_alive():
+                return
+
+            def problem(msg):
+                if auto:
+                    self._banner("off", sub="⚠ " + msg.replace("\n\n", " — ").replace("\n", " "))
+                    self._log("⚠ " + msg.replace("\n", " "))
+                else:
+                    messagebox.showerror(APP, msg)
             miss = missing_modules(server=True)
             if miss:
-                messagebox.showerror(APP, "ยังไม่ได้ติดตั้ง: %s\n\nเปิดโปรแกรมผ่านไฟล์ \"Run on Mac.command\" "
-                                          "เพื่อติดตั้งอัตโนมัติ หรือรัน:\npip install %s" % (", ".join(miss), " ".join(miss)))
+                problem("ยังไม่ได้ติดตั้ง: %s — เปิดโปรแกรมผ่านไฟล์ \"Run on Mac.command\" เพื่อติดตั้งอัตโนมัติ "
+                        "หรือรัน pip install %s" % (", ".join(miss), " ".join(miss)))
                 return
             pw = self.spw_var.get().strip()
             if len(norm_pw(pw)) < 6:
-                messagebox.showerror(APP, "รหัสผ่านต้องยาวอย่างน้อย 6 ตัวอักษร")
-                return
+                if auto and not pw:
+                    pw = gen_password()
+                    self.spw_var.set(pw)
+                else:
+                    problem("รหัสผ่านต้องยาวอย่างน้อย 6 ตัวอักษร")
+                    return
             if not self._relay_cfg():
-                messagebox.showerror(APP, "ยังไม่ได้ตั้งค่า Relay Server\n\nไปที่แท็บ \"การเชื่อมต่อ (Relay)\" "
-                                          "หรือใส่ RELAY_ADDR / RELAY_KEY ในไฟล์ .env")
+                problem("ยังไม่ได้ตั้งค่า Server\n\nไปที่แท็บ \"ตั้งค่า Server\"")
                 return
             self.cfg.update({"password": pw})
             save_config(self.cfg)
@@ -3567,6 +4010,7 @@ def run_gui():
             self.server.start()
             self.srv_btn.configure(text="■  หยุดเปิดรับ")
             self._banner("wait")
+            self._update_id_row()
             if SYSTEM == "Darwin":
                 scr, acc = mac_permissions()
                 if scr is False:
@@ -3583,8 +4027,8 @@ def run_gui():
             self.banner_state = (state, who)
             if state == "off":
                 bg, fg, border = "card", "muted", "border"
-                title = "○   ยังไม่เปิดรับการเชื่อมต่อ"
-                sub = "กด \"เริ่มเปิดรับการเชื่อมต่อ\" เพื่อให้เครื่องอื่นเชื่อมต่อเข้ามาได้"
+                title = "○   หยุดรับการเชื่อมต่อชั่วคราว" if not sub else "○   ยังไม่พร้อมรับการเชื่อมต่อ"
+                sub = sub or "กด \"เริ่มเปิดรับการเชื่อมต่อ\" เพื่อให้เครื่องอื่นเชื่อมต่อเข้ามาได้อีกครั้ง"
             elif state == "wait":
                 bg, fg, border = "ok_bg", "ok", "ok_bg"
                 title = "●   พร้อมรับการเชื่อมต่อ"
@@ -3624,12 +4068,15 @@ def run_gui():
                         self.conn_btn.configure(state="normal")
                         self.cstatus.set("")
                         rec = [rid] + [h for h in (parse_id(x) for x in self.cfg.get("recent", [])) if h and h != rid]
-                        ri = [{"id": rid, "name": info.get("name", ""), "t": time.time()}] + \
-                             [r for r in self.cfg.get("recent_info", []) if r.get("id") != rid]
+                        old = self._recent(rid) or {}
+                        ri = [{"id": rid, "name": info.get("name", ""), "alias": old.get("alias", ""),
+                               "t": time.time()}] + [r for r in self.cfg.get("recent_info", []) if r.get("id") != rid]
                         self.cfg.update({"recent": rec[:15], "recent_info": ri[:30]})
                         save_config(self.cfg)
                         self.host_cb.configure(values=[fmt_id(x) for x in rec[:15]])
-                        self._refresh_recent()
+                        self._refresh_recent(select=rid)
+                        if old.get("alias"):
+                            info = dict(info, name=old["alias"])
                         self.viewers.append(Viewer(self, tls, info, "ID " + fmt_id(rid), fp))
                     elif k == "connect_err":
                         self.conn_btn.configure(state="normal")
@@ -3671,6 +4118,14 @@ def run_gui():
                         self._update_id_row(m[1], m[2])
                         if m[1] == "error":
                             self._log(m[2])
+                    elif k == "update_info":
+                        self._on_update_info(m[1], m[2])
+                    elif k == "update_progress":
+                        self.upd_progress.configure(value=100.0 * m[1] / max(1, m[2]))
+                        self.upd_status.configure(text="กำลังดาวน์โหลด… %s / %s" % (fmt_size(m[1]), fmt_size(m[2])),
+                                                  fg=T.c("muted"))
+                    elif k == "update_done":
+                        self._on_update_done(m[1])
                     elif k == "relay_test":
                         self.relay_test_var.set(m[1])
                     elif k == "latency":

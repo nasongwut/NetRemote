@@ -1,0 +1,10 @@
+{
+  "version": "1.2",
+  "notes": "• แก้ไขปัญหา ...\n• เพิ่มความสามารถ ...",
+  "url": "https://github.com/nasongwut/Remote/actions",
+  "files": {
+    "mac-arm64": "NetRemote-macOS-arm64.dmg",
+    "mac-x86_64": "NetRemote-macOS-x86_64.dmg",
+    "windows": "NetRemote.exe"
+  }
+}

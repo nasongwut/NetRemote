@@ -51,7 +51,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 APP = "NetRemote"
-VERSION = "1.2"
+VERSION = "1.3"
 PROTO = 1
 DEFAULT_PORT = 5905
 SYSTEM = platform.system()
@@ -129,7 +129,7 @@ def env_bool(key, default):
 
 
 # ============================================================================
-# ภาษา (ไทย / English) — ตั้งในโปรแกรม (ปุ่มมุมขวาบน) หรือ LANGUAGE=th/en ในไฟล์ .env
+# ภาษา (ไทย / English) — เริ่มต้นเป็น English · เปลี่ยนได้ที่ปุ่มมุมขวาบน หรือ LANGUAGE=th/en ในไฟล์ .env
 # ============================================================================
 def _detect_lang():
     v = ENV.get("LANGUAGE", "").strip().lower()[:2]
@@ -142,7 +142,7 @@ def _detect_lang():
             return v
     except Exception:
         pass
-    return "th"
+    return "en"                                      # ภาษาเริ่มต้น = English
 
 
 LANG = _detect_lang()
@@ -1208,6 +1208,8 @@ class Server(threading.Thread):
             self.events.put(("server_err", tr("ยังไม่ได้ตั้งค่า Server\n\nตั้งค่าที่แท็บ \"ตั้งค่า Server\"")))
             return
         r = self.relay
+        if r.get("direct", True):
+            UPNP.start()
         self.relay_thread = RelayHost(self, r["addr"], r.get("key", ""), r["id"], r["secret"], self.events)
         self.relay_thread.start()
         self.log(tr("พร้อมรับการเชื่อมต่อ — ID %s") % fmt_id(r["id"]))
@@ -2040,24 +2042,245 @@ def _relay_socket(addr, timeout=10):
     return s
 
 
-def _try_direct(cands, token, timeout=3.0):
-    """ลองเชื่อมต่อตรงไปยังเครื่องปลายทางทุกที่อยู่พร้อมกัน — คืน socket แรกที่ยืนยัน token สำเร็จ หรือ None"""
-    won, lock, done = {}, threading.Lock(), threading.Event()
-    left = [len(cands)]
+# ============================================================================
+# เชื่อมต่อตรงแบบ P2P (ไม่ผ่าน Server) — ลองทุกทางพร้อมกัน:
+#   • ทั้งสองทิศทาง: เครื่องที่ควบคุม → ปลายทาง และ ปลายทาง → เครื่องที่ควบคุม (กัน Firewall ฝั่งใดฝั่งหนึ่ง)
+#   • IPv4 วง LAN, IPv6 (ข้ามอินเทอร์เน็ตได้ถ้ามี), และพอร์ตที่เปิดอัตโนมัติผ่าน UPnP ของ Router
+# ทุกช่องต้องยืนยันด้วย token ครั้งเดียวจาก Server แล้วยังต้องผ่าน TLS + รหัสผ่านเหมือนเดิม
+# เครื่องที่ควบคุมเป็นผู้ "เลือก" ช่องที่ใช้ (pick) — จึงได้ช่องเดียวเสมอแม้ต่อสำเร็จหลายทาง
+# ============================================================================
+P2P_PROTO = 2
 
-    def attempt(c):
+
+def _private_v4(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+        return a.is_private or a in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        return True
+
+
+def get_local_ip6():
+    """IPv6 ที่ออกอินเทอร์เน็ตได้ (global) ของเครื่องนี้ — ไม่ส่งข้อมูลจริง"""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.connect(("2001:4860:4860::8888", 53))
+        ip = s.getsockname()[0].split("%")[0]
+        a = ipaddress.ip_address(ip)
+        return ip if a.is_global else None
+    except Exception:
+        return None
+    finally:
+        if s:
+            s.close()
+
+
+class Upnp:
+    """เปิดพอร์ตชั่วคราวที่ Router อัตโนมัติ (UPnP IGD) — ถ้า Router ไม่รองรับก็ข้ามไปเงียบ ๆ"""
+    ST = ("urn:schemas-upnp-org:service:WANIPConnection:1", "urn:schemas-upnp-org:service:WANIPConnection:2",
+          "urn:schemas-upnp-org:service:WANPPPConnection:1", "urn:schemas-upnp-org:device:InternetGatewayDevice:1")
+
+    def __init__(self):
+        self.ctrl = self.stype = self.ext_ip = None
+        self.done = threading.Event()
+        self.lock = threading.Lock()
+
+    def start(self):
+        if not self.done.is_set() and not getattr(self, "_started", False):
+            self._started = True
+            threading.Thread(target=self._discover, daemon=True).start()
+
+    def _discover(self):
+        try:
+            import urllib.request
+            import xml.etree.ElementTree as ET
+            from urllib.parse import urljoin
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1.5)
+            for st in self.ST:
+                s.sendto(("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\n"
+                          "MX: 1\r\nST: %s\r\n\r\n" % st).encode(), ("239.255.255.250", 1900))
+            locs = []
+            t_end = time.time() + 2.0
+            while time.time() < t_end:
+                try:
+                    data, _a = s.recvfrom(4096)
+                except socket.timeout:
+                    break
+                m = re.search(rb"(?im)^location:\s*(\S+)", data)
+                if m and m.group(1).decode() not in locs:
+                    locs.append(m.group(1).decode())
+            s.close()
+            for loc in locs:
+                try:
+                    xml = urllib.request.urlopen(loc, timeout=2).read()
+                    root = ET.fromstring(xml)
+                    base = loc
+                    for el in root.iter():
+                        if el.tag.endswith("URLBase") and el.text:
+                            base = el.text.strip()
+                    for svc in root.iter():
+                        if not svc.tag.endswith("service"):
+                            continue
+                        st = ct = None
+                        for c in svc:
+                            if c.tag.endswith("serviceType"):
+                                st = (c.text or "").strip()
+                            elif c.tag.endswith("controlURL"):
+                                ct = (c.text or "").strip()
+                        if st and ct and ("WANIPConnection" in st or "WANPPPConnection" in st):
+                            self.ctrl, self.stype = urljoin(base, ct), st
+                            ip = self._soap("GetExternalIPAddress", {}).get("NewExternalIPAddress")
+                            self.ext_ip = ip if ip and not _private_v4(ip) else None
+                            return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        finally:
+            self.done.set()
+
+    def _soap(self, action, args):
+        import urllib.request
+        body = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:%s xmlns:u="%s">%s</u:%s>'
+                '</s:Body></s:Envelope>') % (action, self.stype,
+                                             "".join("<%s>%s</%s>" % (k, v, k) for k, v in args.items()), action)
+        req = urllib.request.Request(self.ctrl, data=body.encode(), headers={
+            "Content-Type": 'text/xml; charset="utf-8"', "SOAPAction": '"%s#%s"' % (self.stype, action)})
+        out = urllib.request.urlopen(req, timeout=2).read().decode("utf-8", "replace")
+        return dict(re.findall(r"<(New\w+)>([^<]*)</New\w+>", out))
+
+    def map(self, port, wait=1.0):
+        """เปิดพอร์ต TCP ภายนอก → พอร์ตนี้ของเครื่องเรา คืน "ip:port" หรือ None"""
+        self.done.wait(wait)
+        if not (self.ctrl and self.ext_ip):
+            return None
+        local = get_local_ip()
+        for lease in (300, 0):
+            try:
+                self._soap("AddPortMapping", {
+                    "NewRemoteHost": "", "NewExternalPort": port, "NewProtocol": "TCP", "NewInternalPort": port,
+                    "NewInternalClient": local, "NewEnabled": 1, "NewPortMappingDescription": "NetRemote",
+                    "NewLeaseDuration": lease})
+                threading.Timer(25, self.unmap, args=(port,)).start()      # ปิดพอร์ตหลังหมดเวลาเชื่อมต่อ
+                return "%s:%d" % (self.ext_ip, port)
+            except Exception:
+                continue
+        return None
+
+    def unmap(self, port):
+        try:
+            self._soap("DeletePortMapping", {"NewRemoteHost": "", "NewExternalPort": port, "NewProtocol": "TCP"})
+        except Exception:
+            pass
+
+
+UPNP = Upnp()
+
+
+def p2p_listen(fixed_port=0):
+    """เปิดพอร์ตชั่วคราวรับการเชื่อมต่อตรง (IPv4 + IPv6) — คืน (socket, port) หรือ (None, 0)"""
+    for fam in (socket.AF_INET6, socket.AF_INET):
+        for p in ([fixed_port, 0] if fixed_port else [0]):
+            ls = None
+            try:
+                ls = socket.socket(fam, socket.SOCK_STREAM)
+                ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if fam == socket.AF_INET6:
+                    ls.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                    ls.bind(("::", p))
+                else:
+                    ls.bind(("0.0.0.0", p))
+                ls.listen(8)
+                return ls, ls.getsockname()[1]
+            except Exception:
+                if ls:
+                    ls.close()
+    return None, 0
+
+
+def p2p_cands(ls, port):
+    """ที่อยู่ที่อีกฝั่งลองเชื่อมต่อเข้ามาได้ — LAN, IPv6, และพอร์ตที่เปิดผ่าน UPnP"""
+    out = ["%s:%d" % (ip, port) for ip in get_local_ips() if not ip.startswith("127.")]
+    if ls is not None and ls.family == socket.AF_INET6:
+        ip6 = get_local_ip6()
+        if ip6:
+            out.append("[%s]:%d" % (ip6, port))
+    up = UPNP.map(port)
+    if up and up not in out:
+        out.append(up)
+    return out[:10]
+
+
+def _p2p_connect(c, timeout):
+    h, p = parse_hostport(c, 0)
+    return socket.create_connection((h, p), timeout=timeout)
+
+
+def p2p_race(token, peer_cands, ls, i_pick, timeout=3.5, legacy=False):
+    """ลองต่อตรงทุกทางพร้อมกัน คืน (socket, รายละเอียด)
+    i_pick=True  = เครื่องที่ควบคุม (เป็นผู้เลือกช่อง)
+    i_pick=False = เครื่องปลายทาง (รอให้อีกฝั่งเลือก)
+    legacy=True  = อีกฝั่งเป็นโปรแกรมเวอร์ชันเก่า (ต่อออกทางเดียว ไม่มีขั้นตอน pick)"""
+    won, lock, done = {}, threading.Lock(), threading.Event()
+    deadline = time.time() + timeout
+    tried = list(peer_cands)
+
+    def finish(sock, how):
+        with lock:
+            if "s" in won:
+                return False
+            won["s"], won["how"] = sock, how
+        done.set()
+        return True
+
+    def handshake(sock, outbound, how):
+        """ยืนยัน token แล้วตกลงเลือกช่อง — คืน True ถ้าช่องนี้ถูกเลือก"""
+        sock.settimeout(max(1.0, deadline - time.time() + 1.5))
+        if outbound:
+            line_send(sock, {"token": token, "p2p": P2P_PROTO})
+            r = line_recv(sock, 1024)
+            if not r.get("ok"):
+                return False
+            if legacy:
+                return finish(sock, how)
+            if i_pick:
+                with lock:
+                    if "s" in won:
+                        return False
+                    won["s"], won["how"] = sock, how
+                line_send(sock, {"pick": 1})
+                done.set()
+                return True
+            return bool(r.get("pick")) and finish(sock, how)
+        r = line_recv(sock, 1024)
+        if not hmac.compare_digest(str(r.get("token", "")), token):
+            return False
+        if legacy or int(r.get("p2p") or 0) < P2P_PROTO:     # อีกฝั่งเวอร์ชันเก่า: ไม่มีขั้นตอน pick
+            with lock:
+                if "s" in won:
+                    return False
+            line_send(sock, {"ok": True})
+            return finish(sock, how)
+        if i_pick:
+            with lock:
+                if "s" in won:
+                    return False
+                won["s"], won["how"] = sock, how
+            line_send(sock, {"ok": True, "pick": 1})
+            done.set()
+            return True
+        line_send(sock, {"ok": True})
+        return bool(line_recv(sock, 1024).get("pick")) and finish(sock, how)
+
+    def dial(c):
         sock = None
         try:
-            h, p = parse_hostport(c, 0)
-            sock = socket.create_connection((h, p), timeout=min(2.0, timeout))
-            sock.settimeout(2.0)
-            line_send(sock, {"token": token})
-            if line_recv(sock, 1024).get("ok"):
-                with lock:
-                    if "s" not in won:
-                        won["s"], won["addr"] = sock, c
-                        sock = None
-                        done.set()
+            sock = _p2p_connect(c, min(2.5, max(0.5, deadline - time.time())))
+            if handshake(sock, True, "out " + c):
+                sock = None
         except Exception:
             pass
         finally:
@@ -2066,45 +2289,85 @@ def _try_direct(cands, token, timeout=3.0):
                     sock.close()
                 except Exception:
                     pass
-            with lock:
-                left[0] -= 1
-                if left[0] <= 0:
-                    done.set()
-    for c in cands:
-        threading.Thread(target=attempt, args=(c,), daemon=True).start()
-    if cands:
-        done.wait(timeout)
+
+    def accept_loop():
+        while not done.is_set() and time.time() < deadline:
+            try:
+                ls.settimeout(max(0.1, min(0.5, deadline - time.time())))
+                conn, addr = ls.accept()
+            except (socket.timeout, OSError):
+                continue
+
+            def serve(conn=conn, addr=addr):
+                try:
+                    if handshake(conn, False, "in " + str(addr[0])):
+                        return
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            threading.Thread(target=serve, daemon=True).start()
+
+    if ls is not None:
+        threading.Thread(target=accept_loop, daemon=True).start()
+    for c in peer_cands:
+        threading.Thread(target=dial, args=(c,), daemon=True).start()
+    if peer_cands or ls is not None:
+        done.wait(max(0.1, deadline - time.time()))
     with lock:
-        s = won.pop("s", None)
-        won["s"] = None                                    # ที่ต่อสำเร็จช้ากว่านี้ จะถูกปิดทิ้ง
-    return s
+        s = won.get("s")
+        how = won.get("how", "")
+        won.setdefault("s", None)
+    if s is not None:
+        s.settimeout(None)
+        try:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        return s, how
+    why = "tried %s" % ", ".join(tried[:6]) if tried else "no address"
+    return None, why
 
 
 def relay_dial(addr, key, host_id, direct=True):
-    """เครื่องที่ควบคุม: ขอเชื่อมต่อไปยัง ID ผ่าน Relay
-    ถ้า direct=True จะลองเชื่อมต่อตรงก่อน (เร็วกว่า ไม่ใช้ Bandwidth ของ Server) ต่อไม่ได้จึงใช้ Relay
-    คืน (socket, route, presence) — route = "direct" / "relay", presence = ช่องที่เปิดค้างกับ Relay (หรือ None)"""
-    s = _relay_socket(addr)
+    """เครื่องที่ควบคุม: ขอเชื่อมต่อไปยัง ID ผ่าน Server
+    ลองเชื่อมต่อตรง (P2P) ก่อนเสมอ ต่อไม่ได้จึงให้ Server ส่งต่อข้อมูล
+    คืน (socket, route, presence) — route = "direct" / "relay", presence = ช่องที่เปิดค้างกับ Server (หรือ None)"""
+    ls, port = p2p_listen() if direct else (None, 0)
+    s = None
     try:
+        my_cands = p2p_cands(ls, port) if ls is not None else []
+        s = _relay_socket(addr)
         s.settimeout(25)
-        line_send(s, {"role": "client", "id": host_id, "key": key or "", "v": 1, "lang": LANG, "direct": 1 if direct else 0})
+        line_send(s, {"role": "client", "id": host_id, "key": key or "", "v": 1, "lang": LANG,
+                      "direct": 1 if direct else 0, "p2p": P2P_PROTO if direct else 0, "ccands": my_cands})
         r = line_recv(s)
         if not r.get("ok"):
             raise ConnectionError(srv(r.get("err")) or tr("Server ปฏิเสธการเชื่อมต่อ"))
         if r.get("phase") == "direct":
-            ds = _try_direct([str(c) for c in r.get("cands") or []], str(r.get("token", "")))
+            legacy = int(r.get("hp2p") or 0) < P2P_PROTO
+            ds, how = p2p_race(str(r.get("token", "")), [str(c) for c in r.get("cands") or []],
+                               None if legacy else ls, True, legacy=legacy)
             if ds is not None:
-                line_send(s, {"use": "direct"})
-                ds.settimeout(None)
+                line_send(s, {"use": "direct", "how": how})
                 return ds, "direct", s
-            line_send(s, {"use": "relay"})
+            line_send(s, {"use": "relay", "why": how, "mine": my_cands})
             r = line_recv(s)
             if not r.get("ok"):
                 raise ConnectionError(srv(r.get("err")) or tr("Server ปฏิเสธการเชื่อมต่อ"))
         return s, "relay", None
     except Exception:
-        s.close()
+        if s is not None:
+            s.close()
         raise
+    finally:
+        if ls is not None:
+            try:
+                ls.close()
+            except Exception:
+                pass
 
 
 def relay_test(addr, key):
@@ -2291,9 +2554,10 @@ class RelayHost(threading.Thread):
                         cmd = msg.get("cmd")
                         tok, frm = str(msg.get("token", "")), msg.get("from", "?")
                         if cmd == "connect":
-                            use_direct = msg.get("direct") and self.server.relay.get("direct", True)
-                            threading.Thread(target=self._direct if use_direct else self._data,
-                                             args=(tok, frm), daemon=True).start()
+                            if msg.get("direct") and self.server.relay.get("direct", True):
+                                threading.Thread(target=self._direct, args=(tok, frm, msg), daemon=True).start()
+                            else:
+                                threading.Thread(target=self._data, args=(tok, frm), daemon=True).start()
                         elif cmd == "open":                 # ต่อตรงไม่สำเร็จ → ใช้ Relay
                             ls = self.direct.pop(tok, None)
                             if ls:
@@ -2318,61 +2582,38 @@ class RelayHost(threading.Thread):
             backoff = min(backoff * 2, 60)
         self.status("off", tr("ปิดการเชื่อมต่อ Server แล้ว"))
 
-    def _direct(self, token, from_ip):
-        """เปิดพอร์ตชั่วคราว (≤ 20 วินาที) ให้เครื่องที่ควบคุมเชื่อมต่อตรง — รับเฉพาะผู้ที่มี token จาก Relay"""
-        port = self.server.relay.get("direct_port", 0)
-        ls = None
-        for p in ([port, 0] if port else [0]):
-            try:
-                ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                ls.bind(("0.0.0.0", p))
-                ls.listen(8)
-                break
-            except OSError:
-                try:
-                    ls.close()
-                except Exception:
-                    pass
-                ls = None
+    def _direct(self, token, from_ip, msg=None):
+        """เชื่อมต่อตรงกับเครื่องที่ควบคุม (P2P): เปิดพอร์ตชั่วคราว + ลองต่อออกไปหาอีกฝั่งพร้อมกัน
+        รับเฉพาะผู้ที่มี token จาก Server — ถ้าไม่สำเร็จ Server จะสั่ง "open" ให้ใช้ช่องผ่าน Server แทน"""
+        msg = msg or {}
+        ls, port = p2p_listen(self.server.relay.get("direct_port", 0))
         if ls is None:
             return self._data(token, from_ip)
-        real = ls.getsockname()[1]
         self.direct[token] = ls
+        peer_new = int(msg.get("p2p") or 0) >= P2P_PROTO
         try:
-            self._ctl({"cmd": "cands", "token": token, "lan": ["%s:%d" % (ip, real) for ip in get_local_ips()],
-                       "port": real, "fixed": bool(port and real == port)})
+            cands = p2p_cands(ls, port)
+            self._ctl({"cmd": "cands", "token": token, "lan": cands, "port": port, "p2p": P2P_PROTO,
+                       "fixed": bool(self.server.relay.get("direct_port") and port == self.server.relay.get("direct_port"))})
         except Exception:
             self.direct.pop(token, None)
             ls.close()
             return
-        deadline = time.time() + 20
+        peer = [str(c) for c in (msg.get("ccands") or [])][:10] if peer_new else []
         try:
-            while time.time() < deadline and self.direct.get(token) is ls:
-                ls.settimeout(max(0.2, deadline - time.time()))
-                try:
-                    conn, addr = ls.accept()
-                except (socket.timeout, OSError):
-                    continue
-                try:
-                    conn.settimeout(3)
-                    if hmac.compare_digest(str(line_recv(conn, 1024).get("token", "")), token):
-                        line_send(conn, {"ok": True})
-                        self.direct.pop(token, None)
-                        ls.close()
-                        conn.settimeout(None)
-                        self.server._client(conn, (addr[0], 0))
-                        return
-                except Exception:
-                    pass
-                conn.close()
+            sock, how = p2p_race(token, peer, ls, False, timeout=9.0, legacy=not peer_new)
         finally:
-            if self.direct.get(token) is ls:
-                self.direct.pop(token, None)
+            self.direct.pop(token, None)
             try:
                 ls.close()
             except Exception:
                 pass
+        if sock is not None:
+            try:
+                ip = sock.getpeername()[0].replace("::ffff:", "")
+            except OSError:
+                ip = from_ip
+            self.server._client(sock, (ip, 0))
 
     def _data(self, token, from_ip):
         try:
@@ -4694,6 +4935,8 @@ def run_gui():
                 self.server.stop()
             self.root.after(200, self.root.destroy)
 
+    if env_bool("DIRECT_CONNECT", True):
+        UPNP.start()
     root = tk.Tk()
     T = Theme(root, env_str("THEME", load_config().get("theme", "auto")))
     set_app_icon(root)

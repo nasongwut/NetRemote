@@ -35,7 +35,7 @@ import time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4"
+VERSION = "1.5"
 ID_RE = re.compile(r"^\d{9}$")
 
 
@@ -70,6 +70,7 @@ EVENT_EN = [
     ("%s ขอเชื่อมต่อ ID %s แต่เครื่องไม่ออนไลน์", "%s requested ID %s but it is offline"),
     ("%s เริ่มควบคุมเครื่อง %s (ID %s) — เชื่อมต่อตรง ไม่ผ่าน Relay", "%s started controlling %s (ID %s) — direct, not via Relay"),
     ("%s เลิกควบคุมเครื่อง %s (ID %s) — เชื่อมต่อตรง, %s", "%s stopped controlling %s (ID %s) — direct, %s"),
+    ("%s เริ่มควบคุมเครื่อง %s (ID %s) — ผ่าน Relay: %s", "%s started controlling %s (ID %s) — via Relay: %s"),
     ("%s เริ่มควบคุมเครื่อง %s (ID %s)", "%s started controlling %s (ID %s)"),
     ("%s เลิกควบคุมเครื่อง %s (ID %s) — %s, %.1f MB", "%s stopped controlling %s (ID %s) — %s, %.1f MB"),
     ("%s ดาวน์โหลดอัปเดต %s (%s)", "%s downloaded update %s (%s)"),
@@ -82,7 +83,15 @@ EVENT_EN = [
     ("ผู้ดูแลโหลดการตั้งค่าใหม่: %s", "Admin reloaded settings: %s"),
     ("ผู้ดูแลสั่งรีสตาร์ต Relay", "Admin restarted the Relay"),
 ]
-EVENT_WORDS = [("(ใช้ Relay Key)", "(Server Key required)"), ("(ไม่มี Relay Key — ใครก็ใช้ได้)", "(no Server Key — open to anyone)")]
+WHY_TH = {"unreachable": "สองเครื่องต่อหากันตรงไม่ได้ (Firewall/Router)",
+          "host_old": "เครื่องปลายทางใช้โปรแกรมเวอร์ชันเก่า",
+          "host_off": "เครื่องปลายทางปิดการเชื่อมต่อตรง",
+          "client_off": "เครื่องที่ควบคุมใช้เวอร์ชันเก่าหรือปิดการเชื่อมต่อตรง"}
+WHY_EN = {"unreachable": "the two computers cannot reach each other (firewall/router)",
+          "host_old": "the remote computer runs an old version",
+          "host_off": "direct connection is off on the remote computer",
+          "client_off": "the controlling computer runs an old version or has direct connection off"}
+EVENT_WORDS = [(WHY_TH[k], WHY_EN[k]) for k in WHY_TH] + [("(ใช้ Relay Key)", "(Server Key required)"), ("(ไม่มี Relay Key — ใครก็ใช้ได้)", "(no Server Key — open to anyone)")]
 
 
 def _fmt_regex(fmt):
@@ -359,7 +368,9 @@ class Relay:
         with self.lock:
             self.pending[token] = pend
         try:
-            hc.send({"cmd": "connect", "token": token, "from": ip, "direct": 1 if want_direct else 0})
+            hc.send({"cmd": "connect", "token": token, "from": ip, "direct": 1 if want_direct else 0,
+                     "p2p": int(msg.get("p2p") or 0), "ccands": [str(x) for x in (msg.get("ccands") or [])][:10]})
+            why = "client_off" if not want_direct else ""
             pend["ev"].wait(15)
             c = pend["cands"]
             if pend["sock"] is None and c is not None:
@@ -369,14 +380,18 @@ class Relay:
                     pub = "%s:%d" % (hc.ip, int(c["port"]))
                     if pub not in cands:
                         cands.append(pub)
-                line_send(conn, {"ok": True, "phase": "direct", "cands": cands, "token": token})
+                line_send(conn, {"ok": True, "phase": "direct", "cands": cands, "token": token,
+                                 "hp2p": int(c.get("p2p") or 0)})
                 conn.settimeout(30)
                 r = line_recv(conn)
                 if r.get("use") == "direct":
                     with self.lock:
                         self.pending.pop(token, None)
-                    self._direct_session(conn, ip, hid, hc)
+                    self._direct_session(conn, ip, hid, hc, str(r.get("how", ""))[:120])
                     return False
+                why = "unreachable"
+                log("ต่อตรงไม่สำเร็จ %s → ID %s: %s | ฝั่งควบคุม: %s" % (
+                    ip, hid, str(r.get("why", ""))[:300], ", ".join(str(x) for x in (r.get("mine") or []))[:300]))
                 # ② ต่อตรงไม่ได้ → ใช้ Relay
                 pend["ev"].clear()
                 hc.send({"cmd": "open", "token": token})
@@ -394,14 +409,16 @@ class Relay:
         if pend["sock"] is None:
             line_send(conn, {"ok": False, "err": "เครื่องปลายทางไม่ตอบสนอง"})
             return False
+        if want_direct and not why:
+            why = "host_old" if not hc.app or hc.app < "1.2" else "host_off"
         line_send(conn, {"ok": True, "route": "relay"})
-        threading.Thread(target=self._pipe, args=(conn, pend["sock"], ip, hid, hc), daemon=True).start()
+        threading.Thread(target=self._pipe, args=(conn, pend["sock"], ip, hid, hc, why), daemon=True).start()
         return True
 
-    def _direct_session(self, conn, ip, hid, hc):
+    def _direct_session(self, conn, ip, hid, hc, how=""):
         """สองเครื่องเชื่อมต่อกันตรงแล้ว — ข้อมูลไม่ผ่าน Relay; Client เปิดช่องนี้ค้างไว้เพื่อแสดงในหน้ามอนิเตอร์"""
         sid = secrets.token_hex(6)
-        sess = {"sid": sid, "client": ip, "hid": hid, "hname": hc.name, "hip": hc.ip, "mode": "direct",
+        sess = {"sid": sid, "client": ip, "hid": hid, "hname": hc.name, "hip": hc.ip, "mode": "direct", "how": how,
                 "start": time.time(), "up": 0, "down": 0, "socks": (conn,), "hc": hc}
         with self.lock:
             self.sessions[sid] = sess
@@ -429,14 +446,14 @@ class Relay:
         pend["ev"].set()
         return True
 
-    def _pipe(self, a, b, ip, hid, hc):
+    def _pipe(self, a, b, ip, hid, hc, why=""):
         sid = secrets.token_hex(6)
-        sess = {"sid": sid, "client": ip, "hid": hid, "hname": hc.name, "hip": hc.ip, "mode": "relay",
+        sess = {"sid": sid, "client": ip, "hid": hid, "hname": hc.name, "hip": hc.ip, "mode": "relay", "why": why,
                 "start": time.time(), "up": 0, "down": 0, "socks": (a, b)}
         with self.lock:
             self.sessions[sid] = sess
             self.stats["sessions_total"] += 1
-        self.event("connect", "%s เริ่มควบคุมเครื่อง %s (ID %s)" % (ip, hc.name or "-", hid))
+        self.event("connect", "%s เริ่มควบคุมเครื่อง %s (ID %s) — ผ่าน Relay: %s" % (ip, hc.name or "-", hid, WHY_TH.get(why, why or "-")))
         a.settimeout(None)
         b.settimeout(None)
 
@@ -532,7 +549,8 @@ class Relay:
             self.samples[s["sid"]] = (now, s["up"], s["down"])
             out_s.append({"sid": s["sid"], "client": s["client"], "hid": s["hid"], "hname": s["hname"],
                           "hip": s["hip"], "dur": now - s["start"], "up": s["up"], "down": s["down"],
-                          "rate_up": ru, "rate_down": rd, "mode": s.get("mode", "relay")})
+                          "rate_up": ru, "rate_down": rd, "mode": s.get("mode", "relay"), "why": s.get("why", ""),
+                          "how": s.get("how", "")})
         out_s.sort(key=lambda x: -x["dur"])
         out_h = [{"id": hid, "name": hc.name, "ip": hc.ip, "online": now - hc.since, "sessions": busy[hid],
                   "app": hc.app}
@@ -656,6 +674,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .ev time{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
 .dot{width:8px;height:8px;border-radius:50%;margin-top:7px;flex:none;background:var(--muted)}
 .d-online,.d-connect{background:var(--ok)}.d-warn{background:var(--warn)}.d-info{background:var(--accent)}
+.why{color:var(--warn);max-width:220px;white-space:normal;text-align:right;line-height:1.3;margin-top:2px;margin-left:auto}
 .events{max-height:520px;overflow:auto;padding-bottom:6px}
 .err{background:var(--dangerbg);color:var(--danger);padding:10px 14px;border-radius:10px;margin-bottom:14px;display:none}
 /* ---------- monitor ---------- */
@@ -823,7 +842,7 @@ font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:9;max-width
 <div class="toast" id="toast"></div>
 <div class="overlay" id="ov"><div class="card"><div class="spin"></div><b id="ov-t">กำลังรีสตาร์ต Relay…</b><div class="muted small" id="ov-s" style="margin-top:6px"></div></div></div>
 <script>
-const LANG=(()=>{try{return localStorage.getItem("nr_lang")||"th"}catch(e){return "th"}})();
+const LANG=(()=>{try{return localStorage.getItem("nr_lang")||"en"}catch(e){return "en"}})();
 const EN={
 "ภาพรวม":"Overview","ตั้งค่า Server":"Server Settings","Relay ทำงานอยู่":"Relay running","ออกจากระบบ":"Sign out",
 "กำลังโหลด…":"Loading…","อัปเดตอัตโนมัติ":"Auto-refresh",
@@ -869,9 +888,15 @@ const EN={
 "เปิดให้เครื่องอื่นดูได้ ต้องตั้งรหัสผ่านหน้าเว็บหรือ Server Key":"When open to other computers, set a web password or Server Key",
 "รีสตาร์ต Relay ตอนนี้?\n\nเครื่องที่ออนไลน์จะหลุดชั่วครู่แล้วเชื่อมต่อกลับเอง การรีโมทที่ผ่าน Relay จะถูกตัด":"Restart the Relay now?\n\nOnline computers will drop briefly and reconnect by themselves. Remote sessions via the Relay will be ended.",
 "รอ Relay กลับมา…":"Waiting for the Relay…","หน้าเว็บย้ายไปพอร์ต":"The page moved to port","Relay กลับมาแล้ว":"Relay is back",
-"มีการแก้ไขที่ยังไม่บันทึก":"You have unsaved changes","แสดง":"Show","ซ่อน":"Hide","ค่าในไฟล์ .env":"Value in .env file","กำลังใช้":"In use"
+"มีการแก้ไขที่ยังไม่บันทึก":"You have unsaved changes",
+"สองเครื่องต่อหากันตรงไม่ได้ (Firewall/Router)":"The two computers cannot reach each other (firewall/router)",
+"เครื่องปลายทางใช้โปรแกรมเวอร์ชันเก่า":"The remote computer runs an old version",
+"เครื่องปลายทางปิดการเชื่อมต่อตรง":"Direct connection is off on the remote computer",
+"เครื่องที่ควบคุมใช้เวอร์ชันเก่าหรือปิดการเชื่อมต่อตรง":"The controlling computer runs an old version or has direct connection off","แสดง":"Show","ซ่อน":"Hide","ค่าในไฟล์ .env":"Value in .env file","กำลังใช้":"In use"
 };
 const t=s=>LANG==="en"?(EN[s]??s):s;
+const WHYT={unreachable:"สองเครื่องต่อหากันตรงไม่ได้ (Firewall/Router)",host_old:"เครื่องปลายทางใช้โปรแกรมเวอร์ชันเก่า",
+ host_off:"เครื่องปลายทางปิดการเชื่อมต่อตรง",client_off:"เครื่องที่ควบคุมใช้เวอร์ชันเก่าหรือปิดการเชื่อมต่อตรง"};
 const LOC=LANG==="en"?"en-GB":"th-TH";
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -923,7 +948,7 @@ async function load(){
    <td><b>${esc(s.hname||"-")}</b><div class="small muted mono" style="white-space:nowrap">ID ${fid(s.hid)}</div></td>
    <td class="num">${fd(s.dur)}</td>${s.mode==="direct"
     ?`<td class="num" colspan="2"><span class="pill p-ok" title="${t("สองเครื่องเชื่อมต่อกันตรง ข้อมูลไม่ผ่าน Relay")}">${t("⚡ เชื่อมต่อตรง")}</span></td>`
-    :`<td class="num">${fb(s.up+s.down)}<div class="small muted">${t("ผ่าน Relay")}</div></td>
+    :`<td class="num">${fb(s.up+s.down)}<div class="small muted">${t("ผ่าน Relay")}</div>${s.why?`<div class="small why">⚠ ${esc(t(WHYT[s.why]||s.why))}</div>`:""}</td>
    <td class="num">${fb(s.rate_up+s.rate_down)}/s<div class="small muted">↑${fb(s.rate_up)} ↓${fb(s.rate_down)}</div></td>`}
    <td class="num"><button class="kick" onclick="kick('sid','${s.sid}')">${t("ตัดการเชื่อมต่อ")}</button></td></tr>`).join("")
    :`<tr><td colspan="7" class="empty">${t("ยังไม่มีใครเชื่อมต่อ")}</td></tr>`;
@@ -1131,7 +1156,7 @@ form.card{position:relative}
 </form>
 <div class="foot">NetRemote Relay v__VER__</div></div>
 <script>
-const LANG=(()=>{try{return localStorage.getItem("nr_lang")||"th"}catch(e){return "th"}})();
+const LANG=(()=>{try{return localStorage.getItem("nr_lang")||"en"}catch(e){return "en"}})();
 const EN={"เข้าสู่ระบบ · NetRemote Relay":"Sign in · NetRemote Relay","เข้าสู่ระบบหน้ามอนิเตอร์สำหรับผู้ดูแล":"Sign in to the admin monitor",
 "รหัสผ่านผู้ดูแล (Admin Key)":"Admin password (Admin Key)","ใส่รหัสผ่าน":"Enter password","แสดงรหัสผ่าน":"Show password",
 "จดจำการเข้าสู่ระบบ 30 วัน":"Keep me signed in for 30 days","⇪ Caps Lock เปิดอยู่":"⇪ Caps Lock is on","เข้าสู่ระบบ":"Sign in",

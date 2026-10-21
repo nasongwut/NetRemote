@@ -1689,6 +1689,204 @@ def run_gui():
     import tkinter as tk
     from tkinter import messagebox, simpledialog, ttk
     from PIL import Image, ImageTk
+    import tkinter.font as tkfont
+
+    # ------------------------------------------------------------------
+    # ธีม (สว่าง / มืด) — สีม่วงเข้ากับไอคอนโปรแกรม
+    # ------------------------------------------------------------------
+    PALETTES = {
+        "light": dict(bg="#F3F4F8", card="#FFFFFF", border="#E3E6EE", text="#1D2130", muted="#6B7280",
+                      subtle="#EEF0F6", hover="#E3E6F0", field="#FFFFFF", accent="#6D4AFF", accent_hover="#5A37F0",
+                      accent_fg="#FFFFFF", sel="#ECE7FF", ok="#15803D", ok_bg="#E6F6EC", warn="#B45309",
+                      warn_bg="#FFF3E0", danger="#DC2626", danger_bg="#FDECEC", danger_hover="#B91C1C",
+                      header="#5B3AE6", header2="#7353FF", hdr_fg="#FFFFFF", hdr_muted="#DCD3FF", viewer="#0F1115"),
+        "dark": dict(bg="#121419", card="#1B1E26", border="#2B303B", text="#E8EAF0", muted="#9AA3B2",
+                     subtle="#252A34", hover="#2F3542", field="#21252E", accent="#8B6CFF", accent_hover="#A08AFF",
+                     accent_fg="#FFFFFF", sel="#352C5E", ok="#4ADE80", ok_bg="#14301F", warn="#FBBF24",
+                     warn_bg="#3A2B10", danger="#F87171", danger_bg="#3A1818", danger_hover="#EF4444",
+                     header="#2E2370", header2="#3D2F94", hdr_fg="#FFFFFF", hdr_muted="#B9AEF0", viewer="#0A0B0E"),
+    }
+
+    def detect_dark():
+        try:
+            if SYSTEM == "Darwin":
+                r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"], capture_output=True, timeout=2)
+                return b"Dark" in r.stdout
+            if SYSTEM == "Windows":
+                import winreg
+                k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                   r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+                return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+        except Exception:
+            pass
+        return False
+
+    class Theme:
+        def __init__(self, root, mode="auto"):
+            self.root, self.mode = root, mode if mode in ("auto", "light", "dark") else "auto"
+            self.items, self.callbacks = [], []
+            fam = tkfont.nametofont("TkDefaultFont").actual("family")
+            sz = 13 if SYSTEM == "Darwin" else 10
+            mono = "Menlo" if SYSTEM == "Darwin" else ("Consolas" if SYSTEM == "Windows" else "DejaVu Sans Mono")
+            F = tkfont.Font
+            self.f = {"base": F(family=fam, size=sz), "small": F(family=fam, size=sz - 2),
+                      "smallbold": F(family=fam, size=sz - 2, weight="bold"), "bold": F(family=fam, size=sz, weight="bold"),
+                      "h1": F(family=fam, size=sz + 7, weight="bold"), "h2": F(family=fam, size=sz + 3, weight="bold"),
+                      "big": F(family=fam, size=sz + 3), "mono": F(family=mono, size=sz + 5, weight="bold"),
+                      "monobig": F(family=mono, size=sz + 12, weight="bold"),
+                      "status": F(family=fam, size=sz + 5, weight="bold")}
+            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+                try:
+                    tkfont.nametofont(name).configure(family=fam, size=sz)
+                except Exception:
+                    pass
+            self.apply()
+
+        def c(self, k):
+            return self.p[k]
+
+        def track(self, w, **roles):
+            self.items.append((w, roles))
+            self._paint(w, roles)
+            return w
+
+        def _paint(self, w, roles):
+            try:
+                w.configure(**{opt: self.p[key] for opt, key in roles.items()})
+            except tk.TclError:
+                pass
+
+        def on_change(self, fn):
+            self.callbacks.append(fn)
+
+        def set_mode(self, mode):
+            self.mode = mode
+            self.apply()
+            for fn in list(self.callbacks):
+                try:
+                    fn()
+                except Exception:
+                    pass
+
+        def apply(self):
+            self.is_dark = self.mode == "dark" or (self.mode == "auto" and detect_dark())
+            p = self.p = PALETTES["dark" if self.is_dark else "light"]
+            s = ttk.Style(self.root)
+            s.theme_use("clam")
+            f = self.f
+            s.configure(".", background=p["bg"], foreground=p["text"], fieldbackground=p["field"],
+                        bordercolor=p["border"], lightcolor=p["border"], darkcolor=p["border"],
+                        troughcolor=p["subtle"], focuscolor=p["accent"], selectbackground=p["accent"],
+                        selectforeground=p["accent_fg"], insertcolor=p["text"], arrowcolor=p["muted"], font=f["base"])
+            s.configure("TFrame", background=p["bg"])
+            s.configure("Card.TFrame", background=p["card"])
+            s.configure("TLabel", background=p["bg"], foreground=p["text"])
+            s.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"], font=f["small"])
+            s.configure("Link.TLabel", background=p["bg"], foreground=p["accent"])
+            s.configure("H2.TLabel", background=p["bg"], foreground=p["text"], font=f["h2"])
+            # ปุ่ม
+            for name, bg, fg, hov, font in (("TButton", p["subtle"], p["text"], p["hover"], f["base"]),
+                                            ("Accent.TButton", p["accent"], p["accent_fg"], p["accent_hover"], f["bold"]),
+                                            ("Danger.TButton", p["danger"], "#FFFFFF", p["danger_hover"], f["bold"])):
+                s.configure(name, background=bg, foreground=fg, bordercolor=bg, lightcolor=bg, darkcolor=bg,
+                            relief="flat", padding=(14, 7), focusthickness=0, font=font, anchor="center")
+                s.map(name, background=[("disabled", p["subtle"]), ("pressed", hov), ("active", hov)],
+                      foreground=[("disabled", p["muted"])],
+                      bordercolor=[("active", hov), ("disabled", p["subtle"])],
+                      lightcolor=[("active", hov), ("disabled", p["subtle"])],
+                      darkcolor=[("active", hov), ("disabled", p["subtle"])])
+            for base in ("Accent.TButton", "TButton", "Danger.TButton"):
+                s.configure("Tool." + base, padding=(9, 5), font=f["small"] if base == "TButton" else f["smallbold"])
+                s.map("Tool." + base, **{k: s.map(base, k) for k in ("background", "foreground", "bordercolor",
+                                                                     "lightcolor", "darkcolor")})
+                s.configure("Big." + base, padding=(18, 11), font=f["h2"] if base != "TButton" else f["bold"])
+                s.map("Big." + base, **{k: s.map(base, k) for k in ("background", "foreground", "bordercolor",
+                                                                    "lightcolor", "darkcolor")})
+            # ช่องกรอก
+            for name in ("TEntry", "TCombobox", "TSpinbox"):
+                s.configure(name, fieldbackground=p["field"], foreground=p["text"], bordercolor=p["border"],
+                            lightcolor=p["field"], darkcolor=p["field"], background=p["field"], padding=(8, 6),
+                            arrowcolor=p["muted"], insertcolor=p["text"], selectbackground=p["sel"],
+                            selectforeground=p["text"])
+                s.map(name, bordercolor=[("focus", p["accent"])], lightcolor=[("focus", p["field"])],
+                      fieldbackground=[("readonly", p["field"]), ("disabled", p["subtle"])],
+                      foreground=[("disabled", p["muted"])], background=[("active", p["field"])],
+                      selectbackground=[("readonly", p["field"])], selectforeground=[("readonly", p["text"])])
+            self.root.option_add("*TCombobox*Listbox.background", p["field"])
+            self.root.option_add("*TCombobox*Listbox.foreground", p["text"])
+            self.root.option_add("*TCombobox*Listbox.selectBackground", p["sel"])
+            self.root.option_add("*TCombobox*Listbox.selectForeground", p["text"])
+            self.root.option_add("*TCombobox*Listbox.font", f["base"])
+            # Checkbox
+            for name, bg in (("TCheckbutton", p["bg"]), ("Card.TCheckbutton", p["card"])):
+                s.configure(name, background=bg, foreground=p["text"], indicatorbackground=p["field"],
+                            indicatorforeground=p["accent_fg"], upperbordercolor=p["border"],
+                            lowerbordercolor=p["border"], indicatormargin=(0, 0, 8, 0), padding=(0, 4), focusthickness=0)
+                s.map(name, background=[("active", bg)],
+                      indicatorbackground=[("selected", p["accent"]), ("active", p["subtle"])],
+                      upperbordercolor=[("selected", p["accent"])], lowerbordercolor=[("selected", p["accent"])],
+                      foreground=[("disabled", p["muted"])])
+            # แท็บ
+            s.configure("TNotebook", background=p["bg"], bordercolor=p["bg"], lightcolor=p["bg"],
+                        darkcolor=p["bg"], tabmargins=(14, 10, 14, 0))
+            s.configure("TNotebook.Tab", background=p["bg"], foreground=p["muted"], bordercolor=p["bg"],
+                        lightcolor=p["bg"], darkcolor=p["bg"], padding=(18, 9), font=f["bold"])
+            s.map("TNotebook.Tab", background=[("selected", p["sel"]), ("active", p["subtle"])],
+                  foreground=[("selected", p["accent"])], bordercolor=[("selected", p["sel"])],
+                  lightcolor=[("selected", p["sel"])], expand=[("selected", (0, 0, 0, 0))])
+            # ตาราง
+            s.configure("Treeview", background=p["card"], fieldbackground=p["card"], foreground=p["text"],
+                        bordercolor=p["card"], lightcolor=p["card"], darkcolor=p["card"],
+                        rowheight=int(f["base"].metrics("linespace") * 1.9), font=f["base"])
+            s.map("Treeview", background=[("selected", p["sel"])], foreground=[("selected", p["text"])])
+            s.configure("Treeview.Heading", background=p["subtle"], foreground=p["muted"], relief="flat",
+                        bordercolor=p["subtle"], lightcolor=p["subtle"], darkcolor=p["subtle"],
+                        font=f["smallbold"], padding=(8, 6))
+            s.map("Treeview.Heading", background=[("active", p["hover"])])
+            s.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+            for orient in ("Vertical", "Horizontal"):
+                s.configure(orient + ".TScrollbar", background=p["subtle"], troughcolor=p["card"],
+                            bordercolor=p["card"], lightcolor=p["subtle"], darkcolor=p["subtle"],
+                            arrowcolor=p["muted"], gripcount=0, arrowsize=12)
+                s.map(orient + ".TScrollbar", background=[("active", p["hover"])])
+            s.configure("TSeparator", background=p["border"])
+            s.configure("Horizontal.TProgressbar", background=p["accent"], troughcolor=p["subtle"],
+                        bordercolor=p["subtle"], lightcolor=p["accent"], darkcolor=p["accent"])
+            self.root.configure(bg=p["bg"])
+            for w, roles in list(self.items):
+                try:
+                    if w.winfo_exists():
+                        self._paint(w, roles)
+                    else:
+                        self.items.remove((w, roles))
+                except tk.TclError:
+                    self.items.remove((w, roles))
+
+    T = None   # กำหนดค่าเมื่อสร้างหน้าต่างหลัก
+
+    def card(parent):
+        return T.track(tk.Frame(parent, highlightthickness=1, bd=0),
+                       bg="card", highlightbackground="border", highlightcolor="border")
+
+    def lbl(parent, text="", fg="text", bg="card", font="base", **kw):
+        kw.setdefault("anchor", "w")
+        kw.setdefault("justify", "left")
+        return T.track(tk.Label(parent, text=text, font=T.f[font], **kw), fg=fg, bg=bg)
+
+    def box(parent, bg="card"):
+        return T.track(tk.Frame(parent, bd=0, highlightthickness=0), bg=bg)
+
+    APP_ICON = ("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")
+
+    def set_app_icon(win):
+        """ใช้ไอคอนของโปรแกรมแทนโลโก้ Tk ที่มุมหน้าต่าง"""
+        try:
+            imgs = [tk.PhotoImage(master=win, data=d) for d in APP_ICON]
+            win.iconphoto(True, *imgs)
+            win._app_icons = imgs
+        except Exception:
+            pass
+
 
     # ------------------------------------------------------------------
     class Viewer:
@@ -1714,58 +1912,65 @@ def run_gui():
             win.minsize(480, 320)
             win.protocol("WM_DELETE_WINDOW", self.disconnect)
 
-            bar = ttk.Frame(win, padding=(8, 5))
+            T.track(win, bg="bg")
+            bar = T.track(tk.Frame(win, bd=0), bg="card")
             bar.pack(fill="x")
+            inner = box(bar)
+            inner.pack(fill="x", padx=12, pady=8)
             mons = info.get("monitors") or [{"w": 0, "h": 0}]
             self.mon_var = tk.StringVar()
             mvals = ["จอ %d (%d×%d)" % (i + 1, m["w"], m["h"]) for i, m in enumerate(mons)]
+            lbl(inner, "●", fg="ok", font="h2").pack(side="left")
+            lbl(inner, info.get("name", host)[:18], font="bold").pack(side="left", padx=(6, 12))
             if len(mons) > 1:
-                ttk.Label(bar, text="จอ:").pack(side="left")
-                cb = ttk.Combobox(bar, values=mvals, textvariable=self.mon_var, state="readonly", width=16)
+                cb = ttk.Combobox(inner, values=mvals, textvariable=self.mon_var, state="readonly", width=15)
                 cb.current(0)
-                cb.pack(side="left", padx=(4, 10))
+                cb.pack(side="left", padx=(0, 8))
                 cb.bind("<<ComboboxSelected>>", lambda e: self.request(full=True))
             else:
                 self.mon_var.set(mvals[0])
             self.mvals = mvals
-            ttk.Label(bar, text="คุณภาพ:").pack(side="left")
             self.q_var = tk.StringVar(value=app.cfg.get("quality", "ปกติ"))
-            qb = ttk.Combobox(bar, values=[q[0] for q in QUALITY], textvariable=self.q_var,
+            qb = ttk.Combobox(inner, values=[q[0] for q in QUALITY], textvariable=self.q_var,
                               state="readonly", width=8)
-            qb.pack(side="left", padx=(4, 10))
+            qb.pack(side="left", padx=(0, 12))
             qb.bind("<<ComboboxSelected>>", lambda e: self._quality_changed())
             self.ctrl_var = tk.BooleanVar(value=self.can_control and not app.view_only_var.get())
-            cbx = ttk.Checkbutton(bar, text="ควบคุมเมาส์/คีย์บอร์ด", variable=self.ctrl_var,
+            cbx = ttk.Checkbutton(inner, text="ควบคุม", variable=self.ctrl_var, style="Card.TCheckbutton",
                                   command=self._release_all)
             cbx.pack(side="left")
             if not self.can_control:
                 cbx.configure(state="disabled")
             remote_mac = info.get("os") == "Darwin"
             self.swap_var = tk.BooleanVar(value=(SYSTEM == "Darwin") != remote_mac)
-            ttk.Checkbutton(bar, text="สลับ ⌘ ↔ Ctrl", variable=self.swap_var).pack(side="left", padx=(10, 0))
-            ttk.Button(bar, text="ตัดการเชื่อมต่อ", command=self.disconnect).pack(side="right")
-            ttk.Button(bar, text="เต็มจอ", command=self.toggle_full).pack(side="right", padx=4)
-            ttk.Button(bar, text="ส่งข้อความ…", command=self.send_text).pack(side="right")
-            ttk.Button(bar, text="ปล่อยปุ่มค้าง", command=self._release_all).pack(side="right", padx=4)
-            ttk.Button(bar, text="📁 รับ-ส่งไฟล์", command=self.open_files).pack(side="right")
-            self.lat_lbl = tk.Label(bar, text="Latency —", font=("Helvetica", 12, "bold"), fg="#888",
-                                    padx=8)
-            self.lat_lbl.pack(side="right", padx=(0, 8))
+            ttk.Checkbutton(inner, text="สลับ ⌘↔Ctrl", variable=self.swap_var,
+                            style="Card.TCheckbutton").pack(side="left", padx=(10, 0))
+            ttk.Button(inner, text="ตัดการเชื่อมต่อ", style="Tool.Danger.TButton",
+                       command=self.disconnect).pack(side="right")
+            ttk.Button(inner, text="⛶ เต็มจอ", style="Tool.TButton", command=self.toggle_full).pack(side="right", padx=(0, 5))
+            ttk.Button(inner, text="⟲ ปล่อยปุ่ม", style="Tool.TButton",
+                       command=self._release_all).pack(side="right", padx=(0, 5))
+            ttk.Button(inner, text="✎ ข้อความ", style="Tool.TButton", command=self.send_text).pack(side="right", padx=(0, 5))
+            ttk.Button(inner, text="📁 ไฟล์", style="Tool.Accent.TButton",
+                       command=self.open_files).pack(side="right", padx=(0, 5))
+            self.lat_lbl = lbl(inner, "Latency —", fg="muted", bg="subtle", font="smallbold", padx=10, pady=4)
+            self.lat_lbl.pack(side="right", padx=(0, 12))
             self.rtt = self.rtt_avg = self.rtt_min = self.rtt_max = None
             self.last_pong = time.time()
+            T.track(tk.Frame(win, height=1, bd=0), bg="border").pack(fill="x")
 
-            self.canvas = tk.Canvas(win, bg="#1e1e1e", highlightthickness=0, cursor="arrow")
+            self.canvas = T.track(tk.Canvas(win, highlightthickness=0, cursor="arrow"), bg="viewer")
             self.canvas.pack(fill="both", expand=True)
             self.img_item = self.canvas.create_image(0, 0, anchor="nw")
             self.cur_item = self.canvas.create_polygon(0, 0, 0, 0, fill="white", outline="black", width=1)
-            self.wait_item = self.canvas.create_text(300, 200, text="กำลังรับภาพหน้าจอ…", fill="#bbb",
-                                                     font=("Helvetica", 16))
+            self.wait_item = self.canvas.create_text(300, 200, text="กำลังรับภาพหน้าจอ…", fill="#9AA3B2",
+                                                     font=T.f["h2"])
 
-            st = ttk.Frame(win, padding=(8, 3))
+            st = box(win, bg="bg")
             st.pack(fill="x")
             self.status = tk.StringVar(value="เชื่อมต่อแล้ว")
-            ttk.Label(st, textvariable=self.status).pack(side="left")
-            ttk.Label(st, text="🔒 TLS · %s" % fp[:23], foreground="#777").pack(side="right")
+            lbl(st, textvariable=self.status, fg="muted", bg="bg", font="small").pack(side="left", padx=12, pady=5)
+            lbl(st, "🔒 TLS  %s" % fp[:23], fg="muted", bg="bg", font="small").pack(side="right", padx=12)
 
             c = self.canvas
             c.bind("<Configure>", lambda e: self._mark_dirty())
@@ -1904,10 +2109,12 @@ def run_gui():
                                           "rtt": None if self.rtt_avg is None else round(self.rtt_avg, 1)}))
             stale = time.time() - self.last_pong > 3
             if self.rtt_avg is not None and stale:
-                self.lat_lbl.configure(text="Latency — ไม่ตอบสนอง", fg="#dc2626")
+                self.lat_lbl.configure(text="●  ไม่ตอบสนอง", fg=T.c("danger"), bg=T.c("danger_bg"))
             elif self.rtt_avg is not None:
-                word, color = latency_style(self.rtt_avg)
-                self.lat_lbl.configure(text="● Latency %.0f ms  (%s)" % (self.rtt_avg, word), fg=color)
+                word, _c = latency_style(self.rtt_avg)
+                lv = "ok" if self.rtt_avg < 80 else ("warn" if self.rtt_avg < 150 else "danger")
+                self.lat_lbl.configure(text="●  %.0f ms · %s" % (self.rtt_avg, word),
+                                       fg=T.c(lv), bg=T.c(lv + "_bg"))
             self.win.after(1000, self._ping_loop)
 
         def _stats_loop(self):
@@ -2077,7 +2284,7 @@ def run_gui():
             self.mode, self.result = mode, None
             self.cur = None
             self.entries = {}
-            w = self.win = tk.Toplevel(parent)
+            w = self.win = T.track(tk.Toplevel(parent), bg="bg")
             w.title(title)
             w.geometry("760x540")
             w.minsize(520, 380)
@@ -2102,7 +2309,7 @@ def run_gui():
             pe.bind("<Return>", lambda e: self.go(self.path_var.get().strip()))
             hint = ("เลือกได้หลายรายการ (กด ⌘/Ctrl หรือ Shift ค้าง) — เลือกโฟลเดอร์ได้ด้วย ดับเบิลคลิกโฟลเดอร์เพื่อเปิด"
                     if mode == "files" else "เปิดโฟลเดอร์ที่ต้องการ แล้วกด \"เลือกโฟลเดอร์นี้\" (หรือคลิกเลือกโฟลเดอร์ย่อย)")
-            ttk.Label(w, text=hint, foreground="#666", padding=(10, 0)).pack(fill="x")
+            ttk.Label(w, text=hint, style="Muted.TLabel", padding=(10, 0)).pack(fill="x")
             fr = ttk.Frame(w, padding=(10, 4, 10, 0))
             fr.pack(fill="both", expand=True)
             t = self.tree = ttk.Treeview(fr, columns=("name", "size", "mtime"), show="headings",
@@ -2119,9 +2326,9 @@ def run_gui():
             bot = ttk.Frame(w, padding=10)
             bot.pack(fill="x")
             self.info_var = tk.StringVar()
-            ttk.Label(bot, textvariable=self.info_var, foreground="#555").pack(side="left")
+            ttk.Label(bot, textvariable=self.info_var, style="Muted.TLabel").pack(side="left")
             ttk.Button(bot, text="ยกเลิก", command=w.destroy).pack(side="right")
-            ttk.Button(bot, text="เลือก" if mode == "files" else "เลือกโฟลเดอร์นี้",
+            ttk.Button(bot, text="เลือก" if mode == "files" else "เลือกโฟลเดอร์นี้", style="Accent.TButton",
                        command=self.choose).pack(side="right", padx=6)
             t.bind("<<TreeviewSelect>>", lambda e: self._sel_info())
             self.go(initial if initial and os.path.isdir(initial) else home)
@@ -2227,7 +2434,7 @@ def run_gui():
             self.pending = None
             self.entries = {}
             self.speed = {}
-            w = self.win = tk.Toplevel(viewer.win)
+            w = self.win = T.track(tk.Toplevel(viewer.win), bg="bg")
             w.title("รับ-ส่งไฟล์ — %s" % viewer.info.get("name", viewer.host))
             w.geometry("900x660")
             w.minsize(640, 480)
@@ -2246,8 +2453,8 @@ def run_gui():
             ttk.Checkbutton(nav, text="แสดงไฟล์ซ่อน", variable=self.hidden_var, command=self.refresh).pack(side="left")
 
             ttk.Label(w, text="ไฟล์บนเครื่องปลายทาง — %s   (ดับเบิลคลิกโฟลเดอร์เพื่อเปิด, ดับเบิลคลิกไฟล์เพื่อดาวน์โหลด)"
-                      % viewer.info.get("name", viewer.host), foreground="#666",
-                      padding=(10, 0)).pack(fill="x")
+                      % viewer.info.get("name", viewer.host), style="Muted.TLabel",
+                      padding=(10, 2)).pack(fill="x")
             fr = ttk.Frame(w, padding=(10, 4, 10, 0))
             fr.pack(fill="both", expand=True)
             t = self.tree = ttk.Treeview(fr, columns=("name", "size", "mtime"), show="headings", selectmode="extended")
@@ -2264,20 +2471,20 @@ def run_gui():
 
             act = ttk.Frame(w, padding=(10, 6))
             act.pack(fill="x")
-            ttk.Button(act, text="⬆ อัปโหลดไฟล์…", command=self.upload_files).pack(side="left")
-            ttk.Button(act, text="⬆ อัปโหลดโฟลเดอร์…", command=self.upload_folder).pack(side="left", padx=4)
-            ttk.Button(act, text="⬇ ดาวน์โหลดที่เลือก", command=self.download).pack(side="left")
+            ttk.Button(act, text="⬆ อัปโหลดไฟล์…", style="Accent.TButton", command=self.upload_files).pack(side="left")
+            ttk.Button(act, text="⬆ อัปโหลดโฟลเดอร์…", command=self.upload_folder).pack(side="left", padx=6)
+            ttk.Button(act, text="⬇ ดาวน์โหลดที่เลือก", style="Accent.TButton", command=self.download).pack(side="left")
             ttk.Button(act, text="+ สร้างโฟลเดอร์", command=self.mkdir).pack(side="left", padx=4)
 
             dl = ttk.Frame(w, padding=(10, 0, 10, 4))
             dl.pack(fill="x")
             ttk.Label(dl, text="บันทึกไฟล์ที่ดาวน์โหลดไว้ที่:").pack(side="left")
             self.dl_var = tk.StringVar(value=self._dl_dir())
-            ttk.Label(dl, textvariable=self.dl_var, foreground="#2563eb").pack(side="left", padx=6)
+            ttk.Label(dl, textvariable=self.dl_var, style="Link.TLabel").pack(side="left", padx=6)
             ttk.Button(dl, text="เปลี่ยน…", command=self.change_dl).pack(side="left")
             ttk.Button(dl, text="เปิดโฟลเดอร์", command=lambda: open_path(self.dl_var.get())).pack(side="left", padx=4)
 
-            ttk.Label(w, text="การรับ-ส่งไฟล์", font=("Helvetica", 12, "bold"), padding=(10, 6, 10, 2)).pack(fill="x")
+            ttk.Label(w, text="การรับ-ส่งไฟล์", style="H2.TLabel", padding=(10, 8, 10, 4)).pack(fill="x")
             tf = ttk.Frame(w, padding=(10, 0, 10, 0))
             tf.pack(fill="x")
             x = self.xfer = ttk.Treeview(tf, columns=("dir", "name", "size", "prog", "speed", "status"),
@@ -2287,16 +2494,16 @@ def run_gui():
                                    ("status", "สถานะ", 260, True)):
                 x.heading(c, text=txt)
                 x.column(c, width=wd, stretch=st, anchor="e" if c in ("size", "speed") else "w")
-            x.tag_configure("done", foreground="#1f9d55")
-            x.tag_configure("error", foreground="#dc2626")
-            x.tag_configure("cancelled", foreground="#888")
+            x.tag_configure("done", foreground=T.c("ok"))
+            x.tag_configure("error", foreground=T.c("danger"))
+            x.tag_configure("cancelled", foreground=T.c("muted"))
             x.pack(fill="x")
             xb = ttk.Frame(w, padding=(10, 6, 10, 10))
             xb.pack(fill="x")
             ttk.Button(xb, text="ยกเลิกที่เลือก", command=self.cancel_sel).pack(side="left")
             ttk.Button(xb, text="ล้างรายการที่เสร็จแล้ว", command=self.clear_done).pack(side="left", padx=4)
             self.status = tk.StringVar(value="")
-            ttk.Label(xb, textvariable=self.status, foreground="#555").pack(side="right")
+            ttk.Label(xb, textvariable=self.status, style="Muted.TLabel").pack(side="right")
             self.go(None)
             self.win.after(150, self._poll)
 
@@ -2462,6 +2669,8 @@ def run_gui():
 
     # ------------------------------------------------------------------
     class App:
+        THEME_LABEL = {"auto": "◐  อัตโนมัติ", "light": "☀  สว่าง", "dark": "☾  มืด"}
+
         def __init__(self, root):
             self.root = root
             self.cfg = load_config()
@@ -2471,19 +2680,23 @@ def run_gui():
             self.q = queue.Queue()
             self.server = None
             self.viewers = []
-            root.title("%s %s — Remote Desktop" % (APP, VERSION))
-            root.geometry("800x680")
-            root.minsize(680, 580)
+            self.banner_state = ("off", "")
+            self.session_who = None
+            root.title("%s — Remote Desktop" % APP)
+            root.geometry("1000x720")
+            root.minsize(900, 640)
+            self._build_header(root)
             nb = ttk.Notebook(root)
-            nb.pack(fill="both", expand=True, padx=8, pady=8)
-            t1, t2, t3 = ttk.Frame(nb, padding=14), ttk.Frame(nb, padding=14), ttk.Frame(nb, padding=14)
-            nb.add(t1, text="  ควบคุมเครื่องอื่น  ")
-            nb.add(t2, text="  ให้เครื่องอื่นควบคุมเครื่องนี้  ")
-            nb.add(t3, text="  อินเทอร์เน็ต (Relay)  ")
+            nb.pack(fill="both", expand=True)
+            t1, t2, t3 = (ttk.Frame(nb, padding=(16, 14, 16, 16)) for _ in range(3))
+            nb.add(t1, text="ควบคุมเครื่องอื่น")
+            nb.add(t2, text="ให้เครื่องอื่นควบคุมเครื่องนี้")
+            nb.add(t3, text="อินเทอร์เน็ต (Relay)")
             self._build_client(t1)
             self._build_server(t2)
             self._build_relay(t3)
             self._update_id_row()
+            T.on_change(lambda: self._banner(*self.banner_state))
             if self.cfg.get("last_tab") in (1, 2):
                 nb.select(self.cfg["last_tab"])
             nb.bind("<<NotebookTabChanged>>", lambda e: self._tab(nb))
@@ -2495,51 +2708,257 @@ def run_gui():
             self.cfg["last_tab"] = nb.index(nb.select())
             save_config(self.cfg)
 
+        # ---------------- header ----------------
+        def _build_header(self, root):
+            hdr = T.track(tk.Frame(root, height=68), bg="header")
+            hdr.pack(fill="x")
+            hdr.pack_propagate(False)
+            logo = T.track(tk.Canvas(hdr, width=42, height=42, highlightthickness=0), bg="header")
+            logo.pack(side="left", padx=(18, 12))
+
+            def draw_logo():
+                logo.delete("all")
+                r, x0, y0, x1, y1 = 10, 2, 2, 40, 40
+                pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+                       x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+                logo.create_polygon(pts, smooth=True, fill="#FFFFFF", outline="")
+                logo.create_rectangle(10, 11, 32, 26, fill=T.c("header"), outline="")
+                logo.create_rectangle(19, 26, 23, 30, fill=T.c("header"), outline="")
+                logo.create_rectangle(15, 30, 27, 32, fill=T.c("header"), outline="")
+                logo.create_polygon(17, 14, 17, 23, 19.5, 21, 21.5, 25, 23, 24.3, 21, 20.5, 24.5, 20.5,
+                                    fill="#FFFFFF", outline="")
+            draw_logo()
+            T.on_change(draw_logo)
+            txt = box(hdr, bg="header")
+            txt.pack(side="left")
+            lbl(txt, "NetRemote", fg="hdr_fg", bg="header", font="h1").pack(anchor="w")
+            lbl(txt, "Remote Desktop · LAN และอินเทอร์เน็ต · v%s" % VERSION, fg="hdr_muted", bg="header",
+                font="small").pack(anchor="w")
+            self.theme_btn = lbl(hdr, self.THEME_LABEL[T.mode], fg="hdr_fg", bg="header2", font="smallbold",
+                                 padx=14, pady=6, cursor="hand2")
+            self.theme_btn.pack(side="right", padx=18)
+            self.theme_btn.bind("<Button-1>", lambda e: self.cycle_theme())
+
+        def cycle_theme(self):
+            order = ["auto", "light", "dark"]
+            mode = order[(order.index(T.mode) + 1) % 3]
+            self.cfg["theme"] = mode
+            save_config(self.cfg)
+            T.set_mode(mode)
+            self.theme_btn.configure(text=self.THEME_LABEL[mode])
+
         # ---------------- client tab ----------------
         def _build_client(self, P):
-            ttk.Label(P, text="เชื่อมต่อไปยังเครื่องอื่น", font=("Helvetica", 15, "bold")).grid(
-                row=0, column=0, columnspan=3, sticky="w")
-            ttk.Label(P, text="ใส่ IP สำหรับวง LAN  หรือ ID 9 หลัก สำหรับเชื่อมต่อผ่านอินเทอร์เน็ต (ต้องตั้งค่า Relay)",
-                      foreground="#666").grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 12))
-            ttk.Label(P, text="IP / ID:").grid(row=2, column=0, sticky="w", pady=4)
+            P.columnconfigure(0, weight=5, uniform="c")
+            P.columnconfigure(1, weight=4, uniform="c")
+            P.rowconfigure(0, weight=1)
+            c = card(P)
+            c.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            lbl(c, "เชื่อมต่อไปยังเครื่องอื่น", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
+            lbl(c, "ใส่ IP (ในวง LAN) หรือ ID 9 หลัก (ผ่านอินเทอร์เน็ต) ของเครื่องปลายทาง",
+                fg="muted", font="small", wraplength=420).pack(anchor="w", padx=22, pady=(0, 16))
+            lbl(c, "IP หรือ ID", fg="muted", font="smallbold").pack(anchor="w", padx=22)
             self.host_var = tk.StringVar(value=(self.cfg.get("recent") or [""])[0])
-            self.host_cb = ttk.Combobox(P, textvariable=self.host_var, values=self.cfg.get("recent", []), width=30)
-            self.host_cb.grid(row=2, column=1, sticky="we", pady=4)
-            ttk.Label(P, text="พอร์ต:").grid(row=3, column=0, sticky="w", pady=4)
-            self.cport_var = tk.StringVar(value=str(self.cfg.get("client_port", DEFAULT_PORT)))
-            ttk.Entry(P, textvariable=self.cport_var, width=8).grid(row=3, column=1, sticky="w", pady=4)
-            ttk.Label(P, text="รหัสผ่าน:").grid(row=4, column=0, sticky="w", pady=4)
+            self.host_cb = ttk.Combobox(c, textvariable=self.host_var, values=self.cfg.get("recent", []),
+                                        font=T.f["big"])
+            self.host_cb.pack(fill="x", padx=22, pady=(4, 14))
+            lbl(c, "รหัสผ่าน", fg="muted", font="smallbold").pack(anchor="w", padx=22)
             self.cpw_var = tk.StringVar()
-            pw = ttk.Entry(P, textvariable=self.cpw_var, show="•", width=30)
-            pw.grid(row=4, column=1, sticky="we", pady=4)
+            pw = ttk.Entry(c, textvariable=self.cpw_var, show="•", font=T.f["big"])
+            pw.pack(fill="x", padx=22, pady=(4, 10))
             pw.bind("<Return>", lambda e: self.connect())
+            row = box(c)
+            row.pack(fill="x", padx=22)
             self.view_only_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(P, text="ดูหน้าจออย่างเดียว (ไม่ควบคุม)", variable=self.view_only_var).grid(
-                row=5, column=1, sticky="w", pady=4)
-            self.conn_btn = ttk.Button(P, text="เชื่อมต่อ", command=self.connect, width=14)
-            self.conn_btn.grid(row=2, column=2, rowspan=2, sticky="nsew", padx=(10, 0), pady=4)
+            ttk.Checkbutton(row, text="ดูหน้าจออย่างเดียว", variable=self.view_only_var,
+                            style="Card.TCheckbutton").pack(side="left")
+            self.cport_var = tk.StringVar(value=str(self.cfg.get("client_port", DEFAULT_PORT)))
+            ttk.Entry(row, textvariable=self.cport_var, width=6).pack(side="right")
+            lbl(row, "พอร์ต (LAN)", fg="muted", font="small").pack(side="right", padx=6)
+            self.conn_btn = ttk.Button(c, text="เชื่อมต่อ   →", style="Big.Accent.TButton", command=self.connect)
+            self.conn_btn.pack(fill="x", padx=22, pady=(18, 10))
             self.cstatus = tk.StringVar(value="")
-            ttk.Label(P, textvariable=self.cstatus, foreground="#b45309", wraplength=640).grid(
-                row=6, column=0, columnspan=3, sticky="w", pady=(6, 10))
-            P.columnconfigure(1, weight=1)
+            lbl(c, textvariable=self.cstatus, fg="warn", font="small", wraplength=420).pack(anchor="w", padx=22)
+            tips = box(c)
+            tips.pack(side="bottom", fill="x", padx=22, pady=(0, 18))
+            for t in ("🔒  เข้ารหัสทุกการเชื่อมต่อด้วย TLS — รหัสผ่านไม่ถูกส่งผ่านเครือข่าย",
+                      "⌨  ใน หน้าต่างรีโมท: รับ-ส่งไฟล์, ส่งข้อความภาษาไทย, ดู Latency"):
+                lbl(tips, t, fg="muted", font="small").pack(anchor="w", pady=1)
 
-            sep = ttk.Separator(P)
-            sep.grid(row=7, column=0, columnspan=3, sticky="we", pady=6)
-            row = ttk.Frame(P)
-            row.grid(row=8, column=0, columnspan=3, sticky="we")
-            ttk.Label(row, text="เครื่องในวง LAN ที่เปิดรับการเชื่อมต่อ", font=("Helvetica", 12, "bold")).pack(side="left")
-            self.disc_btn = ttk.Button(row, text="ค้นหา", command=self.discover)
+            d = card(P)
+            d.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+            head = box(d)
+            head.pack(fill="x", padx=20, pady=(20, 4))
+            lbl(head, "เครื่องในวง LAN", font="h2").pack(side="left")
+            self.disc_btn = ttk.Button(head, text="ค้นหา", command=self.discover)
             self.disc_btn.pack(side="right")
-            self.disc = ttk.Treeview(P, columns=("ip", "name"), show="headings", height=7)
+            lbl(d, "เครื่องที่เปิดรับการเชื่อมต่ออยู่ — ดับเบิลคลิกเพื่อเลือก", fg="muted", font="small").pack(
+                anchor="w", padx=20, pady=(0, 10))
+            tf = box(d)
+            tf.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+            self.disc = ttk.Treeview(tf, columns=("ip", "name"), show="headings")
             self.disc.heading("ip", text="IP")
             self.disc.heading("name", text="ชื่อเครื่อง")
-            self.disc.column("ip", width=150, stretch=False)
-            self.disc.grid(row=9, column=0, columnspan=3, sticky="nsew", pady=(6, 0))
+            self.disc.column("ip", width=130, stretch=False)
+            self.disc.pack(fill="both", expand=True)
             self.disc.bind("<Double-1>", self._pick_disc)
             self.disc.bind("<<TreeviewSelect>>", self._pick_disc_fill)
-            P.rowconfigure(9, weight=1)
-            ttk.Label(P, text="ดับเบิลคลิกเพื่อเลือก แล้วใส่รหัสผ่านของเครื่องนั้น", foreground="#888").grid(
-                row=10, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        # ---------------- server tab ----------------
+        def _build_server(self, P):
+            P.columnconfigure(0, weight=6, uniform="s")
+            P.columnconfigure(1, weight=5, uniform="s")
+            P.rowconfigure(0, weight=1)
+            left = ttk.Frame(P)
+            left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            right = ttk.Frame(P)
+            right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+            # สถานะ + ปุ่มเริ่ม
+            self.status_card = tk.Frame(left, highlightthickness=1, bd=0)
+            self.status_card.pack(fill="x")
+            self.banner = tk.Label(self.status_card, font=T.f["status"], anchor="w")
+            self.banner.pack(fill="x", padx=20, pady=(16, 0))
+            self.banner_sub = tk.Label(self.status_card, font=T.f["small"], anchor="w", justify="left", wraplength=480)
+            self.banner_sub.pack(fill="x", padx=20, pady=(2, 10))
+            self.status_btns = tk.Frame(self.status_card, bd=0)
+            self.status_btns.pack(fill="x", padx=20, pady=(0, 16))
+            self.srv_btn = ttk.Button(self.status_btns, text="▶   เริ่มเปิดรับการเชื่อมต่อ", style="Big.Accent.TButton",
+                                      command=self.toggle_server)
+            self.srv_btn.pack(side="left")
+            self.kick_btn = ttk.Button(self.status_btns, text="ตัดการเชื่อมต่อ", style="Big.Danger.TButton",
+                                       command=self.kick)
+
+            # ข้อมูลสำหรับเชื่อมต่อ
+            info = card(left)
+            info.pack(fill="x", pady=(14, 0))
+            lbl(info, "ข้อมูลสำหรับให้อีกฝั่งเชื่อมต่อ", font="h2").grid(row=0, column=0, columnspan=3, sticky="w",
+                                                                    padx=20, pady=(16, 10))
+            lbl(info, "IP ในวง LAN", fg="muted", font="smallbold").grid(row=1, column=0, sticky="w", padx=20)
+            lbl(info, "ID ผ่านอินเทอร์เน็ต", fg="muted", font="smallbold").grid(row=1, column=1, sticky="w", padx=20)
+            self.ip_lbl = lbl(info, "\n".join(get_local_ips()[:2]), font="mono")
+            self.ip_lbl.grid(row=2, column=0, sticky="nw", padx=20)
+            self.id_lbl = lbl(info, "", font="mono")
+            self.id_lbl.grid(row=2, column=1, sticky="nw", padx=20)
+            self.relay_state_lbl = lbl(info, "", fg="muted", font="small", wraplength=230)
+            self.relay_state_lbl.grid(row=3, column=1, sticky="nw", padx=20)
+            lbl(info, "รหัสผ่าน", fg="muted", font="smallbold").grid(row=4, column=0, columnspan=2, sticky="w",
+                                                                   padx=20, pady=(12, 0))
+            pwrow = box(info)
+            pwrow.grid(row=5, column=0, columnspan=2, sticky="we", padx=20, pady=(4, 18))
+            self.spw_var = tk.StringVar(value=self.cfg.get("password") or gen_password())
+            ttk.Entry(pwrow, textvariable=self.spw_var, font=T.f["mono"], width=16).pack(side="left", fill="x",
+                                                                                          expand=True)
+            ttk.Button(pwrow, text="สุ่มใหม่", command=lambda: self.spw_var.set(gen_password())).pack(side="left",
+                                                                                                      padx=(8, 0))
+            ttk.Button(pwrow, text="คัดลอก", command=self._copy_conn).pack(side="left", padx=(6, 0))
+            info.columnconfigure(0, weight=1)
+            info.columnconfigure(1, weight=1)
+
+            # ตัวเลือก
+            opt = card(left)
+            opt.pack(fill="x", pady=(14, 0))
+            lbl(opt, "ตัวเลือก", font="h2").grid(row=0, column=0, columnspan=2, sticky="w", padx=20, pady=(16, 6))
+            self.ask_var = tk.BooleanVar(value=self.cfg.get("ask", True))
+            self.allow_var = tk.BooleanVar(value=self.cfg.get("allow_control", True))
+            self.files_var = tk.BooleanVar(value=self.cfg.get("allow_files", True))
+            self.auto_var = tk.BooleanVar(value=self.cfg.get("autostart", False))
+            for i, (txt, var) in enumerate((("ถามก่อนรับการเชื่อมต่อ", self.ask_var),
+                                            ("อนุญาตให้ควบคุมเมาส์/คีย์บอร์ด", self.allow_var),
+                                            ("อนุญาตให้รับ-ส่งไฟล์", self.files_var),
+                                            ("เปิดรับอัตโนมัติเมื่อเปิดโปรแกรม", self.auto_var))):
+                ttk.Checkbutton(opt, text=txt, variable=var, style="Card.TCheckbutton",
+                                command=self._save_server_opts).grid(row=1 + i // 2, column=i % 2, sticky="w", padx=20)
+            prow = box(opt)
+            prow.grid(row=3, column=0, columnspan=2, sticky="w", padx=20, pady=(6, 16))
+            lbl(prow, "พอร์ต (LAN)", fg="muted", font="small").pack(side="left")
+            self.sport_var = tk.StringVar(value=str(self.cfg.get("port", DEFAULT_PORT)))
+            ttk.Entry(prow, textvariable=self.sport_var, width=7).pack(side="left", padx=8)
+            opt.columnconfigure(1, weight=1)
+
+            # สิทธิ์ macOS
+            self.perm_rows = {}
+            if SYSTEM == "Darwin":
+                pc = card(right)
+                pc.pack(fill="x", pady=(0, 14))
+                lbl(pc, "สิทธิ์ของ macOS", font="h2").grid(row=0, column=0, columnspan=3, sticky="w",
+                                                          padx=20, pady=(16, 0))
+                lbl(pc, "ให้สิทธิ์กับแอป %s" % ("NetRemote" if getattr(sys, "frozen", False) else "Terminal"),
+                    fg="muted", font="small").grid(row=1, column=0, columnspan=3, sticky="w", padx=20, pady=(0, 8))
+                for i, (k, label) in enumerate((("screen", "Screen Recording\nให้อีกฝั่งเห็นหน้าจอ"),
+                                                ("access", "Accessibility\nให้อีกฝั่งควบคุมได้"))):
+                    st = lbl(pc, "…", font="smallbold", padx=8, pady=2, anchor="center")
+                    st.grid(row=2 + i, column=0, sticky="w", padx=(20, 8), pady=4)
+                    lbl(pc, label, font="small").grid(row=2 + i, column=1, sticky="w")
+                    ttk.Button(pc, text="เปิดการตั้งค่า", command=lambda k=k: self._open_perm(k)).grid(
+                        row=2 + i, column=2, sticky="e", padx=20, pady=4)
+                    self.perm_rows[k] = st
+                lbl(pc, "").grid(row=4, column=0, pady=4)
+                pc.columnconfigure(1, weight=1)
+                self._check_perms()
+
+            lc = card(right)
+            lc.pack(fill="both", expand=True)
+            lbl(lc, "บันทึกเหตุการณ์", font="h2").pack(anchor="w", padx=20, pady=(16, 8))
+            self.log = T.track(tk.Listbox(lc, activestyle="none", relief="flat", highlightthickness=0, bd=0,
+                                          font=T.f["small"]),
+                               bg="card", fg="text", selectbackground="sel", selectforeground="text")
+            self.log.pack(fill="both", expand=True, padx=20)
+            try:
+                fp = server_fingerprint() if os.path.exists(CERT_FILE) else "(สร้างเมื่อเริ่มเปิดรับครั้งแรก)"
+            except Exception:
+                fp = "-"
+            self.fp_lbl = lbl(lc, "Certificate  %s" % fp[:47], fg="muted", font="small")
+            self.fp_lbl.pack(anchor="w", padx=20, pady=(8, 14))
+            self._banner("off")
+
+        # ---------------- relay (internet) tab ----------------
+        def _build_relay(self, P):
+            P.columnconfigure(0, weight=6, uniform="r")
+            P.columnconfigure(1, weight=5, uniform="r")
+            P.rowconfigure(0, weight=1)
+            f = card(P)
+            f.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            lbl(f, "Relay Server", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
+            lbl(f, "ตัวกลางสำหรับรีโมทผ่านอินเทอร์เน็ต (โปรแกรม relay_server.py บน VPS / Cloud) — ทั้งสองเครื่อง"
+                   "เชื่อมต่อออกไปหา Relay จึงไม่ต้องตั้ง Router และข้อมูลยังเข้ารหัสจากต้นทางถึงปลายทาง",
+                fg="muted", font="small", wraplength=470).pack(anchor="w", padx=22, pady=(0, 16))
+            lbl(f, "ที่อยู่ Relay Server", fg="muted", font="smallbold").pack(anchor="w", padx=22)
+            self.relay_addr_var = tk.StringVar(value=self.cfg.get("relay_addr", ""))
+            ttk.Entry(f, textvariable=self.relay_addr_var, font=T.f["big"]).pack(fill="x", padx=22, pady=(4, 2))
+            lbl(f, "เช่น relay.example.com:5910 หรือ 203.0.113.10:5910", fg="muted", font="small").pack(
+                anchor="w", padx=22, pady=(0, 12))
+            lbl(f, "Relay Key", fg="muted", font="smallbold").pack(anchor="w", padx=22)
+            self.relay_key_var = tk.StringVar(value=self.cfg.get("relay_key", ""))
+            ttk.Entry(f, textvariable=self.relay_key_var, show="•", font=T.f["big"]).pack(fill="x", padx=22,
+                                                                                          pady=(4, 12))
+            self.relay_host_var = tk.BooleanVar(value=self.cfg.get("relay_host", False))
+            ttk.Checkbutton(f, text="ให้เครื่องนี้รับการเชื่อมต่อผ่านอินเทอร์เน็ตด้วย", variable=self.relay_host_var,
+                            style="Card.TCheckbutton").pack(anchor="w", padx=22)
+            row = box(f)
+            row.pack(fill="x", padx=22, pady=(16, 8))
+            ttk.Button(row, text="บันทึก", style="Accent.TButton", command=self.save_relay).pack(side="left")
+            ttk.Button(row, text="ทดสอบการเชื่อมต่อ", command=self.test_relay).pack(side="left", padx=8)
+            self.relay_test_var = tk.StringVar(value="")
+            lbl(f, textvariable=self.relay_test_var, fg="muted", font="small", wraplength=470).pack(
+                anchor="w", padx=22, pady=(0, 18))
+
+            right = ttk.Frame(P)
+            right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+            idc = card(right)
+            idc.pack(fill="x")
+            lbl(idc, "ID ของเครื่องนี้", font="h2").pack(anchor="w", padx=22, pady=(20, 2))
+            lbl(idc, "ให้อีกฝั่งใส่ ID นี้ในช่อง \"IP หรือ ID\"", fg="muted", font="small").pack(anchor="w", padx=22)
+            self.relay_id_lbl = lbl(idc, fmt_id(self.cfg["host_id"]), fg="accent", font="monobig")
+            self.relay_id_lbl.pack(anchor="w", padx=22, pady=(10, 8))
+            ttk.Button(idc, text="สร้าง ID ใหม่", command=self.new_id).pack(anchor="w", padx=22, pady=(0, 20))
+            alt = card(right)
+            alt.pack(fill="both", expand=True, pady=(14, 0))
+            lbl(alt, "ไม่มี Relay?", font="h2").pack(anchor="w", padx=22, pady=(20, 4))
+            lbl(alt, "ตั้ง Port Forward ที่ Router ให้พอร์ต TCP %d มาที่เครื่องนี้ แล้วให้อีกฝั่งใส่ IP สาธารณะของ "
+                     "Router แทน — ไม่แนะนำนัก เพราะเครื่องจะถูกสแกนจากอินเทอร์เน็ตได้ ถ้าใช้วิธีนี้ควรตั้งรหัสผ่านยาว ๆ "
+                     "และเปิด \"ถามก่อนรับการเชื่อมต่อ\"" % DEFAULT_PORT,
+                fg="muted", font="small", wraplength=380).pack(anchor="w", padx=22, pady=(0, 20))
 
         def _pick_disc_fill(self, e=None):
             sel = self.disc.selection()
@@ -2626,139 +3045,6 @@ def run_gui():
                 save_config(self.cfg)
             return bool(box.get("ok"))
 
-        # ---------------- server tab ----------------
-        def _build_server(self, P):
-            ttk.Label(P, text="ให้เครื่องอื่นควบคุมเครื่องนี้", font=("Helvetica", 15, "bold")).grid(
-                row=0, column=0, columnspan=3, sticky="w")
-            ttk.Label(P, text="แจ้ง IP และรหัสผ่านด้านล่างให้ผู้ที่ต้องการควบคุมเครื่องนี้",
-                      foreground="#666").grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 10))
-            box = tk.Frame(P, bg="#f4f5f7", highlightthickness=1, highlightbackground="#dcdfe4")
-            box.grid(row=2, column=0, columnspan=3, sticky="we")
-            tk.Label(box, text="IP ของเครื่องนี้", bg="#f4f5f7", fg="#555").grid(row=0, column=0, sticky="w",
-                                                                              padx=12, pady=(10, 0))
-            tk.Label(box, text="รหัสผ่าน", bg="#f4f5f7", fg="#555").grid(row=0, column=1, sticky="w",
-                                                                       padx=12, pady=(10, 0))
-            self.ip_lbl = tk.Label(box, text="  ".join(get_local_ips()), bg="#f4f5f7", fg="#111",
-                                   font=("Helvetica", 18, "bold"))
-            self.ip_lbl.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
-            self.spw_var = tk.StringVar(value=self.cfg.get("password") or gen_password())
-            ent = tk.Entry(box, textvariable=self.spw_var, font=("Courier", 17, "bold"), width=16,
-                           relief="flat", bg="#f4f5f7", fg="#111")
-            ent.grid(row=1, column=1, sticky="w", padx=12, pady=(0, 10))
-            bx = tk.Frame(box, bg="#f4f5f7")
-            bx.grid(row=0, column=2, rowspan=2, padx=10)
-            ttk.Button(bx, text="สุ่มรหัสใหม่", command=lambda: self.spw_var.set(gen_password())).pack(fill="x")
-            ttk.Button(bx, text="คัดลอก", command=self._copy_conn).pack(fill="x", pady=(4, 0))
-            tk.Label(box, text="ID (ผ่านอินเทอร์เน็ต)", bg="#f4f5f7", fg="#555").grid(row=2, column=0, sticky="w",
-                                                                                      padx=12)
-            self.id_lbl = tk.Label(box, text="", bg="#f4f5f7", fg="#111", font=("Courier", 18, "bold"))
-            self.id_lbl.grid(row=3, column=0, sticky="w", padx=12, pady=(0, 10))
-            self.relay_state_lbl = tk.Label(box, text="", bg="#f4f5f7", fg="#666", anchor="w")
-            self.relay_state_lbl.grid(row=3, column=1, columnspan=2, sticky="w", padx=12, pady=(0, 10))
-            box.columnconfigure(1, weight=1)
-
-            opt = ttk.Frame(P)
-            opt.grid(row=3, column=0, columnspan=3, sticky="we", pady=(10, 0))
-            ttk.Label(opt, text="พอร์ต:").pack(side="left")
-            self.sport_var = tk.StringVar(value=str(self.cfg.get("port", DEFAULT_PORT)))
-            ttk.Entry(opt, textvariable=self.sport_var, width=7).pack(side="left", padx=(4, 14))
-            self.ask_var = tk.BooleanVar(value=self.cfg.get("ask", True))
-            ttk.Checkbutton(opt, text="ถามก่อนรับการเชื่อมต่อ", variable=self.ask_var,
-                            command=self._save_server_opts).pack(side="left")
-            self.allow_var = tk.BooleanVar(value=self.cfg.get("allow_control", True))
-            ttk.Checkbutton(opt, text="อนุญาตให้ควบคุมเมาส์/คีย์บอร์ด", variable=self.allow_var,
-                            command=self._save_server_opts).pack(side="left", padx=(12, 0))
-            opt2 = ttk.Frame(P)
-            opt2.grid(row=4, column=0, columnspan=3, sticky="we", pady=(6, 0))
-            self.auto_var = tk.BooleanVar(value=self.cfg.get("autostart", False))
-            ttk.Checkbutton(opt2, text="เปิดรับอัตโนมัติเมื่อเปิดโปรแกรม", variable=self.auto_var,
-                            command=self._save_server_opts).pack(side="left")
-            self.files_var = tk.BooleanVar(value=self.cfg.get("allow_files", True))
-            ttk.Checkbutton(opt2, text="อนุญาตให้รับ-ส่งไฟล์", variable=self.files_var,
-                            command=self._save_server_opts).pack(side="left", padx=(12, 0))
-            self.srv_btn = ttk.Button(opt2, text="▶  เริ่มเปิดรับการเชื่อมต่อ", command=self.toggle_server, width=26)
-            self.srv_btn.pack(side="right")
-
-            self.banner = tk.Label(P, text="○  ยังไม่เปิดรับการเชื่อมต่อ", anchor="w", bg="#eceef1", fg="#444",
-                                   font=("Helvetica", 13, "bold"), padx=12, pady=8)
-            self.banner.grid(row=5, column=0, columnspan=3, sticky="we", pady=(12, 0))
-            self.kick_btn = ttk.Button(P, text="ตัดการเชื่อมต่อ", command=self.kick)
-
-            self.perm = ttk.Frame(P)
-            self.perm.grid(row=7, column=0, columnspan=3, sticky="we", pady=(10, 0))
-            self.perm_rows = {}
-            if SYSTEM == "Darwin":
-                ttk.Label(self.perm, text="สิทธิ์ของ macOS (ให้สิทธิ์กับแอป %s):"
-                          % ("NetRemote" if getattr(sys, "frozen", False) else "Terminal"),
-                          font=("Helvetica", 12, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
-                for i, (k, label) in enumerate((("screen", "บันทึกหน้าจอ (Screen Recording) — ให้อีกฝั่งเห็นหน้าจอ"),
-                                                ("access", "การช่วยการเข้าถึง (Accessibility) — ให้อีกฝั่งควบคุมได้"))):
-                    st = ttk.Label(self.perm, text="…", width=14)
-                    st.grid(row=i + 1, column=0, sticky="w")
-                    ttk.Label(self.perm, text=label).grid(row=i + 1, column=1, sticky="w")
-                    ttk.Button(self.perm, text="เปิดการตั้งค่า",
-                               command=lambda k=k: self._open_perm(k)).grid(row=i + 1, column=2, padx=6, pady=2)
-                    self.perm_rows[k] = st
-                self.perm.columnconfigure(1, weight=1)
-                self._check_perms()
-
-            ttk.Label(P, text="บันทึกเหตุการณ์", foreground="#555").grid(row=8, column=0, sticky="w", pady=(10, 2))
-            self.log = tk.Listbox(P, height=6, activestyle="none", relief="flat", highlightthickness=1,
-                                  highlightbackground="#dcdfe4")
-            self.log.grid(row=9, column=0, columnspan=3, sticky="nsew")
-            P.rowconfigure(9, weight=1)
-            P.columnconfigure(0, weight=1)
-            try:
-                fp = server_fingerprint() if os.path.exists(CERT_FILE) else "(สร้างเมื่อเริ่มเปิดรับครั้งแรก)"
-            except Exception:
-                fp = "-"
-            self.fp_lbl = ttk.Label(P, text="Certificate: %s" % fp[:47], foreground="#888")
-            self.fp_lbl.grid(row=10, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-        # ---------------- relay (internet) tab ----------------
-        def _build_relay(self, P):
-            ttk.Label(P, text="เชื่อมต่อผ่านอินเทอร์เน็ต", font=("Helvetica", 15, "bold")).grid(
-                row=0, column=0, columnspan=3, sticky="w")
-            ttk.Label(P, wraplength=700, foreground="#555", justify="left",
-                      text="ใช้ Relay Server (ไฟล์ relay_server.py บน VPS / Cloud ที่มี IP สาธารณะ) เป็นตัวกลาง "
-                           "ทั้งสองเครื่องเชื่อมต่อออกไปหา Relay จึงไม่ต้องตั้งค่า Router หรือเปิดพอร์ต "
-                           "และข้อมูลยังเข้ารหัสจากต้นทางถึงปลายทาง (Relay อ่านหน้าจอ/ไฟล์/รหัสผ่านไม่ได้)"
-                      ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 12))
-            ttk.Label(P, text="Relay Server:").grid(row=2, column=0, sticky="w", pady=4)
-            self.relay_addr_var = tk.StringVar(value=self.cfg.get("relay_addr", ""))
-            ttk.Entry(P, textvariable=self.relay_addr_var, width=36).grid(row=2, column=1, sticky="we", pady=4)
-            ttk.Label(P, text="เช่น relay.example.com:5910", foreground="#888").grid(row=2, column=2, sticky="w", padx=8)
-            ttk.Label(P, text="Relay Key:").grid(row=3, column=0, sticky="w", pady=4)
-            self.relay_key_var = tk.StringVar(value=self.cfg.get("relay_key", ""))
-            ttk.Entry(P, textvariable=self.relay_key_var, width=36, show="•").grid(row=3, column=1, sticky="we", pady=4)
-            ttk.Label(P, text="ต้องตรงกับที่ตั้งไว้ใน Relay", foreground="#888").grid(row=3, column=2, sticky="w", padx=8)
-            self.relay_host_var = tk.BooleanVar(value=self.cfg.get("relay_host", False))
-            ttk.Checkbutton(P, text="ให้เครื่องนี้รับการเชื่อมต่อผ่านอินเทอร์เน็ต (เมื่อกด \"เริ่มเปิดรับ\" ในแท็บที่ 2)",
-                            variable=self.relay_host_var).grid(row=4, column=1, columnspan=2, sticky="w", pady=(6, 4))
-            row = ttk.Frame(P)
-            row.grid(row=5, column=1, columnspan=2, sticky="w", pady=(6, 0))
-            ttk.Button(row, text="บันทึก", command=self.save_relay).pack(side="left")
-            ttk.Button(row, text="ทดสอบการเชื่อมต่อ Relay", command=self.test_relay).pack(side="left", padx=6)
-            self.relay_test_var = tk.StringVar(value="")
-            ttk.Label(P, textvariable=self.relay_test_var, wraplength=560).grid(row=6, column=1, columnspan=2,
-                                                                                sticky="w", pady=(6, 0))
-            idbox = tk.Frame(P, bg="#f4f5f7", highlightthickness=1, highlightbackground="#dcdfe4")
-            idbox.grid(row=7, column=0, columnspan=3, sticky="we", pady=(14, 0))
-            tk.Label(idbox, text="ID ของเครื่องนี้ (ให้อีกฝั่งใส่ในช่อง IP / ID)", bg="#f4f5f7", fg="#555").grid(
-                row=0, column=0, sticky="w", padx=12, pady=(10, 0))
-            self.relay_id_lbl = tk.Label(idbox, text=fmt_id(self.cfg["host_id"]), bg="#f4f5f7", fg="#111",
-                                         font=("Courier", 22, "bold"))
-            self.relay_id_lbl.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
-            ttk.Button(idbox, text="สร้าง ID ใหม่", command=self.new_id).grid(row=0, column=1, rowspan=2, padx=12)
-            idbox.columnconfigure(0, weight=1)
-            ttk.Separator(P).grid(row=8, column=0, columnspan=3, sticky="we", pady=14)
-            ttk.Label(P, wraplength=700, foreground="#666", justify="left",
-                      text="อีกวิธี (ไม่ใช้ Relay): ตั้ง Port Forward ที่ Router ให้พอร์ต TCP %d มาที่เครื่องนี้ "
-                           "แล้วให้อีกฝั่งใส่ IP สาธารณะของ Router — ไม่แนะนำ เพราะเครื่องจะถูกสแกนจากอินเทอร์เน็ตได้ "
-                           "ถ้าใช้วิธีนี้ควรตั้งรหัสผ่านที่ยาวและเปิด \"ถามก่อนรับการเชื่อมต่อ\"" % DEFAULT_PORT
-                      ).grid(row=9, column=0, columnspan=3, sticky="w")
-            P.columnconfigure(1, weight=1)
-
         def save_relay(self, quiet=False):
             addr = self.relay_addr_var.get().strip()
             if addr:
@@ -2816,15 +3102,15 @@ def run_gui():
 
         def _update_id_row(self, state=None, text=None):
             if self._relay_cfg():
-                self.id_lbl.configure(text=fmt_id(self.cfg["host_id"]), fg="#111")
+                self.id_lbl.configure(text=fmt_id(self.cfg["host_id"]), fg=T.c("text"))
                 if text:
-                    color = {"online": "#1f9d55", "error": "#dc2626", "connecting": "#b45309"}.get(state, "#666")
-                    self.relay_state_lbl.configure(text=text, fg=color)
+                    color = {"online": "ok", "error": "danger", "connecting": "warn"}.get(state, "muted")
+                    self.relay_state_lbl.configure(text=("● " if state == "online" else "") + text, fg=T.c(color))
                 elif not (self.server and self.server.is_alive()):
-                    self.relay_state_lbl.configure(text="จะออนไลน์เมื่อกด เริ่มเปิดรับ", fg="#666")
+                    self.relay_state_lbl.configure(text="จะออนไลน์เมื่อกด เริ่มเปิดรับ", fg=T.c("muted"))
             else:
-                self.id_lbl.configure(text="ปิดอยู่", fg="#888")
-                self.relay_state_lbl.configure(text="ตั้งค่าได้ที่แท็บ \"อินเทอร์เน็ต (Relay)\"", fg="#666")
+                self.id_lbl.configure(text="ปิดอยู่", fg=T.c("muted"))
+                self.relay_state_lbl.configure(text="ตั้งค่าได้ที่แท็บ \"อินเทอร์เน็ต (Relay)\"", fg=T.c("muted"))
 
         def _copy_conn(self):
             txt = "NetRemote — IP: %s  พอร์ต: %s  รหัสผ่าน: %s" % (get_local_ip(), self.sport_var.get(),
@@ -2846,7 +3132,7 @@ def run_gui():
                 lbl = self.perm_rows.get(k)
                 if lbl is not None:
                     lbl.configure(text="✓ อนุญาตแล้ว" if v else ("✗ ยังไม่อนุญาต" if v is False else "? ตรวจไม่ได้"),
-                                  foreground="#1f9d55" if v else "#dc2626")
+                                  fg=T.c("ok" if v else "danger"), bg=T.c("ok_bg" if v else "danger_bg"))
             self.root.after(3000, self._check_perms)
 
         def _save_server_opts(self):
@@ -2911,18 +3197,34 @@ def run_gui():
             if self.server:
                 self.server.kick()
 
-        def _banner(self, state, who=""):
+        def _banner(self, state, who="", sub=None):
+            self.banner_state = (state, who)
             if state == "off":
-                self.banner.configure(text="○  ยังไม่เปิดรับการเชื่อมต่อ", bg="#eceef1", fg="#444")
-                self.kick_btn.grid_forget()
+                bg, fg, border = "card", "muted", "border"
+                title = "○   ยังไม่เปิดรับการเชื่อมต่อ"
+                sub = "กด \"เริ่มเปิดรับการเชื่อมต่อ\" เพื่อให้เครื่องอื่นเชื่อมต่อเข้ามาได้"
             elif state == "wait":
-                self.banner.configure(text="●  กำลังรอการเชื่อมต่อ  —  พอร์ต %s" % self.sport_var.get(),
-                                      bg="#e3f6ea", fg="#166534")
-                self.kick_btn.grid_forget()
+                bg, fg, border = "ok_bg", "ok", "ok_bg"
+                title = "●   พร้อมรับการเชื่อมต่อ"
+                sub = "รอที่พอร์ต %s ในวง LAN%s" % (self.sport_var.get(), (" และผ่านอินเทอร์เน็ตด้วย ID %s"
+                                                   % fmt_id(self.cfg["host_id"])) if self._relay_cfg() else "")
             else:
                 self.session_who = who
-                self.banner.configure(text="●  กำลังถูกควบคุมโดย  %s" % who, bg="#fde2e2", fg="#991b1b")
-                self.kick_btn.grid(row=6, column=0, columnspan=3, sticky="e", pady=(6, 0))
+                bg, fg, border = "danger_bg", "danger", "danger_bg"
+                title = "●   กำลังถูกควบคุมอยู่"
+                sub = sub or "โดย %s" % who
+            for w in (self.status_card, self.status_btns):
+                w.configure(bg=T.c(bg))
+            self.status_card.configure(highlightbackground=T.c(border), highlightcolor=T.c(border))
+            self.banner.configure(text=title, bg=T.c(bg), fg=T.c(fg))
+            self.banner_sub.configure(text=sub, bg=T.c(bg), fg=T.c("text" if state != "off" else "muted"))
+            running = state != "off"
+            self.srv_btn.configure(text="■   หยุดเปิดรับ" if running else "▶   เริ่มเปิดรับการเชื่อมต่อ",
+                                   style="Big.TButton" if running else "Big.Accent.TButton")
+            if state == "busy":
+                self.kick_btn.pack(side="left", padx=(10, 0))
+            else:
+                self.kick_btn.pack_forget()
 
         def _ask_threadsafe(self, ip, name):
             ev, box = threading.Event(), {}
@@ -2994,8 +3296,8 @@ def run_gui():
                     elif k == "latency":
                         if getattr(self, "session_who", None) and self.server and self.server.session:
                             word, _c = latency_style(m[2])
-                            self.banner.configure(text="●  กำลังถูกควบคุมโดย  %s   ·   Latency %.0f ms (%s)"
-                                                       % (self.session_who, m[2], word))
+                            self._banner("busy", self.session_who, "โดย %s   ·   Latency %.0f ms (%s)"
+                                         % (self.session_who, m[2], word))
                     elif k == "session_end":
                         self.session_who = None
                         self._banner("wait" if self.server and self.server.is_alive() else "off")
@@ -3017,10 +3319,8 @@ def run_gui():
             self.root.after(200, self.root.destroy)
 
     root = tk.Tk()
-    try:
-        ttk.Style().theme_use("aqua" if SYSTEM == "Darwin" else "vista" if SYSTEM == "Windows" else "clam")
-    except Exception:
-        pass
+    T = Theme(root, load_config().get("theme", "auto"))
+    set_app_icon(root)
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.quit)
     if SYSTEM == "Darwin":

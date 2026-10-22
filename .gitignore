@@ -22,3 +22,7 @@ installer/
 key.txt
 *.pfx
 *.p12
+
+# Server: log และ PID จาก start_server.sh
+Server/server.log
+Server/.server.pid

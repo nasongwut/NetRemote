@@ -16,6 +16,7 @@ Remote Desktop/
 ├── Server/                     ← Relay Server + หน้าเว็บมอนิเตอร์ (รันบนเครื่อง Server)
 │   ├── relay_server.py
 │   ├── requirements.txt        ไลบรารีเสริม (psutil — ไม่บังคับ)
+│   ├── start_server.sh         เปิด / reload / ปิด Server (activate .venv ให้เอง)
 │   ├── .env / .env.example     ตั้งค่า Server (พอร์ต, RELAY_KEY, รหัสหน้าเว็บ) — .env ไม่ขึ้น GitHub
 │   ├── updates/                ไฟล์อัปเดตที่แจกให้ Client (ไม่ขึ้น GitHub)
 │   ├── netremote-relay.service ติดตั้งเป็น service บน Linux
@@ -32,8 +33,7 @@ Remote Desktop/
 เลขเวอร์ชัน = `VERSION` ใน `Client/remote_desktop.py` + จำนวน commit (เช่น 1.7.30) — เพิ่มเองทุกครั้งที่ push
 
 ## เริ่มใช้งาน
-1. **Server** (ครั้งเดียว): `cd Server && pip3 install -r requirements.txt && python3 relay_server.py` — อ่านค่าจาก `Server/.env` อัตโนมัติ
-   (`requirements.txt` มีแค่ psutil สำหรับหน้า Server Monitor — ไม่ติดตั้งก็รันได้)
+1. **Server**: `cd Server && ./start_server.sh` — สร้าง .venv + ติดตั้งไลบรารีให้เอง แล้วเปิดเบื้องหลัง · `./start_server.sh reload` = ปิดแล้วเปิดใหม่ · อ่านค่าจาก `Server/.env` อัตโนมัติ
    หน้ามอนิเตอร์ `http://localhost:5911` · รายละเอียดใน [`Server/README.md`](Server/README.md)
 2. **Client**: ใส่ `RELAY_ADDR` และ `RELAY_KEY` (ตรงกับ `Server/.env`) ในไฟล์ `Client/.env`
 3. เครื่องที่ถูกควบคุม: แจ้ง ID + รหัสผ่าน · เครื่องที่ควบคุม: ใส่ ID + รหัสผ่าน → เชื่อมต่อ

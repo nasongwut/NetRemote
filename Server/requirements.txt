@@ -1,0 +1,6 @@
+# Relay Server ใช้แค่ Python 3.8+ ที่มากับเครื่องก็รันได้ (ไม่ต้องติดตั้งอะไรเพิ่ม)
+# ไลบรารีด้านล่างไม่บังคับ — ติดตั้งแล้วหน้า Server Monitor แสดง CPU / RAM / Disk / Network ได้ละเอียดและแม่นขึ้น
+#
+#   pip install -r requirements.txt
+#
+psutil>=5.9

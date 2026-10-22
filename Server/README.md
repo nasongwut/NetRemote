@@ -177,8 +177,9 @@ API (ใช้ Basic auth ได้ เช่น `curl -u admin:<รหัส>`)
 
 ### ทดลองบน Mac / เครื่องในออฟฟิศ
 ```bash
-cd "Remote Desktop/relay"
-cp .env.example .env        # แก้ RELAY_KEY ให้เป็นรหัสของคุณ (หรือใช้ .env ที่สร้างให้แล้ว)
+cd "Remote Desktop/Server"
+pip3 install -r requirements.txt   # ไม่บังคับ — ทำครั้งเดียว ให้หน้า Server Monitor แสดง CPU/RAM/Disk/Network ละเอียดขึ้น
+cp .env.example .env               # แก้ RELAY_KEY ให้เป็นรหัสของคุณ (หรือใช้ .env ที่สร้างให้แล้ว)
 python3 relay_server.py
 ```
 โปรแกรม NetRemote ทุกเครื่องตั้ง `RELAY_ADDR=<IP เครื่องที่รัน Relay>:5910`
@@ -186,18 +187,19 @@ python3 relay_server.py
 
 ### บน VPS (Ubuntu / Debian) — แนะนำสำหรับใช้งานจริง
 ```bash
+sudo apt install -y python3-pip && sudo pip3 install -r requirements.txt   # ไม่บังคับ (psutil สำหรับหน้า Server Monitor)
 sudo mkdir -p /opt/netremote-relay
 sudo cp -r relay_server.py .env updates /opt/netremote-relay/
 sudo useradd -r -s /usr/sbin/nologin netremote          # ผู้ใช้สำหรับรัน Relay
 sudo chown -R netremote:netremote /opt/netremote-relay   # ให้หน้าเว็บบันทึกการตั้งค่าได้
-sudo chmod 600 /opt/netremote-Server/.env
+sudo chmod 600 /opt/netremote-relay/.env
 sudo cp netremote-relay.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now netremote-relay
 sudo ufw allow 5910/tcp                       # และเปิดใน Firewall ของผู้ให้บริการ
 sudo journalctl -u netremote-relay -f         # ดู log
 ```
-สเปกต่ำสุดก็พอ (1 vCPU / 512 MB) — ใช้แค่ Python 3.8+ ไม่ต้องติดตั้งไลบรารีเพิ่ม (psutil ไม่บังคับ)
+สเปกต่ำสุดก็พอ (1 vCPU / 512 MB) — ใช้แค่ Python 3.8+ ไม่ต้องติดตั้งไลบรารีเพิ่ม (`requirements.txt` มีแค่ psutil ซึ่งไม่บังคับ)
 
 > อัปเกรดจากเวอร์ชันก่อน: คัดลอกไฟล์ `netremote-relay.service` ใหม่ + ทำคำสั่ง `useradd` และ `chown` ด้านบน แล้ว `sudo systemctl daemon-reload && sudo systemctl restart netremote-relay`
 Bandwidth: รีโมทปกติ ~0.2–3 Mbps ต่อเซสชัน, รับ-ส่งไฟล์ใช้ตามขนาดไฟล์ — เลือก VPS ใกล้ผู้ใช้ (ไทย/สิงคโปร์) Latency จะต่ำ

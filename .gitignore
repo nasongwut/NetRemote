@@ -16,3 +16,9 @@ relay_ids.json
 # ไฟล์อัปเดตที่แจกจาก Relay (ไฟล์ใหญ่ ไม่เก็บใน git)
 relay/updates/*
 !relay/updates/latest.json.example
+
+# ตัวติดตั้งที่ build แล้ว และไฟล์รหัส/ใบรับรอง (ห้ามขึ้น GitHub)
+installer/
+key.txt
+*.pfx
+*.p12

@@ -2993,9 +2993,40 @@ def install_target():
         if SYSTEM == "Darwin" and ".app/Contents/MacOS" in exe:
             return "mac-app", exe.split(".app/Contents/MacOS")[0] + ".app"
         if SYSTEM == "Windows":
-            return "win-exe", exe
+            mei = os.path.abspath(getattr(sys, "_MEIPASS", "") or "")
+            if mei and os.path.normcase(os.path.dirname(mei)) == os.path.normcase(os.path.dirname(exe)) \
+                    or os.path.normcase(mei) == os.path.normcase(os.path.dirname(exe)):
+                return "win-dir", exe          # ติดตั้งด้วย Setup (โฟลเดอร์ + _internal) → อัปเดตด้วย Setup ตัวใหม่
+            return "win-exe", exe              # .exe ไฟล์เดียว
         return None, None
     return "source", os.path.abspath(__file__)
+
+
+def is_setup_file(path_or_name):
+    """ไฟล์ติดตั้ง (Setup.exe ที่สร้างด้วย Inno Setup)?"""
+    n = os.path.basename(str(path_or_name)).lower()
+    if "setup" in n or "install" in n:
+        return True
+    try:
+        with open(path_or_name, "rb") as f:
+            return b"Inno Setup" in f.read(4 * 1024 * 1024)
+    except OSError:
+        return False
+
+
+PENDING_SETUP = []          # (path, เปิดโปรแกรมใหม่หลังติดตั้ง?) — รันตอนโปรแกรมปิด
+
+
+def run_pending_setup():
+    """รัน Setup แบบเงียบหลังหน้าต่างปิด — Setup จะปิดโปรแกรมที่เหลือ แทนที่ไฟล์ แล้วเปิดใหม่ให้เอง"""
+    if not PENDING_SETUP:
+        return False
+    pkg, relaunch = PENDING_SETUP[-1]
+    args = [pkg, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/SP-"]
+    if not relaunch:
+        args.append("/NOLAUNCH")
+    relaunch_self(args)
+    return True
 
 
 def update_plat_for(info):
@@ -3014,9 +3045,13 @@ def can_auto_install(info):
     if not kind or not f:
         return False
     name = f["name"].lower()
-    ok_ext = {"mac-app": (".dmg", ".zip"), "win-exe": (".exe",), "source": (".py",)}[kind]
+    ok_ext = {"mac-app": (".dmg", ".zip"), "win-exe": (".exe",), "win-dir": (".exe",), "source": (".py",)}[kind]
     if not name.endswith(ok_ext):
         return False
+    if kind == "win-dir" and not is_setup_file(name):
+        return False                                   # ติดตั้งแบบโฟลเดอร์ ต้องอัปเดตด้วย Setup เท่านั้น
+    if is_setup_file(name):
+        return True                                    # Setup ติดตั้งเองได้ ไม่ต้องเขียนทับไฟล์เดิม
     return os.access(os.path.dirname(target) or ".", os.W_OK) and (not os.path.exists(target) or
                                                                     os.access(target, os.W_OK))
 
@@ -3031,6 +3066,9 @@ def launch_installer(pkg, relaunch=True):
         os.replace(tmp, target)
         if relaunch:
             RESTART.append(True)
+        return True
+    if kind in ("win-exe", "win-dir") and is_setup_file(pkg):
+        PENDING_SETUP.append((pkg, relaunch))          # รันตอนปิดโปรแกรม (run_pending_setup)
         return True
     if kind == "win-exe":
         # Windows ยอมให้ "เปลี่ยนชื่อ" ไฟล์ .exe ที่กำลังทำงานอยู่ได้ → ย้ายตัวเก่าออก วางตัวใหม่แทน
@@ -7014,6 +7052,8 @@ def run_gui():
         except Exception:
             pass
     root.mainloop()
+    if run_pending_setup():                             # อัปเดตด้วย Setup → Setup เปิดโปรแกรมใหม่ให้เอง
+        return
     if RESTART:                                         # เปลี่ยนภาษา → เปิดโปรแกรมใหม่
         if getattr(sys, "frozen", False):
             cmd = [sys.executable] + sys.argv[1:]

@@ -142,7 +142,7 @@ Relay อ่านไฟล์ `.env` ที่อยู่โฟลเดอร
 เมนูด้านซ้าย (Sidebar) มี 3 หน้า · ปุ่ม **English / ไทย** สลับภาษาได้ที่มุมล่างซ้าย (และในหน้าเข้าสู่ระบบ)
 
 **หน้าเข้าสู่ระบบ**
-- รหัสผ่าน = `RELAY_ADMIN_KEY` ใน `relay/.env` (ถ้าไม่ได้ตั้ง ใช้ค่าเดียวกับ `RELAY_KEY`)
+- รหัสผ่าน = `RELAY_ADMIN_KEY` ใน `Server/.env` (ถ้าไม่ได้ตั้ง ใช้ค่าเดียวกับ `RELAY_KEY`)
 - ปุ่ม 👁 แสดงรหัสผ่าน · แจ้งเตือน Caps Lock · "จดจำการเข้าสู่ระบบ 30 วัน"
 - ใส่ผิด 5 ครั้ง ล็อก 60 วินาที · รีสตาร์ต Relay แล้วยังอยู่ในระบบ · เปลี่ยนรหัส Admin = ทุกคนต้องเข้าสู่ระบบใหม่
 
@@ -190,7 +190,7 @@ sudo mkdir -p /opt/netremote-relay
 sudo cp -r relay_server.py .env updates /opt/netremote-relay/
 sudo useradd -r -s /usr/sbin/nologin netremote          # ผู้ใช้สำหรับรัน Relay
 sudo chown -R netremote:netremote /opt/netremote-relay   # ให้หน้าเว็บบันทึกการตั้งค่าได้
-sudo chmod 600 /opt/netremote-relay/.env
+sudo chmod 600 /opt/netremote-Server/.env
 sudo cp netremote-relay.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now netremote-relay
@@ -214,7 +214,7 @@ Bandwidth: รีโมทปกติ ~0.2–3 Mbps ต่อเซสชัน
 3. ใส่ **เลขเวอร์ชัน** (ต้องตรงกับ VERSION ในไฟล์ที่ Build) + **มีอะไรใหม่** → กด **เผยแพร่อัปเดต**
 - หน้านี้แสดงเวอร์ชันของทุกเครื่องที่ออนไลน์ (ล่าสุด / รออัปเดต) และไฟล์ในโฟลเดอร์ `updates/` (ลบได้)
 - **หยุดแจกอัปเดต** = ลบ `latest.json` (ไฟล์ยังอยู่) · ไม่ต้องรีสตาร์ต Relay
-- ไม่ใช้หน้าเว็บก็ได้: คัดลอกไฟล์ไปไว้ใน `relay/updates/` แล้วสร้าง `latest.json` ตาม `latest.json.example`
+- ไม่ใช้หน้าเว็บก็ได้: คัดลอกไฟล์ไปไว้ใน `Server/updates/` แล้วสร้าง `latest.json` ตาม `latest.json.example`
 
 **ฝั่งผู้ใช้ — ไม่ต้องทำอะไร**
 - โปรแกรมตรวจหาอัปเดตตอนเปิด และทุก 1 ชั่วโมง → เจอเวอร์ชันใหม่ **ดาวน์โหลดเองในเบื้องหลัง** (ตรวจความสมบูรณ์ของไฟล์)
@@ -236,7 +236,7 @@ Bandwidth: รีโมทปกติ ~0.2–3 Mbps ต่อเซสชัน
 | ป้ายแดง "Relay: เชื่อมต่อไม่ได้" — Connection refused | Relay ไม่ได้รัน หรือพอร์ตผิด → ตรวจ `systemctl status netremote-relay` |
 | … — timed out | Firewall ปิดพอร์ต 5910 (ทั้งใน VPS และของผู้ให้บริการ) |
 | … — Name or service not known | `RELAY_ADDR` พิมพ์ชื่อโดเมนผิด |
-| "Relay Key ไม่ถูกต้อง" | `RELAY_KEY` ในโปรแกรม ≠ ใน `relay/.env` |
+| "Relay Key ไม่ถูกต้อง" | `RELAY_KEY` ในโปรแกรม ≠ ใน `Server/.env` |
 | "ไม่พบเครื่อง ID … " | เครื่องปลายทางไม่ได้เปิดโปรแกรม NetRemote หรือออฟไลน์ |
 | "ID นี้ถูกใช้โดยเครื่องอื่นแล้ว" | กด "สร้าง ID ใหม่" ในโปรแกรม (หรือลบ ID นั้นใน `relay_ids.json` แล้วรีสตาร์ต Relay) |
 | "เครื่องปลายทางไม่ตอบสนอง" | Host หลุดจาก Relay ชั่วคราว รอสักครู่แล้วลองใหม่ |

@@ -6,7 +6,7 @@
 cd "$(dirname "$0")"
 PKG="$(pwd)"
 APPDIR="$(cd .. && pwd)"
-ROOT="$(cd ../.. && pwd)"
+ROOT="$(cd ../../.. && pwd)"
 OUT="$ROOT/Apps/macOS"
 WORK="$PKG/.work"
 ARCH="$(uname -m)"

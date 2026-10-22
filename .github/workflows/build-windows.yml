@@ -7,6 +7,9 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths:                       # build เฉพาะเมื่อฝั่ง Client หรือไฟล์ build เปลี่ยน (แก้ Server อย่างเดียวไม่ต้อง build)
+      - "Client/**"
+      - ".github/workflows/**"
 
 jobs:
   build:
@@ -15,6 +18,9 @@ jobs:
       matrix:
         os: [windows-latest]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: Client    # โค้ดโปรแกรมอยู่ในโฟลเดอร์ Client/
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,7 +97,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: NetRemote-Windows-Setup
-          path: installer/NetRemote-Setup-*.exe
+          path: Client/installer/NetRemote-Setup-*.exe
 
       # ---------------- macOS ----------------
       - name: Package DMG (macOS)
@@ -111,4 +117,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: NetRemote-macOS
-          path: "NetRemote-macOS-*.dmg"
+          path: "Client/NetRemote-macOS-*.dmg"

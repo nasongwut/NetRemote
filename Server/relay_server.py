@@ -1345,7 +1345,7 @@ form.card{position:relative}
     <span class="caps" id="caps">⇪ Caps Lock เปิดอยู่</span>
   </div>
   <button class="go" id="go">เข้าสู่ระบบ</button>
-  <div class="note"><span>รหัสผ่านคือ</span> <b>RELAY_ADMIN_KEY</b> <span>ในไฟล์ relay/.env</span><br><span>(ถ้าไม่ได้ตั้ง ใช้ค่าเดียวกับ RELAY_KEY)</span></div>
+  <div class="note"><span>รหัสผ่านคือ</span> <b>RELAY_ADMIN_KEY</b> <span>ในไฟล์ Server/.env</span><br><span>(ถ้าไม่ได้ตั้ง ใช้ค่าเดียวกับ RELAY_KEY)</span></div>
 </form>
 <div class="foot">NetRemote Relay v__VER__</div></div>
 <script>
@@ -1353,7 +1353,7 @@ const LANG=(()=>{try{return localStorage.getItem("nr_lang")||"en"}catch(e){retur
 const EN={"เข้าสู่ระบบ · NetRemote Relay":"Sign in · NetRemote Relay","เข้าสู่ระบบหน้ามอนิเตอร์สำหรับผู้ดูแล":"Sign in to the admin monitor",
 "รหัสผ่านผู้ดูแล (Admin Key)":"Admin password (Admin Key)","ใส่รหัสผ่าน":"Enter password","แสดงรหัสผ่าน":"Show password",
 "จดจำการเข้าสู่ระบบ 30 วัน":"Keep me signed in for 30 days","⇪ Caps Lock เปิดอยู่":"⇪ Caps Lock is on","เข้าสู่ระบบ":"Sign in",
-"รหัสผ่านคือ":"The password is","ในไฟล์ relay/.env":"in relay/.env","(ถ้าไม่ได้ตั้ง ใช้ค่าเดียวกับ RELAY_KEY)":"(if not set, the same as RELAY_KEY)",
+"รหัสผ่านคือ":"The password is","ในไฟล์ Server/.env":"in Server/.env","(ถ้าไม่ได้ตั้ง ใช้ค่าเดียวกับ RELAY_KEY)":"(if not set, the same as RELAY_KEY)",
 "กำลังตรวจสอบ…":"Checking…","✓ สำเร็จ":"✓ Success","รหัสผ่านไม่ถูกต้อง":"Incorrect password","เชื่อมต่อ Relay ไม่ได้":"Cannot reach the Relay"};
 const t=s=>LANG==="en"?(EN[s]??s):s;
 const $=id=>document.getElementById(id), pw=$("pw");

@@ -4,19 +4,19 @@
 
 macOS → .app
   1. (แนะนำ) ติดตั้ง Python จาก https://www.python.org/downloads/macos/
-  2. ดับเบิลคลิก  packaging/Build macOS (.app).command
-     หรือ Terminal:  "~/Desktop/Network tools/Remote Desktop/packaging/Build macOS (.app).command"
+  2. ดับเบิลคลิก  Client/packaging/Build macOS (.app).command
+     หรือ Terminal:  "~/Desktop/Network tools/Remote Desktop/Client/packaging/Build macOS (.app).command"
   3. ได้ไฟล์ที่  Network tools/Apps/macOS/NetRemote.app  และ  .dmg
      (สคริปต์จะถามว่าจะติดตั้งลง Applications ด้วยไหม)
 
 Windows → .exe
   1. คัดลอกโฟลเดอร์ "Remote Desktop" ไปเครื่อง Windows
   2. ติดตั้ง Python จาก https://www.python.org/downloads/windows/ (ติ๊ก "Add python.exe to PATH")
-  3. ดับเบิลคลิก  packaging\Build Windows (.exe).bat
+  3. ดับเบิลคลิก  Client\packaging\Build Windows (.exe).bat
   4. ได้ไฟล์ที่  Apps\Windows\NetRemote.exe  (ไฟล์เดียว คัดลอกไปใช้เครื่องไหนก็ได้)
 
 GitHub Actions (Build บน Cloud ไม่ต้องมีเครื่อง Windows)
   - push โฟลเดอร์นี้ขึ้น GitHub (ไฟล์ .github/workflows/build.yml พร้อมแล้ว)
   - แท็บ Actions → รายการล่าสุด ✓ → Artifacts → ดาวน์โหลด .exe / .dmg
 
-เครื่องมือ Build เก็บแยกไว้ใน packaging/.work (ลบทิ้งได้ จะสร้างใหม่อัตโนมัติ)
+เครื่องมือ Build เก็บแยกไว้ใน Client/packaging/.work (ลบทิ้งได้ จะสร้างใหม่อัตโนมัติ)

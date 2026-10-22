@@ -120,6 +120,13 @@ def env_str(key, default=""):
     return v if v != "" else default
 
 
+def env_int(key, default):
+    try:
+        return int(ENV.get(key, "").strip() or default)
+    except ValueError:
+        return default
+
+
 def env_bool(key, default):
     v = ENV.get(key, "").strip().lower()
     if v in ("1", "true", "yes", "on", "y"):
@@ -149,6 +156,10 @@ def _detect_lang():
 LANG = _detect_lang()
 RESTART = []
 _EN = {
+    'เครื่องนี้มีผู้เชื่อมต่อครบจำนวนแล้ว (%d เครื่อง)': 'This computer already has the maximum number of connections (%d)',
+    'กำลังคุยสายอื่นอยู่ — วางสายเดิมก่อน': 'Already on another call — hang up first',
+    'ตัดการเชื่อมต่อทุกเครื่อง': 'Disconnect all',
+    '%d เครื่อง: %s': '%d computers: %s',
     'NetRemote เปิดอยู่แล้ว': 'NetRemote is already running',
     'กำลังอัปเดต NetRemote… โปรแกรมจะเปิดใหม่เอง': 'Updating NetRemote… it will reopen by itself',
     'กำลังอัปเดต NetRemote เป็นเวอร์ชัน %s': 'Updating NetRemote to version %s',
@@ -1292,8 +1303,9 @@ class Server(threading.Thread):
         self.relay = relay
         self.relay_thread = None
         self.stop_event = threading.Event()
-        self.session = None
+        self.sessions = {}                   # sid → {"ip","name","chan","chat","call"} — รับได้หลายเครื่องพร้อมกัน
         self.session_lock = threading.Lock()
+        self.max_viewers = max(1, env_int("MAX_VIEWERS", 5))     # จำนวนเครื่องที่ควบคุมพร้อมกันได้สูงสุด
         self.fails = {}
         self.ctx = server_context()
         self.fp = server_fingerprint()
@@ -1312,10 +1324,19 @@ class Server(threading.Thread):
             pass
         self.kick()
 
-    def kick(self):
-        s = self.session
-        if s and s.get("chan"):
-            s["chan"].close(tr("เครื่องปลายทางตัดการเชื่อมต่อ"))
+    @property
+    def session(self):
+        """การเชื่อมต่อใดก็ได้ที่ยังอยู่ (None = ว่าง) — ใช้ตรวจว่ามีคนควบคุมอยู่ไหม"""
+        with self.session_lock:
+            return next(iter(self.sessions.values()), None)
+
+    def kick(self, sid=None):
+        """ตัดการเชื่อมต่อ (sid=None → ทุกเครื่อง)"""
+        with self.session_lock:
+            targets = [v for k, v in self.sessions.items() if sid is None or k == sid]
+        for s in targets:
+            if s.get("chan"):
+                s["chan"].close(tr("เครื่องปลายทางตัดการเชื่อมต่อ"))
 
     def run(self):
         # รับการเชื่อมต่อผ่าน Relay เท่านั้น — ไม่เปิดพอร์ตใด ๆ บนเครื่องนี้
@@ -1364,9 +1385,9 @@ class Server(threading.Thread):
                 return
             self.fails.pop(ip, None)
             with self.session_lock:
-                busy = self.session is not None
+                busy = len(self.sessions) >= self.max_viewers
             if busy:
-                send_msg(tls, T_ERR, jdump({"msg": tr("เครื่องนี้มีผู้เชื่อมต่ออยู่แล้ว")}))
+                send_msg(tls, T_ERR, jdump({"msg": tr("เครื่องนี้มีผู้เชื่อมต่อครบจำนวนแล้ว (%d เครื่อง)") % self.max_viewers}))
                 tls.close()
                 return
             if self.ask_cb:
@@ -1378,11 +1399,12 @@ class Server(threading.Thread):
                     tls.close()
                     return
             with self.session_lock:
-                if self.session is not None:
-                    send_msg(tls, T_ERR, jdump({"msg": tr("เครื่องนี้มีผู้เชื่อมต่ออยู่แล้ว")}))
+                if len(self.sessions) >= self.max_viewers:
+                    send_msg(tls, T_ERR, jdump({"msg": tr("เครื่องนี้มีผู้เชื่อมต่อครบจำนวนแล้ว (%d เครื่อง)") % self.max_viewers}))
                     tls.close()
                     return
-                self.session = {"ip": ip, "name": name}
+                sid = secrets.token_hex(4)
+                sess = self.sessions[sid] = {"ip": ip, "name": name, "sid": sid}
         except Exception as e:
             try:
                 tls.close()
@@ -1403,7 +1425,7 @@ class Server(threading.Thread):
             send_msg(tls, T_OK, jdump({"name": computer_name(), "os": SYSTEM, "monitors": mons,
                                        "files": bool(self.allow_files), "v": PROTO, "chat": 1,
                                        "control": bool(self.allow_control and inj)}))
-            self._session_loop(tls, ip, name, cap, inj)
+            self._session_loop(tls, ip, name, cap, inj, sess)
         except Exception as e:
             self.log(tr("ผิดพลาดระหว่างเชื่อมต่อ: %s") % err_text(e))
             try:
@@ -1417,9 +1439,10 @@ class Server(threading.Thread):
             if cap:
                 cap.close()
             with self.session_lock:
-                self.session = None
+                self.sessions.pop(sid, None)
 
-    def _session_loop(self, tls, ip, name, cap, inj):
+    def _session_loop(self, tls, ip, name, cap, inj, sess):
+        sid = sess["sid"]
         from PIL import ImageChops
         st = {"max_w": 1600, "q": 60, "sub": 2, "mon": 0, "force": True}
         req = threading.Event()
@@ -1449,7 +1472,7 @@ class Server(threading.Thread):
                 try:
                     rtt = jload(p).get("rtt")
                     if rtt is not None:
-                        self.events.put(("latency", ip, float(rtt)))
+                        self.events.put(("latency", ip, float(rtt), sid))
                 except Exception:
                     pass
             elif t == T_INPUT and inj and self.allow_control:
@@ -1467,14 +1490,14 @@ class Server(threading.Thread):
             if ev.get("ev") == "call_incoming" and not getattr(self, "ui", True):
                 call.decline("nodev")                # โหมดไม่มีหน้าต่าง: รับสายไม่ได้
                 return
-            self.events.put(("chat", ev))
+            self.events.put(("chat", ev, sid))
         chat = ChatEngine(chan, deliver, name)
         call = CallEngine(chan, deliver)
-        self.session["chan"] = chan
-        self.session["chat"], self.session["call"] = chat, call
-        self.events.put(("chat_open", chat, call, name))
+        sess["chan"] = chan
+        sess["chat"], sess["call"] = chat, call
+        self.events.put(("chat_open", chat, call, name, sid))
         chan.start()
-        self.events.put(("session", ip, name))
+        self.events.put(("session", ip, name, sid))
         self.log(tr("● %s (%s) เชื่อมต่อแล้ว") % (name, ip))
         prev = None
         last_sent = 0.0
@@ -1531,10 +1554,10 @@ class Server(threading.Thread):
         fs.close()
         chat.close()
         call.close()
-        self.events.put(("chat_end",))
+        self.events.put(("chat_end", sid))
         chan.close(tr("เครื่องนี้ตัดการเชื่อมต่อ") if self.stop_event.is_set() else "")
         chan.join(3)
-        self.events.put(("session_end", ip, reason["r"] or chan.reason))
+        self.events.put(("session_end", ip, reason["r"] or chan.reason, sid))
         self.log(tr("○ %s (%s) ออกจากการเชื่อมต่อ — %s") % (name, ip, reason["r"] or chan.reason))
 
     def _input(self, inj, cap, mon_i, m):
@@ -2429,6 +2452,8 @@ class ChatEngine:
 
 
 class CallEngine:
+    ALL = []                                 # ทุกสายในเครื่องนี้ — โทรได้ทีละสาย (ไมค์/ลำโพงมีชุดเดียว)
+
     """โทรเสียง / วีดีโอคอล — สัญญาณ (invite/accept/decline/end) + สตรีมเสียง PCM และภาพ JPEG
     ส่งเหตุการณ์ทาง deliver(dict): call_incoming, call_state, remote_video, self_video, call_error"""
 
@@ -2446,6 +2471,10 @@ class CallEngine:
         self.cam_stop = threading.Event()
         self.peer_video = False
         self.sid = None
+        CallEngine.ALL.append(self)
+
+    def _other_busy(self):
+        return any(e is not self and e.state != "idle" for e in list(CallEngine.ALL))
 
     # ----- สัญญาณ -----
     def _sig(self, op, **kw):
@@ -2458,6 +2487,9 @@ class CallEngine:
         audio_ok, video_ok = media_available()
         if not audio_ok:
             self.deliver({"ev": "call_error", "text": tr("ไม่พบไมโครโฟนหรือลำโพงในเครื่องนี้")})
+            return
+        if self._other_busy():
+            self.deliver({"ev": "call_error", "text": tr("กำลังคุยสายอื่นอยู่ — วางสายเดิมก่อน")})
             return
         self.sid = secrets.token_hex(4)
         self.video = bool(video and video_ok)
@@ -2518,7 +2550,7 @@ class CallEngine:
         m = jload(p)
         op = m.get("op")
         if op == "invite":
-            if self.state != "idle":
+            if self.state != "idle" or self._other_busy():
                 self.chan.send(T_CALL, jdump({"op": "decline", "sid": m.get("sid"), "reason": "busy"}))
                 return
             self.sid = m.get("sid")
@@ -2646,6 +2678,10 @@ class CallEngine:
     def close(self):
         if self.state != "idle":
             self._finish("ended")
+        try:
+            CallEngine.ALL.remove(self)
+        except ValueError:
+            pass
 
 
 # ============================================================================
@@ -6163,6 +6199,7 @@ def run_gui(minimized=False):
             self.banner_state = ("off", "")
             self.relay_state = {"mon": "checking", "data": None, "host": None, "host_text": "", "t": None}
             self.session_who = None
+            self.session_names = {}                  # sid → "ชื่อ (IP)" ของทุกเครื่องที่ควบคุมอยู่
             root.title("%s — Remote Desktop" % APP)
             root.geometry("1000x780")
             root.minsize(900, 700)
@@ -6525,7 +6562,8 @@ def run_gui(minimized=False):
                                        command=self.kick)
             self.host_chat_btn = ttk.Button(self.status_btns, text="💬 " + tr("แชท"), style="Big.TButton",
                                             command=lambda: self.show_host_chat(True))
-            self.host_chat = None
+            self.host_chats = {}                     # sid → หน้าต่างแชทของแต่ละเครื่องที่ควบคุมอยู่
+            self.session_lat = {}
 
             # ข้อมูลสำหรับเชื่อมต่อ
             info = card(left)
@@ -7238,33 +7276,78 @@ def run_gui(minimized=False):
                 self.kick_btn.pack_forget()
                 self.host_chat_btn.pack_forget()
 
-        # ----- แชทฝั่งเครื่องที่ถูกควบคุม -----
-        def _open_host_chat(self, chat, call, name):
-            self._close_host_chat()
+        # ----- แชทฝั่งเครื่องที่ถูกควบคุม (รองรับหลายเครื่องพร้อมกัน: 1 หน้าต่างแชทต่อ 1 เครื่อง) -----
+        def _open_host_chat(self, chat, call, name, sid=""):
+            self._close_host_chat(sid, quiet=True)
             w = T.track(tk.Toplevel(self.root), bg="card")
             w.title("%s — %s" % (name, APP))
             sw, sh = w.winfo_screenwidth(), w.winfo_screenheight()
             ww, wh = max(340, sw // 7), min(720, sh - 140)
-            w.geometry("%dx%d+%d+%d" % (ww, wh, sw - ww - 24, 80))
+            off = 28 * len(self.host_chats)
+            w.geometry("%dx%d+%d+%d" % (ww, wh, sw - ww - 24 - off, 80 + off))
             w.minsize(320, 420)
             w.protocol("WM_DELETE_WINDOW", w.withdraw)
             panel = ChatPanel(w, chat, call, name, mode="host", width=ww, on_hide=w.withdraw,
                               subtitle=tr("กำลังควบคุมเครื่องนี้"))
             panel.frame.pack(fill="both", expand=True)
-            panel.on_unread = self._host_unread
+            panel.on_unread = lambda n, ev=None, sid=sid: self._host_unread(sid, n, ev)
             w.withdraw()
-            self.host_chat = (w, panel)
-            self._show_control_banner(name)
+            self.host_chats[sid] = {"win": w, "panel": panel, "name": name, "unread": 0}
+            self._refresh_control_banner()
             if self.banner_state[0] == "busy":
                 self.host_chat_btn.pack(side="left", padx=(10, 0))
 
-        def _host_unread(self, n, ev=None):
-            if n == -1 or n:
-                self.show_host_chat(True)              # ข้อความ/สายเข้า → เด้งหน้าต่างแชทขึ้นมา (นับว่าอ่านแล้ว)
-            else:
-                self._banner_count(0)
+        @property
+        def host_chat(self):
+            """หน้าต่างแชทแรก (ใช้ตรวจว่ามีแชทเปิดอยู่ไหม)"""
+            for c in self.host_chats.values():
+                return c["win"], c["panel"]
+            return None
 
-        # ----- แถบแดงด้านบนจอ: "X กำลังควบคุมเครื่องนี้" -----
+        def _host_unread(self, sid, n, ev=None):
+            c = self.host_chats.get(sid)
+            if not c:
+                return
+            if n == -1 or n:
+                self.show_host_chat(True, sid)         # ข้อความ/สายเข้า → เด้งหน้าต่างแชทของเครื่องนั้นขึ้นมา
+            else:
+                c["unread"] = 0
+                self._banner_count()
+
+        def _host_names(self):
+            return [c["name"] for c in self.host_chats.values()]
+
+        # ----- แถบแดงด้านบนจอ: "X กำลังควบคุมเครื่องนี้" (หลายเครื่อง → "A, B กำลังควบคุม…") -----
+        def _refresh_control_banner(self):
+            names = self._host_names()
+            if not names:
+                self._hide_control_banner()
+                return
+            self._show_control_banner(names[0] if len(names) == 1 else
+                                      (", ".join(names[:3]) + (" +%d" % (len(names) - 3) if len(names) > 3 else "")))
+
+        def _pick_session(self, title, action):
+            """หลายเครื่อง → เมนูให้เลือกเครื่อง (action(sid))"""
+            sids = list(self.host_chats)
+            if len(sids) <= 1:
+                action(sids[0] if sids else None)
+                return
+            m = tk.Menu(self.root, tearoff=0)
+            for sid in sids:
+                m.add_command(label=self.host_chats[sid]["name"], command=lambda s=sid: action(s))
+            if action == self._kick_one:
+                m.add_separator()
+                m.add_command(label=tr("ตัดการเชื่อมต่อทุกเครื่อง"), command=self.kick)
+            x, y = self.root.winfo_pointerxy()
+            try:
+                m.tk_popup(x, y)
+            finally:
+                m.grab_release()
+
+        def _kick_one(self, sid):
+            if self.server:
+                self.server.kick(sid)
+
         def _show_control_banner(self, name):
             self._hide_control_banner()
             if not env_bool("CONTROL_BANNER", True):
@@ -7288,10 +7371,11 @@ def run_gui(minimized=False):
             c.create_text(38, H / 2, text=text, anchor="w", fill="#FFFFFF", font=f)
             x = 38 + f.measure(text) + 16
             self.banner_chat = RoundButton(c, "chat", text=tr("แชท"), kind="dark", w=chat_w, h=32, r=16, bg=RED,
-                                           icon_px=15, command=lambda: self.show_host_chat(True))
+                                           icon_px=15,
+                                           command=lambda: self._pick_session("chat", lambda s: self.show_host_chat(True, s)))
             KIND["banner_w"] = ("#FFFFFF", "#FDECEC", RED)
             disc = RoundButton(c, None, text=tr("ตัดการเชื่อมต่อ"), kind="banner_w", w=disc_w, h=32, r=16, bg=RED,
-                               command=self.kick)
+                               command=lambda: self._pick_session("kick", self._kick_one))
             c.create_window(x, H / 2, window=self.banner_chat.cv, anchor="w")
             c.create_window(x + chat_w + 6, H / 2, window=disc.cv, anchor="w")
             sw = b.winfo_screenwidth()
@@ -7315,8 +7399,10 @@ def run_gui(minimized=False):
                 pass
             self.banner_chat.configure(bg=RED)
             self.ctrl_banner = b
+            self._banner_count()
 
-        def _banner_count(self, n):
+        def _banner_count(self, n=None):
+            n = sum(c["unread"] for c in self.host_chats.values()) if n is None else n
             try:
                 if getattr(self, "ctrl_banner", None) is not None:
                     self.banner_chat.configure(text=tr("แชท") + (" (%d)" % n if n else ""))
@@ -7332,10 +7418,16 @@ def run_gui(minimized=False):
                 except tk.TclError:
                     pass
 
-        def show_host_chat(self, show=True):
-            if not self.host_chat:
+        def show_host_chat(self, show=True, sid=None):
+            if sid is None:
+                if len(self.host_chats) > 1 and show:
+                    self._pick_session("chat", lambda s: self.show_host_chat(True, s))
+                    return
+                sid = next(iter(self.host_chats), None)
+            c = self.host_chats.get(sid)
+            if not c:
                 return
-            w, panel = self.host_chat
+            w, panel = c["win"], c["panel"]
             try:
                 if show:
                     w.deiconify()
@@ -7343,31 +7435,39 @@ def run_gui(minimized=False):
                     w.attributes("-topmost", True)
                     w.after(300, lambda: w.attributes("-topmost", False))
                     panel.seen()
-                    self._banner_count(0)
+                    c["unread"] = 0
+                    self._banner_count()
                 else:
                     w.withdraw()
             except tk.TclError:
                 pass
 
-        def _close_host_chat(self):
-            self._hide_control_banner()
-            if self.host_chat:
-                try:
-                    self.host_chat[0].destroy()
-                except tk.TclError:
-                    pass
-            self.host_chat = None
-            self.host_chat_btn.pack_forget()
-
-        def _host_chat_event(self, ev):
-            if not self.host_chat:
+        def _close_host_chat(self, sid=None, quiet=False):
+            sids = list(self.host_chats) if sid is None else [sid]
+            for s in sids:
+                c = self.host_chats.pop(s, None)
+                if c:
+                    try:
+                        c["win"].destroy()
+                    except tk.TclError:
+                        pass
+            if quiet:
                 return
-            w, panel = self.host_chat
+            self._refresh_control_banner()
+            if not self.host_chats:
+                self.host_chat_btn.pack_forget()
+
+        def _host_chat_event(self, ev, sid=""):
+            c = self.host_chats.get(sid)
+            if not c:
+                return
             try:
-                visible = w.state() == "normal"
+                visible = c["win"].state() == "normal"
             except tk.TclError:
                 return
-            panel.on_event(ev, visible)
+            if not visible and not ev.get("mine") and ev.get("ev") in ("msg", "file"):
+                c["unread"] += 1
+            c["panel"].on_event(ev, visible)
 
         def _ask_threadsafe(self, ip, name):
             ev, box = threading.Event(), {}
@@ -7431,7 +7531,8 @@ def run_gui(minimized=False):
                     elif k == "log":
                         self._log(m[1])
                     elif k == "session":
-                        self._banner("busy", "%s (%s)" % (m[2], m[1]))
+                        self.session_names[m[3] if len(m) > 3 else ""] = "%s (%s)" % (m[2], m[1])
+                        self._banner("busy", ", ".join(self.session_names.values()))
                     elif k == "relay":
                         self._update_id_row(m[1], m[2])
                         if m[1] == "error":
@@ -7447,19 +7548,32 @@ def run_gui(minimized=False):
                     elif k == "relay_test":
                         self.relay_test_var.set(m[1])
                     elif k == "latency":
-                        if getattr(self, "session_who", None) and self.server and self.server.session:
+                        sid = m[3] if len(m) > 3 else ""
+                        if sid in self.session_names and self.server and self.server.session:
                             word, _c = latency_style(m[2])
-                            self._banner("busy", self.session_who, tr("โดย %s   ·   Latency %.0f ms (%s)")
-                                         % (self.session_who, m[2], word))
+                            self.session_lat[sid] = "%.0f ms" % m[2]
+                            who = ", ".join(self.session_names.values())
+                            if len(self.session_names) == 1:
+                                sub = tr("โดย %s   ·   Latency %.0f ms (%s)") % (who, m[2], word)
+                            else:
+                                sub = tr("%d เครื่อง: %s") % (len(self.session_names), "  ·  ".join(
+                                    "%s %s" % (n, self.session_lat.get(s, "")) for s, n in self.session_names.items()))
+                            self._banner("busy", who, sub)
                     elif k == "chat_open":
-                        self._open_host_chat(m[1], m[2], m[3])
+                        self._open_host_chat(m[1], m[2], m[3], m[4] if len(m) > 4 else "")
                     elif k == "chat":
-                        self._host_chat_event(m[1])
+                        self._host_chat_event(m[1], m[2] if len(m) > 2 else "")
                     elif k == "chat_end":
-                        self._close_host_chat()
+                        self._close_host_chat(m[1] if len(m) > 1 else None)
                     elif k == "session_end":
-                        self.session_who = None
-                        self._banner("wait" if self.server and self.server.is_alive() else "off")
+                        sid = m[3] if len(m) > 3 else ""
+                        self.session_names.pop(sid, None)
+                        self.session_lat.pop(sid, None)
+                        if self.session_names:
+                            self._banner("busy", ", ".join(self.session_names.values()))
+                        else:
+                            self.session_who = None
+                            self._banner("wait" if self.server and self.server.is_alive() else "off")
                     elif k == "server_err":
                         self._log(m[1])
                         messagebox.showerror(APP, m[1])

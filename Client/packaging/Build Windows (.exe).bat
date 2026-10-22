@@ -7,7 +7,7 @@ REM =====================================================================
 cd /d "%~dp0"
 set "PKG=%~dp0"
 for %%I in ("%~dp0..") do set "APPDIR=%%~fI"
-for %%I in ("%~dp0..\..") do set "ROOT=%%~fI"
+for %%I in ("%~dp0..\..\..") do set "ROOT=%%~fI"
 set "OUT=%ROOT%\Apps\Windows"
 set "WORK=%PKG%.work"
 set "NAME=NetRemote"

@@ -1189,6 +1189,7 @@ function upload(inp){
  x.upload.onprogress=e=>{if(e.lengthComputable)bar.firstElementChild.style.width=(100*e.loaded/e.total).toFixed(1)+"%"};
  x.onload=async()=>{bar.style.display="none";let r={};try{r=JSON.parse(x.responseText)}catch(_){}
   if(x.status===200&&r.ok){toast("✓ "+t("อัปโหลดแล้ว")+": "+r.name);
+   const vm=/(\d+\.\d+(?:\.\d+){0,2})/.exec(r.name);if(vm&&!$("u-ver").value.trim())$("u-ver").value=vm[1];
    const cur={};document.querySelectorAll("#u-plats select").forEach(s=>cur[s.dataset.p]=s.value);
    if(extOk(k,r.name))cur[k]=r.name;await loadUpd();
    document.querySelectorAll("#u-plats select").forEach(s=>{if(cur[s.dataset.p]!==undefined)s.value=cur[s.dataset.p]})}

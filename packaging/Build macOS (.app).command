@@ -48,7 +48,7 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 V="$VENV/bin/python"
 "$V" -m pip install -q --upgrade pip
-"$V" -m pip install -q --upgrade pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless || fail "ติดตั้งเครื่องมือไม่สำเร็จ (ตรวจสอบอินเทอร์เน็ต)"
+"$V" -m pip install -q --upgrade pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless tkinterdnd2 || fail "ติดตั้งเครื่องมือไม่สำเร็จ (ตรวจสอบอินเทอร์เน็ต)"
 
 # 3) Build  (ถ้ามีไฟล์ .env จะฝังไปกับโปรแกรม — ผู้ใช้ไม่ต้องตั้งค่า Relay เอง)
 ADD_ENV=()

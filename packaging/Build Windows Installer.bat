@@ -45,7 +45,7 @@ if not exist "%WORK%\venv\Scripts\python.exe" (
 )
 set "V=%WORK%\venv\Scripts\python.exe"
 "%V%" -m pip install -q --upgrade pip
-"%V%" -m pip install -q --upgrade pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless || goto fail
+"%V%" -m pip install -q --upgrade pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless tkinterdnd2 || goto fail
 
 "%V%" -c "import re;print(re.search(r'^VERSION = .([^\x22]+).', open(r'%APPDIR%\remote_desktop.py', encoding='utf-8').read(), re.M).group(1))" > "%WORK%\ver.txt" || goto fail
 set /p VER=<"%WORK%\ver.txt"

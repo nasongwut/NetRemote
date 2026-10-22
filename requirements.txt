@@ -6,3 +6,5 @@ cryptography>=41
 sounddevice>=0.4.6
 numpy>=1.24
 opencv-python-headless>=4.8
+# ลากไฟล์จาก Finder / File Explorer มาวาง
+tkinterdnd2>=0.4

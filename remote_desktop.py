@@ -52,7 +52,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
 APP = "NetRemote"
-VERSION = "1.6"
+VERSION = "1.7"
 PROTO = 1
 DEFAULT_PORT = 5905
 SYSTEM = platform.system()
@@ -149,6 +149,27 @@ def _detect_lang():
 LANG = _detect_lang()
 RESTART = []
 _EN = {
+    '%d รายการ': '%d item(s)',
+    'คัดลอกตำแหน่งไฟล์': 'Copy path',
+    'ชื่อใหม่:': 'New name:',
+    'ชื่อไม่ถูกต้อง': 'Invalid name',
+    'ดาวน์โหลดไปที่': 'Download to',
+    'มีไฟล์หรือโฟลเดอร์ชื่อนี้อยู่แล้ว': 'A file or folder with this name already exists',
+    'รีเฟรช': 'Refresh',
+    'ลบ': 'Delete',
+    'ลากไฟล์ข้ามฝั่ง หรือลากจาก Finder/Explorer มาวางฝั่งขวาเพื่อส่ง · คลิกขวาเพื่อดูคำสั่ง': 'Drag files across, or from Finder/Explorer onto the right side to send · Right-click for actions',
+    'ลากไฟล์ข้ามฝั่งเพื่อส่งได้ · คลิกขวาเพื่อดูคำสั่ง': 'Drag files across to send · Right-click for actions',
+    'ส่งไปที่': 'Send to',
+    'เครื่องปลายทางใช้โปรแกรมเวอร์ชันเก่า ยังเปลี่ยนชื่อไฟล์ไม่ได้ — อัปเดตโปรแกรมบนเครื่องปลายทางก่อน': "The remote computer runs an older version that can't rename files — update it first",
+    'เปลี่ยนชื่อไม่ได้: %s': "Can't rename: %s",
+    'เปลี่ยนชื่อ…': 'Rename…',
+    'เปิดไฟล์': 'Open file',
+    'เลือกโฟลเดอร์ที่จะบันทึก': 'Choose a folder to save to',
+    'แสดงใน Finder': 'Show in Finder',
+    '✎ %s เปลี่ยนชื่อ %s → %s': '✎ %s renamed %s → %s',
+    '⬆  ส่งไปเครื่องปลายทาง': '⬆  Send to remote computer',
+    '⬇  ดาวน์โหลดมาที่โฟลเดอร์ซ้าย': '⬇  Download to the left folder',
+    '⬇  ดาวน์โหลดไปที่…': '⬇  Download to…',
     '✓ เวอร์ชัน %s พร้อมติดตั้ง — กำลังติดตั้งและเปิดโปรแกรมใหม่…': '✓ Version %s is ready — installing and restarting…',
     '⬆ จะติดตั้งเวอร์ชัน %s ให้ทันทีที่เลิกการรีโมท': '⬆ Version %s will be installed as soon as the remote session ends',
     'เปิดโปรแกรมแบบย่อหน้าต่าง (ใช้ตอนเปิดเครื่อง)': 'Start minimized (used at startup)',
@@ -1738,13 +1759,23 @@ class FileServer:
                 self.log(tr("🗑 %s ลบ %d รายการ") % (self.who, len(d.get("paths", [])) - len(errs)))
                 if errs:
                     raise RuntimeError(tr("ลบไม่สำเร็จบางรายการ — ") + "; ".join(errs[:5]))
+            elif d.get("op") == "rename":
+                parts = safe_parts(d.get("name", ""))
+                if len(parts) != 1:
+                    raise ValueError(tr("ชื่อไม่ถูกต้อง"))
+                src = os.path.abspath(str(d.get("src", "")))
+                dst = os.path.join(os.path.dirname(src), parts[0])
+                if os.path.exists(dst):
+                    raise FileExistsError(tr("มีไฟล์หรือโฟลเดอร์ชื่อนี้อยู่แล้ว"))
+                os.rename(src, dst)
+                self.log(tr("✎ %s เปลี่ยนชื่อ %s → %s") % (self.who, os.path.basename(src), parts[0]))
             elif d.get("op") == "mkdir":
                 parts = safe_parts(d.get("name", ""))
                 if len(parts) != 1:
                     raise ValueError(tr("ชื่อโฟลเดอร์ไม่ถูกต้อง"))
                 os.mkdir(os.path.join(os.path.abspath(d["path"]), parts[0]))
             res = list_dir(d.get("path"), bool(d.get("hidden")))
-            res.update(id=rid, ok=True)
+            res.update(id=rid, ok=True, op=d.get("op"))
         except Exception as e:
             res = {"id": rid, "ok": False, "err": err_text(e), "path": d.get("path")}
         self._send(T_FS_R, res)
@@ -1880,6 +1911,9 @@ class FileClient:
 
     def mkdir(self, path, name, hidden=False):
         return self._fs("mkdir", path=path, name=name, hidden=hidden)
+
+    def rename(self, path, src, name, hidden=False):
+        return self._fs("rename", path=path, src=src, name=name, hidden=hidden)
 
     # ----- jobs -----
     def _new_job(self, direction, name, dest):
@@ -4779,7 +4813,24 @@ def run_gui(minimized=False):
                 for b in (self.plus, self.send_btn, self.abtn, self.vbtn):
                     b.set_enabled(False)
                 e.configure(state="disabled")
+            elif DND["ok"]:                              # ลากไฟล์/รูป/วีดีโอจาก Finder / Explorer มาวางในแชท → ส่ง
+                for w in (self.cv, self.inner, self.pill, self.entry):
+                    try:
+                        w.drop_target_register("DND_Files")
+                        w.dnd_bind("<<Drop>>", self._os_drop)
+                    except Exception as ex:
+                        log_error(ex)
             self._tick()
+
+        def _os_drop(self, e):
+            try:
+                paths = self.frame.tk.splitlist(e.data)
+            except tk.TclError:
+                paths = []
+            for p in paths:
+                if os.path.isfile(p):
+                    self.chat.send_file(p)
+            return "copy"
 
         # ================= ปุ่มควบคุมการรีโมท =================
         def _build_controls(self, body, v):
@@ -5435,6 +5486,8 @@ def run_gui(minimized=False):
         t = datetime.fromtimestamp(ts)
         return "%d/%d/%d %02d:%02d" % (t.day, t.month, t.year + 543, t.hour, t.minute)
 
+    DND = {"ok": False}
+
     class FilePane:
         """รายการไฟล์ 1 ฝั่ง — side = "local" (เครื่องนี้) หรือ "remote" (เครื่องปลายทาง)"""
 
@@ -5503,9 +5556,25 @@ def run_gui(minimized=False):
             t.bind("<ButtonPress-1>", self._drag_start, add="+")
             t.bind("<B1-Motion>", self._drag_motion, add="+")
             t.bind("<ButtonRelease-1>", self._drag_end, add="+")
+            t.bind("<F2>", lambda e: self.rename())
+            for seq in (("<Button-2>", "<Control-Button-1>", "<Button-3>") if SYSTEM == "Darwin" else ("<Button-3>",)):
+                t.bind(seq, self._context_menu)
+            t.tag_configure("drop", background=T.c("sel"))
             self.status = lbl(f, "", fg="muted", bg="bg", font="small")
             self.status.pack(fill="x", padx=14, pady=(0, 4))
             self._drag = None
+            self._ghost = None
+            self._drop_row = None
+            self.expect_op = None
+            if DND["ok"] and side == "remote":          # ลากไฟล์จาก Finder / File Explorer มาวาง → อัปโหลด
+                for w in (t, f):
+                    try:
+                        w.drop_target_register("DND_Files")
+                        w.dnd_bind("<<DropPosition>>", self._os_drop_pos)
+                        w.dnd_bind("<<DropLeave>>", lambda e: (self._mark_drop(None), "refuse_drop")[1])
+                        w.dnd_bind("<<Drop>>", self._os_drop)
+                    except Exception as e:
+                        log_error(e)
 
         # ----- navigation -----
         def go(self, path, record=True):
@@ -5636,29 +5705,193 @@ def run_gui(minimized=False):
             else:
                 self.pending = self.fw.fc._fs("delete", path=self.cur, paths=paths)
 
-        # ----- drag & drop ไปอีกฝั่ง -----
+        def rename(self):
+            sel = [i for i in self.tree.selection() if i in self.entries]
+            if len(sel) != 1:
+                return
+            ent = self.entries[sel[0]]
+            old = ent["n"]
+            new = simpledialog.askstring(APP, tr("ชื่อใหม่:"), initialvalue=old, parent=self.fw.win)
+            if not new or not new.strip() or new.strip() == old:
+                return
+            new = new.strip()
+            if self.side == "local":
+                try:
+                    parts = safe_parts(new)
+                    if len(parts) != 1:
+                        raise ValueError(tr("ชื่อไม่ถูกต้อง"))
+                    dst = os.path.join(os.path.dirname(ent["p"]), parts[0])
+                    if os.path.exists(dst):
+                        raise FileExistsError(tr("มีไฟล์หรือโฟลเดอร์ชื่อนี้อยู่แล้ว"))
+                    os.rename(ent["p"], dst)
+                except Exception as e:
+                    messagebox.showerror(APP, tr("เปลี่ยนชื่อไม่ได้: %s") % err_text(e), parent=self.fw.win)
+                self.refresh()
+            else:
+                self.expect_op = "rename"
+                self.pending = self.fw.fc.rename(self.cur, ent["p"], new)
+
+        def copy_path(self):
+            paths = self.selected_paths() or ([self.cur] if self.cur else [])
+            if paths:
+                self.fw.win.clipboard_clear()
+                self.fw.win.clipboard_append("\n".join(paths))
+
+        def _row_at(self, y):
+            row = self.tree.identify_row(y)
+            return row if row in self.entries or row == "up" else None
+
+        def _context_menu(self, e):
+            t = self.tree
+            row = self._row_at(e.y)
+            if row and row not in t.selection():
+                t.selection_set(row)
+            elif not row:
+                t.selection_remove(*t.selection())
+            t.focus_set()
+            sel = [i for i in t.selection() if i in self.entries]
+            ents = [self.entries[i] for i in sel]
+            remote = self.side == "remote"
+            m = tk.Menu(t, tearoff=0)
+            if len(ents) == 1 and ents[0]["d"]:
+                m.add_command(label=tr("เปิด"), command=lambda: self.go(ents[0]["p"]))
+            elif len(ents) == 1 and not remote:
+                m.add_command(label=tr("เปิดไฟล์"), command=lambda: open_path(ents[0]["p"]))
+            if ents:
+                if remote:
+                    m.add_command(label=tr("⬇  ดาวน์โหลดมาที่โฟลเดอร์ซ้าย"), command=self.fw.download)
+                    m.add_command(label=tr("⬇  ดาวน์โหลดไปที่…"), command=self._download_to)
+                else:
+                    m.add_command(label=tr("⬆  ส่งไปเครื่องปลายทาง"), command=self.fw.upload)
+                    m.add_command(label=tr("แสดงใน Finder") if SYSTEM == "Darwin" else tr("แสดงในโฟลเดอร์"),
+                                  command=lambda: show_in_folder(ents[0]["p"]))
+                m.add_separator()
+                m.add_command(label=tr("เปลี่ยนชื่อ…"), command=self.rename,
+                              state="normal" if len(ents) == 1 else "disabled")
+                m.add_command(label=tr("ลบ") + (" (%d)" % len(ents) if len(ents) > 1 else ""), command=self.delete)
+                m.add_command(label=tr("คัดลอกตำแหน่งไฟล์"), command=self.copy_path)
+                m.add_separator()
+            m.add_command(label=tr("+ โฟลเดอร์ใหม่"), command=self.mkdir, state="normal" if self.cur else "disabled")
+            m.add_command(label=tr("รีเฟรช"), command=self.refresh)
+            if not ents and self.cur:
+                m.add_command(label=tr("คัดลอกตำแหน่งไฟล์"), command=self.copy_path)
+            try:
+                m.tk_popup(e.x_root, e.y_root)
+            finally:
+                m.grab_release()
+
+        def _download_to(self):
+            d = pick_folder(self.fw.win, tr("เลือกโฟลเดอร์ที่จะบันทึก"), self.fw.local.cur)
+            if d:
+                self.fw.download(dest=d)
+
+        # ----- ลากไปวางอีกฝั่ง (วางบนโฟลเดอร์ = ส่งเข้าโฟลเดอร์นั้น) -----
+        def _mark_drop(self, row):
+            if self._drop_row == row:
+                return
+            if self._drop_row and self.tree.exists(self._drop_row):
+                self.tree.item(self._drop_row, tags=())
+            self._drop_row = row
+            if row and self.tree.exists(row):
+                self.tree.item(row, tags=("drop",))
+
+        def _target_dir(self, row):
+            """โฟลเดอร์ปลายทางเมื่อวางบนแถว row (โฟลเดอร์ → ข้างใน, ".." → โฟลเดอร์แม่, อื่น ๆ → โฟลเดอร์ที่เปิดอยู่)"""
+            if row == "up":
+                return self.parent_path or self.cur
+            ent = self.entries.get(row)
+            if ent and ent["d"]:
+                return ent["p"]
+            return self.cur
+
         def _drag_start(self, e):
             row = self.tree.identify_row(e.y)
             self._drag = {"x": e.x_root, "y": e.y_root, "on": False} if row and row != "up" else None
 
         def _drag_motion(self, e):
-            if self._drag and not self._drag["on"] and (abs(e.x_root - self._drag["x"]) + abs(e.y_root - self._drag["y"])) > 12:
-                self._drag["on"] = True
-                self.tree.configure(cursor="hand2")
+            d = self._drag
+            if not d:
+                return
+            if not d["on"]:
+                if abs(e.x_root - d["x"]) + abs(e.y_root - d["y"]) <= 12:
+                    return
+                d["on"] = True
+                n = len(self.selected_paths())
+                g = self._ghost = tk.Toplevel(self.fw.win)
+                g.overrideredirect(True)
+                try:
+                    g.attributes("-topmost", True)
+                    g.attributes("-alpha", 0.92)
+                except tk.TclError:
+                    pass
+                self._ghost_lbl = tk.Label(g, font=T.f["smallbold"], bg=T.c("accent"), fg=T.c("accent_fg"),
+                                           padx=10, pady=5)
+                self._ghost_lbl.pack()
+                self._ghost_n = n
+            other = self._other_at(e.x_root, e.y_root)
+            if other is not None:
+                orow = other._row_at(e.y_root - other.tree.winfo_rooty()) if \
+                    self.fw.win.winfo_containing(e.x_root, e.y_root) is other.tree else None
+                other._mark_drop(orow if orow and other._target_dir(orow) != other.cur else None)
+                dest = other._target_dir(orow) if orow else other.cur
+                verb = tr("ส่งไปที่") if self.side == "local" else tr("ดาวน์โหลดไปที่")
+                txt = "%s %s  →  %s" % ("⬆" if self.side == "local" else "⬇",
+                                         tr("%d รายการ") % self._ghost_n,
+                                         "%s %s" % (verb, os.path.basename((dest or "").rstrip("\\/")) or dest or "—"))
+            else:
+                for pane in (self.fw.local, self.fw.remote):
+                    pane._mark_drop(None)
+                txt = tr("%d รายการ") % self._ghost_n
+            self._ghost_lbl.configure(text=txt)
+            self._ghost.geometry("+%d+%d" % (e.x_root + 14, e.y_root + 12))
+
+        def _other_at(self, x, y):
+            other = self.fw.remote if self.side == "local" else self.fw.local
+            w = self.fw.win.winfo_containing(x, y)
+            while w is not None:
+                if w is other.tree or w is other.frame:
+                    return other
+                w = w.master
+            return None
 
         def _drag_end(self, e):
             d, self._drag = self._drag, None
-            self.tree.configure(cursor="")
+            if self._ghost is not None:
+                self._ghost.destroy()
+                self._ghost = None
             if not d or not d["on"]:
                 return
-            target = self.fw.win.winfo_containing(e.x_root, e.y_root)
-            other = self.fw.remote if self.side == "local" else self.fw.local
-            w = target
-            while w is not None:
-                if w is other.tree or w is other.frame:
-                    (self.fw.upload if self.side == "local" else self.fw.download)()
-                    return
-                w = w.master
+            other = self._other_at(e.x_root, e.y_root)
+            row = other._drop_row if other is not None else None
+            for pane in (self.fw.local, self.fw.remote):
+                pane._mark_drop(None)
+            if other is None:
+                return
+            dest = other._target_dir(row) if row else other.cur
+            if self.side == "local":
+                self.fw.upload(dest=dest)
+            else:
+                self.fw.download(dest=dest)
+
+        # ----- ลากไฟล์จาก Finder / File Explorer มาวาง -----
+        def _os_drop_pos(self, e):
+            try:
+                row = self._row_at(e.y_root - self.tree.winfo_rooty())
+            except tk.TclError:
+                row = None
+            self._mark_drop(row if row and self._target_dir(row) != self.cur else None)
+            return "copy"
+
+        def _os_drop(self, e):
+            row = self._drop_row
+            self._mark_drop(None)
+            try:
+                paths = [p for p in self.fw.win.tk.splitlist(e.data) if os.path.exists(p)]
+            except tk.TclError:
+                paths = []
+            if paths:
+                self.fw.upload(paths=paths, dest=self._target_dir(row) if row else self.cur)
+            return "copy"
 
     class FileWindow:
         """หน้าต่างรับ-ส่งไฟล์ 2 ฝั่ง: ซ้าย = เครื่องนี้, ขวา = เครื่องปลายทาง"""
@@ -5692,7 +5925,9 @@ def run_gui(minimized=False):
             lbl(head, tr("การรับ-ส่งไฟล์"), fg="text", bg="bg", font="bold").pack(side="left")
             ttk.Button(head, text=tr("ล้างรายการที่เสร็จแล้ว"), style="Tool.TButton", command=self.clear_done).pack(side="right")
             ttk.Button(head, text=tr("ยกเลิกที่เลือก"), style="Tool.TButton", command=self.cancel_sel).pack(side="right", padx=6)
-            self.msg = lbl(head, tr("ลากไฟล์ข้ามฝั่งเพื่อส่งได้"), fg="muted", bg="bg", font="small")
+            self.msg = lbl(head, tr("ลากไฟล์ข้ามฝั่ง หรือลากจาก Finder/Explorer มาวางฝั่งขวาเพื่อส่ง · คลิกขวาเพื่อดูคำสั่ง")
+                           if DND["ok"] else tr("ลากไฟล์ข้ามฝั่งเพื่อส่งได้ · คลิกขวาเพื่อดูคำสั่ง"),
+                           fg="muted", bg="bg", font="small")
             self.msg.pack(side="right", padx=12)
             tf = box(bottom, bg="card")
             tf.pack(fill="x", padx=12, pady=(0, 12))
@@ -5708,7 +5943,8 @@ def run_gui(minimized=False):
             x.tag_configure("cancelled", foreground=T.c("muted"))
             x.pack(fill="x")
 
-            self.local.go(self.app.cfg.get("download_dir") or os.path.join(os.path.expanduser("~"), "Downloads"))
+            start = self.app.cfg.get("download_dir") or os.path.join(os.path.expanduser("~"), "Downloads")
+            self.local.go(start if os.path.isdir(start) else os.path.expanduser("~"))
             if self.local.cur is None:
                 self.local.go(None)
             self.remote.go(None)
@@ -5718,25 +5954,27 @@ def run_gui(minimized=False):
             self.win.deiconify()
             self.win.lift()
 
-        def upload(self):
-            paths = self.local.selected_paths()
+        def upload(self, paths=None, dest=None):
+            paths = paths or self.local.selected_paths()
             if not paths:
                 messagebox.showinfo(APP, tr("เลือกไฟล์หรือโฟลเดอร์ฝั่งซ้าย (เครื่องนี้) ที่จะส่งก่อน"), parent=self.win)
                 return
-            if not self.remote.cur:
+            dest = dest or self.remote.cur
+            if not dest:
                 messagebox.showinfo(APP, tr("เปิดโฟลเดอร์ปลายทางฝั่งขวาก่อน"), parent=self.win)
                 return
-            self._add_job(self.fc.upload(paths, self.remote.cur))
+            self._add_job(self.fc.upload(paths, dest))
 
-        def download(self):
-            paths = self.remote.selected_paths()
+        def download(self, paths=None, dest=None):
+            paths = paths or self.remote.selected_paths()
             if not paths:
                 messagebox.showinfo(APP, tr("เลือกไฟล์หรือโฟลเดอร์ฝั่งขวา (เครื่องปลายทาง) ที่จะดาวน์โหลดก่อน"), parent=self.win)
                 return
-            if not self.local.cur:
+            dest = dest or self.local.cur
+            if not dest:
                 messagebox.showinfo(APP, tr("เปิดโฟลเดอร์ปลายทางฝั่งซ้ายก่อน"), parent=self.win)
                 return
-            self._add_job(self.fc.download(paths, self.local.cur))
+            self._add_job(self.fc.download(paths, dest))
 
         def cancel_sel(self):
             for iid in self.xfer.selection():
@@ -5775,6 +6013,10 @@ def run_gui(minimized=False):
                 while True:
                     kind, d = self.fc.events.get_nowait()
                     if kind == "fs" and d.get("id") == self.remote.pending:
+                        if d.get("ok") and self.remote.expect_op and d.get("op") != self.remote.expect_op:
+                            messagebox.showinfo(APP, tr("เครื่องปลายทางใช้โปรแกรมเวอร์ชันเก่า ยังเปลี่ยนชื่อไฟล์ไม่ได้ — "
+                                                        "อัปเดตโปรแกรมบนเครื่องปลายทางก่อน"), parent=self.win)
+                        self.remote.expect_op = None
                         if d.get("ok"):
                             self.remote.populate(d)
                         else:
@@ -7049,6 +7291,12 @@ def run_gui(minimized=False):
     if env_bool("DIRECT_CONNECT", True):
         UPNP.start()
     root = tk.Tk()
+    try:                                                 # ลากไฟล์จาก Finder / File Explorer มาวาง (ถ้ามี tkinterdnd2)
+        from tkinterdnd2 import TkinterDnD
+        TkinterDnD.require(root)
+        DND["ok"] = True
+    except Exception:
+        DND["ok"] = False
     T = Theme(root, env_str("THEME", load_config().get("theme", "auto")))
     set_app_icon(root)
     app = App(root)

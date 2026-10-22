@@ -29,7 +29,7 @@ if not exist "%WORK%\venv\Scripts\python.exe" (
 )
 set "V=%WORK%\venv\Scripts\python.exe"
 "%V%" -m pip install -q --upgrade pip
-"%V%" -m pip install -q --upgrade pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless || goto fail
+"%V%" -m pip install -q --upgrade pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless tkinterdnd2 || goto fail
 
 set "ADDENV="
 if exist "%APPDIR%\.env" (

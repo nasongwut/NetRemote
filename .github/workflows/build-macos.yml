@@ -17,17 +17,19 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # ใช้นับจำนวน commit เป็นเลขเวอร์ชัน
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install build tools
-        run: python -m pip install --upgrade pip pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless
+        run: python -m pip install --upgrade pip pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless tkinterdnd2
 
-      - name: Read version
+      - name: Stamp version (auto: <VERSION>.<commit count>)
         shell: bash
-        run: echo "APP_VERSION=$(python -c "import re;print(re.search(r'^VERSION = \"([^\"]+)\"', open('remote_desktop.py', encoding='utf-8').read(), re.M).group(1))")" >> "$GITHUB_ENV"
+        run: python packaging/stamp_version.py
 
       - name: Create .env from repository secrets (optional)
         shell: bash
@@ -102,7 +104,7 @@ jobs:
           mkdir -p pkg
           ditto "dist/NetRemote.app" "pkg/NetRemote.app"
           ln -s /Applications pkg/Applications
-          hdiutil create -volname "NetRemote" -srcfolder pkg -ov -format UDZO "NetRemote-macOS-$(uname -m).dmg"
+          hdiutil create -volname "NetRemote" -srcfolder pkg -ov -format UDZO "NetRemote-macOS-${APP_VERSION}-$(uname -m).dmg"
 
       - name: Upload (macOS)
         if: runner.os == 'macOS'

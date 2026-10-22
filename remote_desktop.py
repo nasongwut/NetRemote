@@ -149,6 +149,19 @@ def _detect_lang():
 LANG = _detect_lang()
 RESTART = []
 _EN = {
+    'NetRemote เปิดอยู่แล้ว': 'NetRemote is already running',
+    'กำลังอัปเดต NetRemote… โปรแกรมจะเปิดใหม่เอง': 'Updating NetRemote… it will reopen by itself',
+    'กำลังอัปเดต NetRemote เป็นเวอร์ชัน %s': 'Updating NetRemote to version %s',
+    'โปรแกรมจะปิดแล้วเปิดขึ้นมาใหม่เองในไม่กี่วินาที — ไม่ต้องทำอะไร': 'NetRemote will close and reopen in a few seconds — no need to do anything',
+    '✓ อัปเดตเป็นเวอร์ชัน %s เรียบร้อยแล้ว': '✓ Updated to version %s',
+    '✓  อัปเดตเป็น %s แล้ว': '✓  Updated to %s',
+    '✗ อัปเดตเป็นเวอร์ชัน %s ไม่สำเร็จ — ยังเป็นเวอร์ชัน %s': '✗ Update to version %s failed — still on version %s',
+    '⬇  ดาวน์โหลดและติดตั้งเวอร์ชัน %s (%s)': '⬇  Download and install version %s (%s)',
+    'มีโปรแกรม NetRemote เวอร์ชันใหม่ %s\n(ใช้อยู่ %s · ขนาด %s)': 'A new version of NetRemote is available: %s\n(current %s · size %s)',
+    'มีอะไรใหม่:': "What's new:",
+    'ดาวน์โหลดตอนนี้เลยไหม?': 'Download it now?',
+    '⬆ ยังไม่ดาวน์โหลดเวอร์ชัน %s — กดดาวน์โหลดได้ที่แท็บ "ตั้งค่า Server"': '⬆ Version %s not downloaded — you can download it from the "Server Settings" tab',
+    'ดาวน์โหลดเวอร์ชัน %s เสร็จแล้ว\n\nติดตั้งตอนนี้เลยไหม? โปรแกรมจะปิดแล้วเปิดใหม่เอง (ใช้เวลาไม่กี่วินาที)\n\nถ้าเลือก No จะติดตั้งให้ตอนปิดโปรแกรม': 'Version %s has been downloaded.\n\nInstall it now? NetRemote will close and reopen by itself (a few seconds).\n\nIf you choose No, it will be installed when you close the program.',
     '%d รายการ': '%d item(s)',
     'คัดลอกตำแหน่งไฟล์': 'Copy path',
     'ชื่อใหม่:': 'New name:',
@@ -2994,10 +3007,92 @@ def update_platform():
 UPDATE_DIR = os.path.join(CONF_DIR, "updates")
 
 
+def update_mode():
+    """AUTO_UPDATE ใน .env: (เว้นว่าง) ask = ถามก่อนดาวน์โหลด และถามก่อนติดตั้ง
+    auto = ดาวน์โหลด + ติดตั้ง + เปิดใหม่เองโดยไม่ถาม (เครื่องที่ไม่มีคนเฝ้า)  ·  quit = ดาวน์โหลดเอง ติดตั้งตอนปิดโปรแกรม"""
+    v = env_str("AUTO_UPDATE", "").strip().lower()
+    if v in ("auto", "silent", "1", "yes", "true", "on"):
+        return "auto"
+    if v in ("quit", "exit", "manual", "off", "0", "no", "false"):
+        return "quit"
+    return "ask"
+
+
+SINGLE = {"sock": None, "show": threading.Event()}
+
+
+def instance_port():
+    """พอร์ตบนเครื่อง (127.0.0.1) ที่ใช้กันเปิดโปรแกรมซ้ำ — แยกตามผู้ใช้ Windows/Mac"""
+    try:
+        import getpass
+        user = getpass.getuser()
+    except Exception:
+        user = os.path.expanduser("~")
+    return 47100 + int(hashlib.sha1(user.encode("utf-8", "replace")).hexdigest(), 16) % 800
+
+
+def acquire_single_instance():
+    """True = เป็นตัวแรก (เปิดต่อได้)  ·  False = มีโปรแกรมเปิดอยู่แล้ว (สั่งให้ตัวเดิมเด้งขึ้นมาแทน)"""
+    port = instance_port()
+    wait_until = time.time() + (10 if os.environ.get("NETREMOTE_RELAUNCH") else 0)   # หลังอัปเดต: รอตัวเก่าปิดก่อน
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if SYSTEM == "Windows":
+            try:
+                s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1)
+            except OSError:
+                pass
+        try:
+            s.bind(("127.0.0.1", port))
+            s.listen(4)
+            break
+        except OSError:
+            s.close()
+            if time.time() < wait_until:
+                time.sleep(0.4)
+                continue
+            try:
+                c = socket.create_connection(("127.0.0.1", port), timeout=2)
+                c.sendall(b"NETREMOTE-SHOW\n")
+                c.close()
+                return False
+            except OSError:
+                return True                                    # พอร์ตถูกโปรแกรมอื่นใช้ → เปิดต่อตามปกติ
+    SINGLE["sock"] = s
+
+    def loop():
+        while True:
+            try:
+                c, _a = s.accept()
+            except OSError:
+                return
+            try:
+                c.settimeout(2)
+                if c.recv(64).startswith(b"NETREMOTE-SHOW"):
+                    SINGLE["show"].set()
+            except OSError:
+                pass
+            finally:
+                c.close()
+    threading.Thread(target=loop, daemon=True).start()
+    return True
+
+
+def release_single_instance():
+    s, SINGLE["sock"] = SINGLE["sock"], None
+    if s is not None:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
 def relaunch_self(cmd):
     """เปิดโปรแกรมตัวเองใหม่ — ล้างตัวแปรของ PyInstaller onefile ไม่ให้ตัวใหม่ไปใช้โฟลเดอร์ชั่วคราวของตัวเก่า"""
     env = {k: v for k, v in os.environ.items() if not (k.startswith("_MEI") or k.startswith("_PYI"))}
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    env["NETREMOTE_RELAUNCH"] = "1"                         # ตัวใหม่รอตัวเก่าปิดก่อน (กันเปิดซ้ำ)
+    release_single_instance()
     kw = {}
     if SYSTEM == "Windows":
         kw["creationflags"] = 0x00000200 | 0x00000008          # NEW_PROCESS_GROUP | DETACHED_PROCESS
@@ -3059,7 +3154,8 @@ def run_pending_setup():
     if not PENDING_SETUP:
         return False
     pkg, relaunch = PENDING_SETUP[-1]
-    args = [pkg, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/SP-"]
+    # /SILENT = ไม่ถามอะไร แต่แสดงหน้าต่าง "กำลังติดตั้ง" ให้เห็นว่ากำลังอัปเดต
+    args = [pkg, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/SP-"]
     if not relaunch:
         args.append("/NOLAUNCH")
     relaunch_self(args)
@@ -3140,6 +3236,7 @@ def launch_installer(pkg, relaunch=True):
         q = lambda p: "'" + p.replace("'", "'\\''") + "'"
         with open(sh, "w", encoding="utf-8") as f:
             f.write("#!/bin/bash\n"
+                    "osascript -e 'display notification \"%s\" with title \"NetRemote\"' >/dev/null 2>&1 &\n"
                     "while kill -0 %d 2>/dev/null; do sleep 0.5; done\n"
                     "PKG=%s; TARGET=%s; WORK=$(mktemp -d /tmp/netremote-update.XXXXXX)\n"
                     'if [[ "$PKG" == *.dmg ]]; then\n'
@@ -3156,7 +3253,8 @@ def launch_installer(pkg, relaunch=True):
                     '[[ "$PKG" == *.dmg ]] && hdiutil detach "$WORK/mnt" -quiet\n'
                     'rm -rf "$WORK" "$PKG"\n'
                     "%s"
-                    'rm -f "$0"\n' % (pid, q(pkg), q(target), 'open "$TARGET"\n' if relaunch else ""))
+                    'rm -f "$0"\n' % (re.sub(r"[\"'\\\\$`]", "", tr("กำลังอัปเดต NetRemote… โปรแกรมจะเปิดใหม่เอง")),
+                                       pid, q(pkg), q(target), 'open "$TARGET"\n' if relaunch else ""))
         os.chmod(sh, 0o700)
         subprocess.Popen(["/bin/bash", sh], start_new_session=True, close_fds=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -6087,6 +6185,7 @@ def run_gui(minimized=False):
             self.monitor = RelayMonitor(self._relay_conn, self.q)
             self.monitor.start()
             root.after(3000, self._update_loop)
+            root.after(800, self._post_update_notice)
             root.after(400, lambda: self.start_server(auto=True))   # พร้อมรับการเชื่อมต่ออัตโนมัติเสมอ
 
         def _tab(self, nb):
@@ -6635,6 +6734,17 @@ def run_gui(minimized=False):
             plat = update_plat_for(info)
             has_file = plat in (info.get("files") or {})
             self.upd_notes.configure(text=info.get("notes") or "")
+            if has_file and can_auto_install(info) and update_mode() == "ask":
+                f = info["files"][plat]
+                self.upd_status.configure(text=tr("⬆ มีเวอร์ชันใหม่: %s  (ใช้อยู่ %s)") % (latest, VERSION), fg=T.c("warn"))
+                self.upd_btn.configure(text=tr("⬇  ดาวน์โหลดและติดตั้งเวอร์ชัน %s (%s)") % (latest, fmt_size(f["size"])),
+                                       state="normal", command=lambda: self.download_update(auto=True))
+                self.upd_btn.pack(anchor="w", padx=22, pady=(10, 18))
+                self._badge(tr("⬆  มีอัปเดต %s") % latest)
+                if getattr(self, "_asked_dl", None) != latest:        # ถามครั้งเดียวต่อเวอร์ชัน (ปฏิเสธแล้วกดปุ่มเองได้)
+                    self._asked_dl = latest
+                    self._ask_download()
+                return
             if has_file and can_auto_install(info):
                 self.upd_status.configure(text=tr("⬆ มีเวอร์ชันใหม่ %s — กำลังดาวน์โหลดอัตโนมัติ…") % latest,
                                           fg=T.c("warn"))
@@ -6657,6 +6767,62 @@ def run_gui(minimized=False):
             if not manual and getattr(self, "_notified_ver", None) != latest:
                 self._notified_ver = latest
                 self._log(tr("⬆ มีโปรแกรมเวอร์ชันใหม่ %s — ดูที่แท็บ \"ตั้งค่า Server\"") % latest)
+
+        def _post_update_notice(self):
+            to = self.cfg.pop("updating_to", None)
+            if not to:
+                return
+            save_config(self.cfg)
+            if version_tuple(VERSION) >= version_tuple(to):
+                self._log(tr("✓ อัปเดตเป็นเวอร์ชัน %s เรียบร้อยแล้ว") % VERSION)
+                self._badge(tr("✓  อัปเดตเป็น %s แล้ว") % VERSION, "#15803D", "#FFFFFF")
+                self.root.after(15000, lambda: self._badge(None) if not self.update_ready else None)
+            else:
+                self._log(tr("✗ อัปเดตเป็นเวอร์ชัน %s ไม่สำเร็จ — ยังเป็นเวอร์ชัน %s") % (to, VERSION))
+
+        def _bring_front(self):
+            try:
+                if self.root.state() in ("iconic", "withdrawn"):
+                    self.root.deiconify()
+                self.root.lift()
+                self.root.attributes("-topmost", True)
+                self.root.after(500, lambda: self.root.attributes("-topmost", False))
+            except tk.TclError:
+                pass
+
+        def _ask_download(self):
+            """ถามก่อนดาวน์โหลดอัปเดต (ถ้ากำลังรีโมทอยู่ รอให้เลิกก่อน ไม่เด้งกวน)"""
+            info = self.update_info or {}
+            latest = info.get("version", "")
+            if self.upd_cancel is not None or self.update_ready or not latest:
+                return
+            if self._busy():
+                self.root.after(30000, self._ask_download)
+                return
+            f = (info.get("files") or {}).get(update_plat_for(info)) or {}
+            msg = tr("มีโปรแกรม NetRemote เวอร์ชันใหม่ %s\n(ใช้อยู่ %s · ขนาด %s)") % (latest, VERSION, fmt_size(f.get("size", 0)))
+            if info.get("notes"):
+                msg += "\n\n" + tr("มีอะไรใหม่:") + "\n" + str(info["notes"])[:600]
+            msg += "\n\n" + tr("ดาวน์โหลดตอนนี้เลยไหม?")
+            self._bring_front()
+            if messagebox.askyesno(APP, msg, parent=self.root):
+                self.download_update(auto=True)
+            else:
+                self._log(tr("⬆ ยังไม่ดาวน์โหลดเวอร์ชัน %s — กดดาวน์โหลดได้ที่แท็บ \"ตั้งค่า Server\"") % latest)
+
+        def _ask_install(self):
+            """ดาวน์โหลดเสร็จ → ถามก่อนติดตั้ง (ไม่ติดตั้ง = ติดตั้งให้ตอนปิดโปรแกรม)"""
+            if not self.update_ready:
+                return
+            if self._busy():
+                self.root.after(30000, self._ask_install)
+                return
+            latest = (self.update_info or {}).get("version", "")
+            self._bring_front()
+            if messagebox.askyesno(APP, tr("ดาวน์โหลดเวอร์ชัน %s เสร็จแล้ว\n\nติดตั้งตอนนี้เลยไหม? โปรแกรมจะปิดแล้วเปิดใหม่เอง "
+                                           "(ใช้เวลาไม่กี่วินาที)\n\nถ้าเลือก No จะติดตั้งให้ตอนปิดโปรแกรม") % latest,
+                                   parent=self.root):
+                self.install_update(confirm=False)
 
         def download_update(self, auto=False):
             info = self.update_info or {}
@@ -6706,7 +6872,7 @@ def run_gui(minimized=False):
                 return
             if self.upd_auto:
                 self.update_ready = res
-                instant = env_str("AUTO_UPDATE", "auto").lower() not in ("quit", "exit", "manual", "off", "0", "false", "no")
+                instant = update_mode() == "auto"
                 self.upd_status.configure(text=(tr("✓ เวอร์ชัน %s พร้อมติดตั้ง — กำลังติดตั้งและเปิดโปรแกรมใหม่…") if instant
                                                 else tr("✓ เวอร์ชัน %s พร้อมติดตั้ง — จะติดตั้งให้เมื่อปิดโปรแกรม")) % latest,
                                           fg=T.c("ok"))
@@ -6715,10 +6881,12 @@ def run_gui(minimized=False):
                 self.upd_btn.pack(anchor="w", padx=22, pady=(10, 18))
                 self._badge(tr("↻  รีสตาร์ตเพื่ออัปเดตเป็น %s") % latest, "#15803D", "#FFFFFF")
                 self._log(tr("⬆ ดาวน์โหลดเวอร์ชัน %s แล้ว — กดปุ่มด้านบนเพื่อรีสตาร์ต หรือจะติดตั้งให้เมื่อปิดโปรแกรม") % latest)
-                if instant:                     # ค่าเริ่มต้น: ติดตั้ง + เปิดใหม่ทันที (ถ้ากำลังรีโมทอยู่ รอให้เลิกก่อน)
+                if instant:                     # AUTO_UPDATE=auto: ติดตั้ง + เปิดใหม่ทันที (ถ้ากำลังรีโมทอยู่ รอให้เลิกก่อน)
                     if self._busy():
                         self._log(tr("⬆ จะติดตั้งเวอร์ชัน %s ให้ทันทีที่เลิกการรีโมท") % latest)
                     self.root.after(3000, self._auto_install_when_idle)
+                elif update_mode() == "ask":    # ค่าเริ่มต้น: ถามก่อนติดตั้ง
+                    self.root.after(500, self._ask_install)
                 return
             self.upd_status.configure(text=tr("✓ ดาวน์โหลดเรียบร้อย: %s") % os.path.basename(res), fg=T.c("ok"))
             if SYSTEM == "Darwin":
@@ -6763,7 +6931,34 @@ def run_gui(minimized=False):
                 return
             self.update_ready = None
             self._log(tr("กำลังอัปเดตเป็นเวอร์ชัน %s …") % latest)
-            self.quit(installing=True)
+            self.cfg["updating_to"] = latest
+            save_config(self.cfg)
+            self._updating_splash(latest)
+            self.root.after(1500, lambda: self.quit(installing=True))
+
+        def _updating_splash(self, latest):
+            """หน้าต่างเล็ก "กำลังอัปเดต…" ก่อนโปรแกรมปิดไปติดตั้ง"""
+            try:
+                for w in self.root.winfo_children():
+                    if isinstance(w, tk.Toplevel):
+                        w.withdraw()
+                self.root.withdraw()
+                sp = tk.Toplevel(self.root)
+                sp.overrideredirect(True)
+                sp.attributes("-topmost", True)
+                f = T.track(tk.Frame(sp, bd=0, highlightthickness=1), bg="card")
+                f.configure(highlightbackground=T.c("border"))
+                f.pack()
+                lbl(f, "⬆", fg="accent", font="big").pack(pady=(18, 4))
+                lbl(f, tr("กำลังอัปเดต NetRemote เป็นเวอร์ชัน %s") % latest, font="bold").pack(padx=30)
+                lbl(f, tr("โปรแกรมจะปิดแล้วเปิดขึ้นมาใหม่เองในไม่กี่วินาที — ไม่ต้องทำอะไร"), fg="muted",
+                    font="small").pack(padx=30, pady=(4, 20))
+                sp.update_idletasks()
+                w, h = sp.winfo_reqwidth(), sp.winfo_reqheight()
+                sp.geometry("+%d+%d" % ((sp.winfo_screenwidth() - w) // 2, (sp.winfo_screenheight() - h) // 3))
+                sp.update()
+            except tk.TclError:
+                pass
 
         def _confirm_fp_threadsafe(self, host, fp, name):
             """ตรวจ Certificate ของปลายทาง (เรียกจาก thread เชื่อมต่อ) — ครั้งแรกจดจำไว้ ถ้าเปลี่ยนจะถามผู้ใช้"""
@@ -7288,6 +7483,9 @@ def run_gui(minimized=False):
                 self.server.stop()
             self.root.after(200, self.root.destroy)
 
+    if not acquire_single_instance():                    # เปิดได้ทีละ 1 หน้าต่าง → เด้งตัวที่เปิดอยู่ขึ้นมาแทน
+        print(tr("NetRemote เปิดอยู่แล้ว"))
+        return
     if env_bool("DIRECT_CONNECT", True):
         UPNP.start()
     root = tk.Tk()
@@ -7301,6 +7499,13 @@ def run_gui(minimized=False):
     set_app_icon(root)
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.quit)
+
+    def _show_check():                                   # มีคนเปิดโปรแกรมซ้ำ → แสดงหน้าต่างนี้แทน
+        if SINGLE["show"].is_set():
+            SINGLE["show"].clear()
+            app._bring_front()
+        root.after(300, _show_check)
+    root.after(300, _show_check)
     if minimized:                                        # เปิดตอนเปิดเครื่อง → ย่อไว้ที่ Taskbar แต่พร้อมรับการเชื่อมต่อ
         root.after(300, root.iconify)
     if SYSTEM == "Darwin":

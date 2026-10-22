@@ -149,6 +149,8 @@ def _detect_lang():
 LANG = _detect_lang()
 RESTART = []
 _EN = {
+    '✓ เวอร์ชัน %s พร้อมติดตั้ง — กำลังติดตั้งและเปิดโปรแกรมใหม่…': '✓ Version %s is ready — installing and restarting…',
+    '⬆ จะติดตั้งเวอร์ชัน %s ให้ทันทีที่เลิกการรีโมท': '⬆ Version %s will be installed as soon as the remote session ends',
     'เปิดโปรแกรมแบบย่อหน้าต่าง (ใช้ตอนเปิดเครื่อง)': 'Start minimized (used at startup)',
     '%s กำลังควบคุมเครื่องนี้': '%s is controlling this computer',
     'กำลังควบคุมเครื่องนี้': 'Controlling this computer',
@@ -6462,15 +6464,19 @@ def run_gui(minimized=False):
                 return
             if self.upd_auto:
                 self.update_ready = res
-                self.upd_status.configure(text=tr("✓ เวอร์ชัน %s พร้อมติดตั้ง — จะติดตั้งให้เมื่อปิดโปรแกรม") % latest,
+                instant = env_str("AUTO_UPDATE", "auto").lower() not in ("quit", "exit", "manual", "off", "0", "false", "no")
+                self.upd_status.configure(text=(tr("✓ เวอร์ชัน %s พร้อมติดตั้ง — กำลังติดตั้งและเปิดโปรแกรมใหม่…") if instant
+                                                else tr("✓ เวอร์ชัน %s พร้อมติดตั้ง — จะติดตั้งให้เมื่อปิดโปรแกรม")) % latest,
                                           fg=T.c("ok"))
                 self.upd_btn.configure(text=tr("↻  รีสตาร์ตและอัปเดตตอนนี้"), state="normal",
                                        command=self.install_update)
                 self.upd_btn.pack(anchor="w", padx=22, pady=(10, 18))
                 self._badge(tr("↻  รีสตาร์ตเพื่ออัปเดตเป็น %s") % latest, "#15803D", "#FFFFFF")
                 self._log(tr("⬆ ดาวน์โหลดเวอร์ชัน %s แล้ว — กดปุ่มด้านบนเพื่อรีสตาร์ต หรือจะติดตั้งให้เมื่อปิดโปรแกรม") % latest)
-                if env_str("AUTO_UPDATE", "").lower() in ("auto", "1", "true", "yes", "on"):
-                    self._auto_install_when_idle()
+                if instant:                     # ค่าเริ่มต้น: ติดตั้ง + เปิดใหม่ทันที (ถ้ากำลังรีโมทอยู่ รอให้เลิกก่อน)
+                    if self._busy():
+                        self._log(tr("⬆ จะติดตั้งเวอร์ชัน %s ให้ทันทีที่เลิกการรีโมท") % latest)
+                    self.root.after(3000, self._auto_install_when_idle)
                 return
             self.upd_status.configure(text=tr("✓ ดาวน์โหลดเรียบร้อย: %s") % os.path.basename(res), fg=T.c("ok"))
             if SYSTEM == "Darwin":
@@ -6490,7 +6496,7 @@ def run_gui(minimized=False):
             return bool(self.viewers) or bool(self.server and self.server.is_alive() and self.server.session)
 
         def _auto_install_when_idle(self):
-            """AUTO_UPDATE=auto — สำหรับเครื่องที่ไม่มีคนเฝ้า: ติดตั้งทันทีเมื่อไม่มีการรีโมท"""
+            """ติดตั้งอัปเดตทันทีเมื่อไม่มีการรีโมท แล้วเปิดโปรแกรมใหม่ (AUTO_UPDATE=quit → ติดตั้งตอนปิดโปรแกรมแทน)"""
             if not self.update_ready:
                 return
             if self._busy():

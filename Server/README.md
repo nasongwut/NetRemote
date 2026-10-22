@@ -184,6 +184,15 @@ cp .env.example .env          # ครั้งแรก: แก้ RELAY_KEY �
 ./start_server.sh stop        # ปิด · status = ดูสถานะ · log = ดู log สด · fg = เปิดอยู่หน้า Terminal
 # Windows: ใช้ start_server.bat แบบเดียวกัน (start / reload / stop / status / log / fg)
 ```
+
+### บน Windows — เปิดเองตอนเปิดเครื่อง ไม่มีหน้าต่าง Command
+```bat
+start_server.bat install      :: ติดตั้งครั้งเดียว (ขอสิทธิ์ Administrator) — Task Scheduler รันเป็น SYSTEM ตอน Windows เริ่ม
+                              ::   ไม่ต้อง log in · ล่มแล้วเปิดใหม่เองทุก 1 นาที · เปิด Firewall พอร์ต RELAY_PORT/RELAY_WEB_PORT ให้
+start_server.bat status       :: ดูสถานะ
+start_server.bat reload       :: ปิดแล้วเปิดใหม่ (ถามสิทธิ์ Administrator)
+start_server.bat uninstall    :: เลิกเปิดอัตโนมัติ
+```
 โปรแกรม NetRemote ทุกเครื่องตั้ง `RELAY_ADDR=<IP เครื่องที่รัน Relay>:5910`
 (ถ้าจะใช้ข้ามอินเทอร์เน็ต ต้อง Port Forward TCP 5910 ที่ Router มาที่เครื่องนี้)
 

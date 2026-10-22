@@ -1,38 +1,50 @@
 @echo off
 setlocal EnableExtensions
 REM =====================================================================
-REM  NetRemote Relay Server (Windows) - start / reload / stop
+REM  NetRemote Relay Server (Windows)
 REM
-REM    start_server.bat            start the Server (if already running -> reload)
-REM    start_server.bat reload     stop and start again (after editing .env / updating relay_server.py)
-REM    start_server.bat stop       stop the Server
-REM    start_server.bat status     is it running?
-REM    start_server.bat log        watch the log live (Ctrl+C to leave - the Server keeps running)
-REM    start_server.bat fg         run in this window (Ctrl+C = stop)
+REM    start_server.bat              start the Server in the background (if already running -> reload)
+REM    start_server.bat reload       stop and start again (after editing .env / updating relay_server.py)
+REM    start_server.bat stop         stop the Server
+REM    start_server.bat status       is it running?
+REM    start_server.bat log          watch the log live (Ctrl+C to leave - the Server keeps running)
+REM    start_server.bat fg           run in this window (Ctrl+C = stop)
+REM
+REM    start_server.bat install      start automatically when Windows starts - no window, no login needed
+REM                                  (Task Scheduler as SYSTEM + Windows Firewall rule; asks for Administrator)
+REM    start_server.bat uninstall    remove the automatic start
 REM
 REM  First run: creates .venv in this folder and installs requirements.txt
-REM  Every run: uses .venv (re-installs only when requirements.txt changes)
-REM  Runs hidden in the background - you can close this window. Log: server.log
+REM  Log: server.log  (errors: server.err.log)
 REM =====================================================================
 chcp 65001 >nul
 cd /d "%~dp0"
 set "HERE=%~dp0"
+set "SRVDIR=%HERE:~0,-1%"
 set "VPY=%HERE%.venv\Scripts\python.exe"
+set "VPYW=%HERE%.venv\Scripts\pythonw.exe"
+set "TASKNAME=NetRemote Relay Server"
 set "CMD=%~1"
 if "%CMD%"=="" set "CMD=start"
 
-if /i "%CMD%"=="start"   goto start
-if /i "%CMD%"=="reload"  goto reload
-if /i "%CMD%"=="restart" goto reload
-if /i "%CMD%"=="stop"    goto stop
-if /i "%CMD%"=="status"  goto status
-if /i "%CMD%"=="log"     goto log
-if /i "%CMD%"=="fg"      goto fg
-echo Usage: start_server.bat [start^|reload^|stop^|status^|log^|fg]
+set "TASK="
+schtasks /Query /TN "%TASKNAME%" >nul 2>&1 && set "TASK=1"
+
+if /i "%CMD%"=="start"     goto start
+if /i "%CMD%"=="reload"    goto reload
+if /i "%CMD%"=="restart"   goto reload
+if /i "%CMD%"=="stop"      goto stop
+if /i "%CMD%"=="status"    goto status
+if /i "%CMD%"=="log"       goto log
+if /i "%CMD%"=="fg"        goto fg
+if /i "%CMD%"=="install"   goto install
+if /i "%CMD%"=="uninstall" goto uninstall
+echo Usage: start_server.bat [start^|reload^|stop^|status^|log^|fg^|install^|uninstall]
 exit /b 1
 
 REM ---------------------------------------------------------------------
 :start
+call :need_admin_if_task || exit /b 0
 call :find_pids
 if defined PIDS (
   echo Server is already running - reloading ...
@@ -40,27 +52,30 @@ if defined PIDS (
 )
 call :venv || exit /b 1
 call :launch
-exit /b %errorlevel%
+goto done
 
 :reload
+call :need_admin_if_task || exit /b 0
 call :find_pids
 if defined PIDS (call :kill) else (echo [Server was not running])
 call :venv || exit /b 1
 call :launch
-exit /b %errorlevel%
+goto done
 
 :stop
+call :need_admin_if_task || exit /b 0
 call :find_pids
 if not defined PIDS (
   echo Server is not running
-  exit /b 0
+  goto done
 )
 call :kill
-exit /b 0
+goto done
 
 :status
 call :find_pids
 if defined PIDS (echo [ON]  Server is running - PID %PIDS%) else (echo [OFF] Server is not running)
+if defined TASK (echo       Starts automatically with Windows: YES) else (echo       Starts automatically with Windows: no  ^(start_server.bat install^))
 exit /b 0
 
 :log
@@ -69,6 +84,10 @@ powershell -NoProfile -Command "Get-Content -Path 'server.log' -Tail 50 -Wait -E
 exit /b 0
 
 :fg
+if defined TASK (
+  echo The Server is installed to start with Windows. Use "start_server.bat uninstall" first to run it in a window.
+  exit /b 1
+)
 call :find_pids
 if defined PIDS (
   echo Stopping the background Server first ...
@@ -76,13 +95,59 @@ if defined PIDS (
 )
 call :venv || exit /b 1
 echo Starting NetRemote Relay Server - press Ctrl+C to stop
-set "RELAY_PIDFILE=%HERE%.server.pid"
-"%VPY%" relay_server.py
+"%VPY%" relay_server.py --pidfile .server.pid
 exit /b %errorlevel%
+
+:install
+call :is_admin || (call :elevate install & exit /b 0)
+call :venv || goto done
+call :find_pids
+if defined PIDS call :kill
+echo Installing "%TASKNAME%" - starts with Windows, hidden, restarts itself if it stops ...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $d=$env:SRVDIR; $a=New-ScheduledTaskAction -Execute $env:VPYW -Argument 'relay_server.py --log server.log --pidfile .server.pid' -WorkingDirectory $d; $t=New-ScheduledTaskTrigger -AtStartup; $p=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest; $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew; Register-ScheduledTask -TaskName $env:TASKNAME -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null; $p1='5910'; $p2='5911'; $f=Join-Path $d '.env'; if (Test-Path $f) { foreach ($l in Get-Content $f) { if ($l -match '^\s*RELAY_PORT\s*=\s*(\d+)') { $p1=$matches[1] }; if ($l -match '^\s*RELAY_WEB_PORT\s*=\s*(\d+)') { $p2=$matches[1] } } }; Remove-NetFirewallRule -DisplayName $env:TASKNAME -ErrorAction SilentlyContinue; New-NetFirewallRule -DisplayName $env:TASKNAME -Direction Inbound -Protocol TCP -LocalPort @($p1,$p2) -Action Allow | Out-Null; Write-Host ('Firewall: allowed TCP ' + $p1 + ', ' + $p2); Start-ScheduledTask -TaskName $env:TASKNAME"
+if errorlevel 1 (
+  echo [FAILED] Could not install the startup task - see the message above.
+  goto done
+)
+set "TASK=1"
+timeout /t 3 /nobreak >nul
+call :find_pids
+if defined PIDS (echo [OK] Installed and running - PID %PIDS%) else (echo [OK] Installed - check "start_server.bat log" if it does not come up)
+echo The Server now starts by itself every time Windows starts, without any window.
+goto done
+
+:uninstall
+call :is_admin || (call :elevate uninstall & exit /b 0)
+call :find_pids
+if defined PIDS call :kill
+powershell -NoProfile -Command "Unregister-ScheduledTask -TaskName $env:TASKNAME -Confirm:$false -ErrorAction SilentlyContinue; Remove-NetFirewallRule -DisplayName $env:TASKNAME -ErrorAction SilentlyContinue"
+echo [OK] Automatic start removed. Start manually with: start_server.bat
+goto done
 
 REM ---------------------------------------------------------------------
 REM  helpers
 REM ---------------------------------------------------------------------
+:done
+REM  keep the window open when this was double-clicked / opened as Administrator
+echo %CMDCMDLINE% | find /i "%~nx0" >nul && pause
+exit /b 0
+
+:is_admin
+net session >nul 2>&1
+exit /b %errorlevel%
+
+:elevate
+echo Asking for Administrator permission ...
+powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%1' -Verb RunAs"
+exit /b 0
+
+:need_admin_if_task
+REM  when installed as a startup task the Server runs as SYSTEM -> controlling it needs Administrator
+if not defined TASK exit /b 0
+call :is_admin && exit /b 0
+call :elevate %CMD%
+exit /b 1
+
 :venv
 if exist "%VPY%" (
   "%VPY%" -c "" >nul 2>&1 || (
@@ -97,8 +162,7 @@ if not exist "%VPY%" (
 )
 if not exist "%VPY%" (
   echo Could not create .venv - install Python 3 from https://www.python.org/downloads/windows/
-  echo and tick "Add python.exe to PATH", then run this again.
-  pause
+  echo ^(tick "Add python.exe to PATH" - and for "install", choose "Install for all users"^), then run this again.
   exit /b 1
 )
 set "NEED="
@@ -114,11 +178,14 @@ if defined NEED (
 exit /b 0
 
 :launch
-echo Starting NetRemote Relay Server in the background ...
 del /q .server.pid >nul 2>&1
-set "PYTHONUNBUFFERED=1"
-set "RELAY_PIDFILE=%HERE%.server.pid"
-powershell -NoProfile -Command "Start-Process -FilePath '%VPY%' -ArgumentList 'relay_server.py' -WorkingDirectory '%HERE:~0,-1%' -WindowStyle Hidden -RedirectStandardOutput 'server.log' -RedirectStandardError 'server.err.log'"
+if defined TASK (
+  echo Starting the "%TASKNAME%" task ...
+  schtasks /Run /TN "%TASKNAME%" >nul
+) else (
+  echo Starting NetRemote Relay Server in the background ...
+  powershell -NoProfile -Command "Start-Process -FilePath $env:VPYW -ArgumentList 'relay_server.py','--log','server.log','--pidfile','.server.pid' -WorkingDirectory $env:SRVDIR -WindowStyle Hidden"
+)
 timeout /t 3 /nobreak >nul
 call :find_pids
 if defined PIDS (
@@ -126,9 +193,8 @@ if defined PIDS (
   powershell -NoProfile -Command "if (Test-Path server.log) { Get-Content server.log -Tail 5 -Encoding UTF8 }"
   exit /b 0
 )
-echo [FAILED] Server did not start - details:
-if exist server.err.log type server.err.log
-if exist server.log type server.log
+echo [FAILED] Server did not start - last lines of the log:
+powershell -NoProfile -Command "if (Test-Path server.log) { Get-Content server.log -Tail 20 -Encoding UTF8 }"
 exit /b 1
 
 :find_pids
@@ -143,6 +209,7 @@ exit /b 0
 
 :kill
 echo Stopping Server (PID %PIDS%) ...
+if defined TASK schtasks /End /TN "%TASKNAME%" >nul 2>&1
 taskkill /PID %PIDS% /T /F >nul 2>&1
 timeout /t 1 /nobreak >nul
 del /q .server.pid >nul 2>&1

@@ -2022,6 +2022,11 @@ def restart_self():
         pass
     for k in ENV_FROM_FILE:                         # ให้รอบใหม่อ่านค่าจากไฟล์ .env ล่าสุด
         os.environ.pop(k, None)
+    if os.name == "nt":                             # Windows: execv ใช้กับ path ที่มีช่องว่างไม่ได้ → เปิดตัวใหม่แล้วปิดตัวนี้
+        import subprocess
+        subprocess.Popen([sys.executable] + sys.argv, close_fds=True,
+                         creationflags=0x08000000 | 0x00000200)   # CREATE_NO_WINDOW | NEW_PROCESS_GROUP
+        os._exit(0)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
@@ -2066,9 +2071,21 @@ ENV_FROM_FILE = set()
 
 
 def main():
-    if os.environ.get("RELAY_PIDFILE"):             # start_server.bat/.sh ใช้หา/ปิด Server (เขียนใหม่ทุกครั้งที่รีสตาร์ต)
+    pre0 = argparse.ArgumentParser(add_help=False)
+    pre0.add_argument("--log")
+    pre0.add_argument("--pidfile")
+    early = pre0.parse_known_args()[0]
+    here = os.path.dirname(os.path.abspath(__file__))
+    if early.log:                                   # รันแบบไม่มีหน้าต่าง (Windows Startup) → เขียน log ลงไฟล์
         try:
-            with open(os.environ["RELAY_PIDFILE"], "w") as f:
+            lf = open(os.path.join(here, early.log), "a", encoding="utf-8", buffering=1)
+            sys.stdout = sys.stderr = lf
+        except OSError:
+            pass
+    pidfile = early.pidfile or os.environ.get("RELAY_PIDFILE")
+    if pidfile:                                     # start_server.bat/.sh ใช้หา/ปิด Server (เขียนใหม่ทุกครั้งที่รีสตาร์ต)
+        try:
+            with open(os.path.join(here, pidfile), "w") as f:
                 f.write(str(os.getpid()))
         except OSError:
             pass
@@ -2079,6 +2096,8 @@ def main():
     env_path = load_env(want_env) or want_env
     p = argparse.ArgumentParser(description="NetRemote Relay Server")
     p.add_argument("--env", help="ไฟล์ตั้งค่า (ค่าเริ่มต้น: .env ในโฟลเดอร์เดียวกับโปรแกรมนี้)")
+    p.add_argument("--log", help="เขียน log ลงไฟล์นี้ (ใช้ตอนรันเบื้องหลัง)")
+    p.add_argument("--pidfile", help="เขียนหมายเลข process ลงไฟล์นี้")
     p.add_argument("--port", type=int, default=int(os.environ.get("RELAY_PORT", 5910)))
     p.add_argument("--key", default=os.environ.get("RELAY_KEY", ""),
                    help="Relay Key — ผู้ใช้ต้องใส่ให้ตรงจึงจะใช้ Relay ได้ (แนะนำให้ตั้ง)")

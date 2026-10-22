@@ -182,6 +182,7 @@ cp .env.example .env          # ครั้งแรก: แก้ RELAY_KEY �
 ./start_server.sh             # สร้าง .venv + ติดตั้ง requirements.txt (ครั้งแรก) → activate → เปิด Server เบื้องหลัง
 ./start_server.sh reload      # ปิดแล้วเปิดใหม่ (หลังแก้ .env / อัปเดตไฟล์)
 ./start_server.sh stop        # ปิด · status = ดูสถานะ · log = ดู log สด · fg = เปิดอยู่หน้า Terminal
+# Windows: ใช้ start_server.bat แบบเดียวกัน (start / reload / stop / status / log / fg)
 ```
 โปรแกรม NetRemote ทุกเครื่องตั้ง `RELAY_ADDR=<IP เครื่องที่รัน Relay>:5910`
 (ถ้าจะใช้ข้ามอินเทอร์เน็ต ต้อง Port Forward TCP 5910 ที่ Router มาที่เครื่องนี้)

@@ -2066,6 +2066,12 @@ ENV_FROM_FILE = set()
 
 
 def main():
+    if os.environ.get("RELAY_PIDFILE"):             # start_server.bat/.sh ใช้หา/ปิด Server (เขียนใหม่ทุกครั้งที่รีสตาร์ต)
+        try:
+            with open(os.environ["RELAY_PIDFILE"], "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--env", default=os.environ.get("RELAY_ENV",
                                                      os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")))

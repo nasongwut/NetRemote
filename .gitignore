@@ -25,4 +25,5 @@ key.txt
 
 # Server: log และ PID จาก start_server.sh
 Server/server.log
+Server/server.err.log
 Server/.server.pid

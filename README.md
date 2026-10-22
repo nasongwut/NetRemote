@@ -16,7 +16,7 @@ Remote Desktop/
 ├── Server/                     ← Relay Server + หน้าเว็บมอนิเตอร์ (รันบนเครื่อง Server)
 │   ├── relay_server.py
 │   ├── requirements.txt        ไลบรารีเสริม (psutil — ไม่บังคับ)
-│   ├── start_server.sh         เปิด / reload / ปิด Server (activate .venv ให้เอง)
+│   ├── start_server.sh / .bat  เปิด / reload / ปิด Server บน Mac·Linux / Windows (activate .venv ให้เอง)
 │   ├── .env / .env.example     ตั้งค่า Server (พอร์ต, RELAY_KEY, รหัสหน้าเว็บ) — .env ไม่ขึ้น GitHub
 │   ├── updates/                ไฟล์อัปเดตที่แจกให้ Client (ไม่ขึ้น GitHub)
 │   ├── netremote-relay.service ติดตั้งเป็น service บน Linux

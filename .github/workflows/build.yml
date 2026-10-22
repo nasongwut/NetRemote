@@ -1,5 +1,6 @@
-# Build NetRemote เป็น .exe (Windows) และ .dmg (macOS) อัตโนมัติบน GitHub
+# Build NetRemote: Windows → ตัวติดตั้ง NetRemote-Setup-<เวอร์ชัน>.exe   macOS → .dmg
 # ทำงานเองทุกครั้งที่ push ขึ้น main หรือกด Actions > Build NetRemote > Run workflow
+# เซ็นชื่อดิจิทัลบน Windows อัตโนมัติเมื่อตั้ง secrets WINDOWS_CERT_PFX_BASE64 + WINDOWS_CERT_PASSWORD (ดู packaging/sign_windows.ps1)
 name: Build NetRemote
 
 on:
@@ -24,6 +25,10 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade pip pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless
 
+      - name: Read version
+        shell: bash
+        run: echo "APP_VERSION=$(python -c "import re;print(re.search(r'^VERSION = \"([^\"]+)\"', open('remote_desktop.py', encoding='utf-8').read(), re.M).group(1))")" >> "$GITHUB_ENV"
+
       - name: Create .env from repository secrets (optional)
         shell: bash
         env:
@@ -41,16 +46,52 @@ jobs:
           ADD=""
           [ -f .env ] && ADD="--add-data .env:."
           if [ "$RUNNER_OS" = "Windows" ]; then
-            ICON=ico; ONE=--onefile; PLAT=_win32
+            ICON=ico; PLAT=_win32      # แบบโฟลเดอร์ (onedir) → เซ็นได้ทุกไฟล์ + Antivirus เตือนน้อยกว่าแบบไฟล์เดียว
           else
-            ICON=icns; ONE=; PLAT=_darwin
+            ICON=icns; PLAT=_darwin
           fi
-          pyinstaller --noconfirm --windowed $ONE --name "NetRemote" \
+          pyinstaller --noconfirm --windowed --name "NetRemote" \
             --icon "assets/netremote.$ICON" \
             --osx-bundle-identifier com.networktools.netremote \
             --hidden-import pynput.keyboard.$PLAT --hidden-import pynput.mouse.$PLAT $ADD \
             remote_desktop.py
 
+      # ---------------- Windows ----------------
+      - name: Sign program files (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./packaging/sign_windows.ps1 dist/NetRemote
+
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DAppVersion=$env:APP_VERSION" "/DSourceDir=$PWD\dist\NetRemote" "/DOutputDir=$PWD\installer" packaging\netremote.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Sign installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./packaging/sign_windows.ps1 installer
+
+      - name: Upload (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetRemote-Windows-Setup
+          path: installer/NetRemote-Setup-*.exe
+
+      # ---------------- macOS ----------------
       - name: Package DMG (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -62,13 +103,6 @@ jobs:
           ditto "dist/NetRemote.app" "pkg/NetRemote.app"
           ln -s /Applications pkg/Applications
           hdiutil create -volname "NetRemote" -srcfolder pkg -ov -format UDZO "NetRemote-macOS-$(uname -m).dmg"
-
-      - name: Upload (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: NetRemote-Windows
-          path: dist/NetRemote.exe
 
       - name: Upload (macOS)
         if: runner.os == 'macOS'

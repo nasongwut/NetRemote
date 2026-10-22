@@ -1,0 +1,112 @@
+# Build macOS → NetRemote-macOS-<arm64>.dmg (แยกจาก Windows)
+# ทำงานเองทุกครั้งที่ push ขึ้น main หรือกด Actions > Build NetRemote > Run workflow
+# เซ็นชื่อดิจิทัลบน Windows อัตโนมัติเมื่อตั้ง secrets WINDOWS_CERT_PFX_BASE64 + WINDOWS_CERT_PASSWORD (ดู packaging/sign_windows.ps1)
+name: Build macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade pip pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless
+
+      - name: Read version
+        shell: bash
+        run: echo "APP_VERSION=$(python -c "import re;print(re.search(r'^VERSION = \"([^\"]+)\"', open('remote_desktop.py', encoding='utf-8').read(), re.M).group(1))")" >> "$GITHUB_ENV"
+
+      - name: Create .env from repository secrets (optional)
+        shell: bash
+        env:
+          RELAY_ADDR: ${{ secrets.NETREMOTE_RELAY_ADDR }}
+          RELAY_KEY: ${{ secrets.NETREMOTE_RELAY_KEY }}
+        run: |
+          if [ -n "$RELAY_ADDR" ]; then
+            printf 'RELAY_ADDR=%s\nRELAY_KEY=%s\n' "$RELAY_ADDR" "$RELAY_KEY" > .env
+            echo "embedding Relay settings (.env) into the build"
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          ADD=""
+          [ -f .env ] && ADD="--add-data .env:."
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ICON=ico; PLAT=_win32      # แบบโฟลเดอร์ (onedir) → เซ็นได้ทุกไฟล์ + Antivirus เตือนน้อยกว่าแบบไฟล์เดียว
+          else
+            ICON=icns; PLAT=_darwin
+          fi
+          pyinstaller --noconfirm --windowed --name "NetRemote" \
+            --icon "assets/netremote.$ICON" \
+            --osx-bundle-identifier com.networktools.netremote \
+            --hidden-import pynput.keyboard.$PLAT --hidden-import pynput.mouse.$PLAT $ADD \
+            remote_desktop.py
+
+      # ---------------- Windows ----------------
+      - name: Sign program files (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./packaging/sign_windows.ps1 dist/NetRemote
+
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DAppVersion=$env:APP_VERSION" "/DSourceDir=$PWD\dist\NetRemote" "/DOutputDir=$PWD\installer" packaging\netremote.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Sign installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+          WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./packaging/sign_windows.ps1 installer
+
+      - name: Upload (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetRemote-Windows-Setup
+          path: installer/NetRemote-Setup-*.exe
+
+      # ---------------- macOS ----------------
+      - name: Package DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # สิทธิ์ไมโครโฟน/กล้อง สำหรับโทรเสียง/วีดีโอคอล
+          plutil -replace NSMicrophoneUsageDescription -string "NetRemote uses the microphone for voice and video calls" dist/NetRemote.app/Contents/Info.plist
+          plutil -replace NSCameraUsageDescription -string "NetRemote uses the camera for video calls" dist/NetRemote.app/Contents/Info.plist
+          codesign --force --deep -s - dist/NetRemote.app
+          mkdir -p pkg
+          ditto "dist/NetRemote.app" "pkg/NetRemote.app"
+          ln -s /Applications pkg/Applications
+          hdiutil create -volname "NetRemote" -srcfolder pkg -ov -format UDZO "NetRemote-macOS-$(uname -m).dmg"
+
+      - name: Upload (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetRemote-macOS
+          path: "NetRemote-macOS-*.dmg"

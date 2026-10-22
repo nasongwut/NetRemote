@@ -1,7 +1,7 @@
-# Build NetRemote: Windows → ตัวติดตั้ง NetRemote-Setup-<เวอร์ชัน>.exe   macOS → .dmg
+# Build Windows → ตัวติดตั้ง NetRemote-Setup-<เวอร์ชัน>.exe (แยกจาก macOS เพื่อให้ได้ไฟล์ทันทีที่ Windows เสร็จ)
 # ทำงานเองทุกครั้งที่ push ขึ้น main หรือกด Actions > Build NetRemote > Run workflow
 # เซ็นชื่อดิจิทัลบน Windows อัตโนมัติเมื่อตั้ง secrets WINDOWS_CERT_PFX_BASE64 + WINDOWS_CERT_PASSWORD (ดู packaging/sign_windows.ps1)
-name: Build NetRemote
+name: Build Windows
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        os: [windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

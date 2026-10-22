@@ -3,6 +3,7 @@
 ;
 ; - ติดตั้งให้ผู้ใช้คนเดียว (ไม่ต้องใช้สิทธิ์ Admin) ที่ %LOCALAPPDATA%\Programs\NetRemote
 ;   → โปรแกรมอัปเดตตัวเองได้โดยไม่ต้องถามสิทธิ์
+; - เลือกได้ตอนติดตั้ง: เปิดโปรแกรมอัตโนมัติตอนเปิดเครื่อง (ติ๊กไว้ให้แล้ว) — อัปเดตแบบเงียบจะจำค่าเดิม
 ; - อัปเดตแบบเงียบ:  NetRemote-Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS [/NOLAUNCH]
 
 #ifndef AppVersion
@@ -46,6 +47,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "startup"; Description: "Start NetRemote automatically when Windows starts (ready to accept connections)"; GroupDescription: "Startup:"
+
+[Registry]
+; เปิดอัตโนมัติตอนเข้าสู่ระบบ Windows (ย่อหน้าต่างไว้ แต่พร้อมให้รีโมทเข้ามา) — ถอนการติดตั้งแล้วลบให้เอง
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "NetRemote"; ValueData: """{app}\NetRemote.exe"" --minimized"; Flags: uninsdeletevalue; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "NetRemote"; Flags: deletevalue; Tasks: not startup
 
 [InstallDelete]
 ; ลบไฟล์ไลบรารีของเวอร์ชันเก่าก่อน กันไฟล์ค้างปนกัน

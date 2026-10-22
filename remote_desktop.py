@@ -149,6 +149,7 @@ def _detect_lang():
 LANG = _detect_lang()
 RESTART = []
 _EN = {
+    'เปิดโปรแกรมแบบย่อหน้าต่าง (ใช้ตอนเปิดเครื่อง)': 'Start minimized (used at startup)',
     '%s กำลังควบคุมเครื่องนี้': '%s is controlling this computer',
     'กำลังควบคุมเครื่องนี้': 'Controlling this computer',
     'กำลังส่ง…': 'Sending…',
@@ -3477,7 +3478,7 @@ def mods_from_state(st):
 # ============================================================================
 # GUI
 # ============================================================================
-def run_gui():
+def run_gui(minimized=False):
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog, ttk
     from PIL import Image, ImageTk
@@ -7046,6 +7047,8 @@ def run_gui():
     set_app_icon(root)
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.quit)
+    if minimized:                                        # เปิดตอนเปิดเครื่อง → ย่อไว้ที่ Taskbar แต่พร้อมรับการเชื่อมต่อ
+        root.after(300, root.iconify)
     if SYSTEM == "Darwin":
         try:
             root.createcommand("tk::mac::Quit", app.quit)
@@ -7134,6 +7137,7 @@ def main():
     p.add_argument("--no-files", action="store_true", help=tr("ไม่อนุญาตรับ-ส่งไฟล์ (โหมด --server)"))
     p.add_argument("--relay", help=tr("Relay Server เช่น relay.example.com:5910 (หรือ RELAY_ADDR ใน .env)"))
     p.add_argument("--relay-key", help="Relay Key")
+    p.add_argument("--minimized", action="store_true", help=tr("เปิดโปรแกรมแบบย่อหน้าต่าง (ใช้ตอนเปิดเครื่อง)"))
     args = p.parse_args()
     if args.server:
         miss = missing_modules(server=True)
@@ -7145,7 +7149,7 @@ def main():
     if miss:
         print(tr("ยังไม่ได้ติดตั้ง: pip install ") + " ".join(miss))
         return 1
-    run_gui()
+    run_gui(minimized=args.minimized)
     return 0
 
 

@@ -3441,7 +3441,7 @@ def mods_from_state(st):
 # ============================================================================
 def run_gui():
     import tkinter as tk
-    from tkinter import messagebox, simpledialog, ttk
+    from tkinter import filedialog, messagebox, simpledialog, ttk
     from PIL import Image, ImageTk
     import tkinter.font as tkfont
 
@@ -4834,8 +4834,9 @@ def run_gui():
                          "file": [(tr("ทุกไฟล์"), "*")]}[kind]
                 try:
                     paths = list(filedialog.askopenfilenames(parent=self.frame, title=title, filetypes=types) or [])
-                except Exception:
-                    paths = []
+                except Exception as e:
+                    log_error(e)
+                    paths = LocalPicker(self.frame.winfo_toplevel(), title, "files").result or []
             else:
                 paths = LocalPicker(self.frame.winfo_toplevel(), title, "files").result or []
             for p in paths:

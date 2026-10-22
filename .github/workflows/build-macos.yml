@@ -27,7 +27,7 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade pip pyinstaller mss Pillow pynput cryptography sounddevice numpy opencv-python-headless tkinterdnd2
 
-      - name: Stamp version (auto: <VERSION>.<commit count>)
+      - name: Stamp version (VERSION + commit count)
         shell: bash
         run: python packaging/stamp_version.py
 
